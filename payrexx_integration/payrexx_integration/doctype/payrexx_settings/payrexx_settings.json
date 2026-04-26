@@ -1,0 +1,167 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:gateway_name",
+ "creation": "2026-04-25 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "credentials_section",
+  "gateway_name",
+  "instance_name",
+  "api_version",
+  "column_break_creds",
+  "api_secret",
+  "webhook_signing_key",
+  "behavior_section",
+  "supported_currencies",
+  "psp",
+  "column_break_behavior",
+  "validity_minutes",
+  "redirect_section",
+  "success_redirect_url",
+  "failed_redirect_url",
+  "cancel_redirect_url"
+ ],
+ "fields": [
+  {
+   "fieldname": "credentials_section",
+   "fieldtype": "Section Break",
+   "label": "Credentials"
+  },
+  {
+   "description": "Used to build the Payment Gateway name as 'Payrexx-{gateway_name}'. e.g. 'Live' or 'Sandbox'.",
+   "fieldname": "gateway_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Gateway Name",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "description": "Your Payrexx instance subdomain (the part before .payrexx.com).",
+   "fieldname": "instance_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Instance Name",
+   "reqd": 1
+  },
+  {
+   "default": "v1.14",
+   "fieldname": "api_version",
+   "fieldtype": "Data",
+   "label": "API Version",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_creds",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "API secret from Payrexx → Integrations → API & Plugins. Sent as the 'x-api-key' header.",
+   "fieldname": "api_secret",
+   "fieldtype": "Password",
+   "label": "API Secret",
+   "reqd": 1
+  },
+  {
+   "description": "Signing key configured for the webhook in Payrexx → Webhooks. Used to verify the X-Webhook-Signature header.",
+   "fieldname": "webhook_signing_key",
+   "fieldtype": "Password",
+   "label": "Webhook Signing Key",
+   "reqd": 1
+  },
+  {
+   "fieldname": "behavior_section",
+   "fieldtype": "Section Break",
+   "label": "Behavior"
+  },
+  {
+   "default": "CHF,EUR,USD,GBP",
+   "description": "Comma-separated ISO 4217 currency codes accepted by this gateway.",
+   "fieldname": "supported_currencies",
+   "fieldtype": "Small Text",
+   "label": "Supported Currencies",
+   "reqd": 1
+  },
+  {
+   "description": "Optional: comma-separated list of Payrexx PSP IDs to restrict available payment providers (e.g. '4,17').",
+   "fieldname": "psp",
+   "fieldtype": "Small Text",
+   "label": "PSP Whitelist"
+  },
+  {
+   "fieldname": "column_break_behavior",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "How long the generated checkout link stays valid (in minutes). Leave blank for the Payrexx default.",
+   "fieldname": "validity_minutes",
+   "fieldtype": "Int",
+   "label": "Gateway Validity (minutes)"
+  },
+  {
+   "fieldname": "redirect_section",
+   "fieldtype": "Section Break",
+   "label": "Redirect Overrides"
+  },
+  {
+   "description": "Optional override. By default the customer is sent back to '/payment-success?doctype=...&docname=...' on success.",
+   "fieldname": "success_redirect_url",
+   "fieldtype": "Data",
+   "label": "Success Redirect URL"
+  },
+  {
+   "fieldname": "failed_redirect_url",
+   "fieldtype": "Data",
+   "label": "Failed Redirect URL"
+  },
+  {
+   "fieldname": "cancel_redirect_url",
+   "fieldtype": "Data",
+   "label": "Cancel Redirect URL"
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "issingle": 0,
+ "links": [],
+ "modified": "2026-04-25 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Payrexx Integration",
+ "name": "Payrexx Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "Accounts Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "Accounts User",
+   "share": 1
+  }
+ ],
+ "row_format": "Dynamic",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

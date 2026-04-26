@@ -1,0 +1,17 @@
+{
+  "name": "payrexx-integration-playwright",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Playwright end-to-end tests for the payrexx_integration Frappe app.",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.45.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

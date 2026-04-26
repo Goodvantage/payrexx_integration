@@ -8,7 +8,7 @@ app_license = "unlicense"
 # Apps
 # ------------------
 
-# required_apps = []
+required_apps = ["payments"]
 
 # Each item in the list will be shown as an app in the apps page
 # add_to_apps_screen = [
@@ -77,10 +77,11 @@ app_license = "unlicense"
 # ----------
 
 # add methods and filters to jinja environment
-# jinja = {
-# 	"methods": "payrexx_integration.utils.jinja_methods",
-# 	"filters": "payrexx_integration.utils.jinja_filters"
-# }
+jinja = {
+	"methods": [
+		"payrexx_integration.api.payrexx_pay_url",
+	],
+}
 
 # Installation
 # ------------
