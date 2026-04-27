@@ -99,7 +99,7 @@ jobs:
         working-directory: /home/runner/frappe-bench
         run: |
           bench --site test_site set-config allow_tests true
-          mkdir -p ~/logs ~/frappe-bench/logs ~/frappe-bench/sites/test_site/logs
+          mkdir -p ~/logs ~/frappe-bench/logs ~/frappe-bench/sites/test_site/logs ~/frappe-bench/test_site/logs
           /home/runner/frappe-bench/env/bin/python -c "
           import frappe
           frappe.init('test_site', sites_path='/home/runner/frappe-bench/sites')

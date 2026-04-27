@@ -29,6 +29,8 @@ const OFFLINE_METHOD = process.env.TEST_GUEST_OFFLINE_METHOD || "68";
 const ADMIN_USER = process.env.FRAPPE_USERNAME || "Administrator";
 const ADMIN_PASS = process.env.FRAPPE_PASSWORD || "admin";
 const BASE = process.env.PLAYWRIGHT_BASE_URL || "http://localhost:8000";
+const FIXED_GUEST_EMAIL = process.env.TEST_GUEST_EMAIL || "";
+const FIXED_GUEST_FULL_NAME = process.env.TEST_GUEST_FULL_NAME || "";
 
 // This file deliberately does NOT inherit the auth.json storageState — every
 // API call below uses freshly constructed contexts so the test mirrors a
@@ -47,8 +49,8 @@ test.describe("Guest pay-later flow over HTTP", () => {
 		});
 
 		const tag = Date.now().toString(36);
-		const guestEmail = `playwright-guest-${tag}@example.com`;
-		const guestFullName = `Playwright Guest ${tag}`;
+		const guestEmail = FIXED_GUEST_EMAIL || `playwright-guest-${tag}@example.com`;
+		const guestFullName = FIXED_GUEST_FULL_NAME || `Playwright Guest ${tag}`;
 
 		try {
 			// Sanity: prove the guest ctx is actually unauthenticated. Frappe
