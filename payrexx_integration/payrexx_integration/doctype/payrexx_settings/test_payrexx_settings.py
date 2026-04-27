@@ -15,7 +15,6 @@ from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
 
-
 GATEWAY_NAME = "TestGW"
 SETTINGS_NAME_PREFIX = "Payrexx-Test-"
 
@@ -160,8 +159,9 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 		# Patch frappe.request just for this call so callback() can read body+headers.
 		class _FakeRequest:
-			args = {}
-			form = {}
+			def __init__(self):
+				self.args = {}
+				self.form = {}
 
 			def get_data(self):
 				return body

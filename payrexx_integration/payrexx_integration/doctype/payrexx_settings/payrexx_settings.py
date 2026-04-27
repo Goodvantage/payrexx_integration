@@ -9,7 +9,6 @@ from frappe import _
 from frappe.integrations.utils import create_request_log
 from frappe.model.document import Document
 from frappe.utils import call_hook_method, flt, get_url
-
 from payments.utils import create_payment_gateway
 
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import PayrexxClient
@@ -115,10 +114,10 @@ class PayrexxSettings(Document):
 
 	def _build_create_gateway_payload(self, kwargs: dict, integration_request_name: str) -> dict:
 		# Payrexx wants the amount in the smallest currency unit (e.g. cents).
-		amount_cents = int(round(flt(kwargs.get("amount")) * 100))
+		amount_cents = round(flt(kwargs.get("amount")) * 100)
 		currency = (kwargs.get("currency") or "CHF").upper()
 		payer_name = (kwargs.get("payer_name") or "").strip()
-		first, last = (payer_name.split(" ", 1) + [""])[:2] if payer_name else ("", "")
+		first, last = [*payer_name.split(" ", 1), ""][:2] if payer_name else ("", "")
 
 		payload = {
 			"amount": amount_cents,
