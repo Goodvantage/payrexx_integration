@@ -79,6 +79,62 @@ test.describe("Event Booking workflow state", () => {
 			`unexpected workflow_state value: ${booking.workflow_state}`,
 		).toContain(booking.workflow_state);
 	});
+
+	// Regression: a pay-later booking, once submitted, must end up in
+	// Confirmed AND must auto-fire (a) the registration_confirmation /
+	// combined_bundle email referencing the booking and (b) the invoice
+	// email referencing the Sales Invoice. Used to fail because
+	// _sync_workflow_state derived workflow_state in validate() before
+	// before_submit flipped status to Confirmed.
+	test("pay-later booking ends up Confirmed AND queues both auto emails", async ({
+		request,
+	}) => {
+		const booking = (await getDoc(request, "Event Booking", BOOKING!)) as {
+			workflow_state: string;
+			docstatus: number;
+			payment_preference: string;
+			pay_later_selected: number;
+			sales_invoice: string | null;
+		};
+		test.skip(
+			!booking.pay_later_selected,
+			`booking ${BOOKING} is not a pay-later booking — skipping confirmation regression test`,
+		);
+		expect(booking.docstatus, "should be submitted (docstatus=1)").toBe(1);
+		expect(booking.workflow_state, "pay-later submit must derive to Confirmed").toBe(
+			"Confirmed",
+		);
+
+		// (a) booking-referenced email — registration_confirmation or combined_bundle
+		const bookingQ = (await callMethod(request, "frappe.client.get_list", {
+			doctype: "Email Queue",
+			filters: { reference_doctype: "Event Booking", reference_name: BOOKING },
+			fields: ["name"],
+			limit_page_length: 1,
+			order_by: "creation desc",
+		})) as { name: string }[];
+		expect(
+			bookingQ.length,
+			"expected an Email Queue row referencing the booking (registration_confirmation / combined_bundle)",
+		).toBeGreaterThan(0);
+
+		// (b) SI-referenced email — invoice flow
+		expect(booking.sales_invoice, "pay-later flow should produce a Sales Invoice").toBeTruthy();
+		const siQ = (await callMethod(request, "frappe.client.get_list", {
+			doctype: "Email Queue",
+			filters: {
+				reference_doctype: "Sales Invoice",
+				reference_name: booking.sales_invoice,
+			},
+			fields: ["name"],
+			limit_page_length: 1,
+			order_by: "creation desc",
+		})) as { name: string }[];
+		expect(
+			siQ.length,
+			"expected an Email Queue row referencing the Sales Invoice (invoice flow)",
+		).toBeGreaterThan(0);
+	});
 });
 
 test.describe("Manual correspondence triggers (api.send_correspondence)", () => {
