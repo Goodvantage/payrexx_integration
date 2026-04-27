@@ -62,11 +62,16 @@ test.describe("/anmelden picker UX", () => {
 		expect(taBox!.y).toBeGreaterThanOrEqual(searchBox!.y);
 
 		// (e) Pick the first row → selected chip renders with the new
-		//     uppercase + ✕ button (regression for the chip restyle).
+		//     uppercase + ✕ button, search input is hidden (regression for
+		//     the chip restyle + the [hidden]+display:flex specificity bug).
 		const firstRow = customerBlock.locator(".ea-typeahead-row").first();
 		if (await firstRow.count()) {
 			await firstRow.click();
 			await expect(customerBlock.locator(".ea-anmelden-selected")).toBeVisible();
+			await expect(
+				customerBlock.locator("#ea-customer-search"),
+				"search input must be hidden after a Trägerschaft is picked",
+			).toBeHidden();
 			const clearBtn = customerBlock.locator("button.ea-anmelden-clear");
 			await expect(clearBtn).toBeVisible();
 			// Label is uppercased via CSS, content stays as authored.
