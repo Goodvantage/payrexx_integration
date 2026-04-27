@@ -72,7 +72,7 @@ def payrexx_pay_url(sales_invoice: str | None) -> str:
 # -------------------------------------------------------------- redirect entry
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=True)  # nosemgrep: guest-whitelisted-method
 def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: str | None = None):
 	"""Lazy-create a Payrexx Gateway for a Sales Invoice and redirect to it.
 
@@ -92,9 +92,7 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 		# Already paid — send the customer to the success page instead of
 		# creating a duplicate Payrexx gateway.
 		frappe.local.response["type"] = "redirect"
-		frappe.local.response["location"] = get_url(
-			"/payment-success?doctype=Sales Invoice&docname=" + si
-		)
+		frappe.local.response["location"] = get_url("/payment-success?doctype=Sales Invoice&docname=" + si)
 		return
 
 	settings_name = gateway_name or _resolve_default_settings()
@@ -117,11 +115,7 @@ def _resolve_default_settings() -> str:
 	if not rows:
 		frappe.throw(_("No Payrexx Settings configured"))
 	if len(rows) > 1:
-		frappe.throw(
-			_(
-				"Multiple Payrexx Settings exist — pass ?gateway_name=... in the pay link"
-			)
-		)
+		frappe.throw(_("Multiple Payrexx Settings exist — pass ?gateway_name=... in the pay link"))
 	return rows[0]
 
 

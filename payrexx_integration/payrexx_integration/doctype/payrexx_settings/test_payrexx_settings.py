@@ -89,9 +89,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 	def test_webhook_signature_base64(self):
 		key = "whk_test_dummy"
 		body = b'{"transaction":{"id":1,"status":"confirmed"}}'
-		sig = base64.b64encode(
-			hmac.new(key.encode("utf-8"), body, hashlib.sha256).digest()
-		).decode("ascii")
+		sig = base64.b64encode(hmac.new(key.encode("utf-8"), body, hashlib.sha256).digest()).decode("ascii")
 		self.assertTrue(verify_webhook_signature(body, sig, key))
 
 	def test_webhook_signature_hex_fallback(self):
@@ -104,9 +102,9 @@ class TestPayrexxSettings(IntegrationTestCase):
 		key = "whk_test_dummy"
 		good_body = b'{"transaction":{"id":1,"status":"confirmed"}}'
 		bad_body = b'{"transaction":{"id":1,"status":"refunded"}}'
-		sig = base64.b64encode(
-			hmac.new(key.encode("utf-8"), good_body, hashlib.sha256).digest()
-		).decode("ascii")
+		sig = base64.b64encode(hmac.new(key.encode("utf-8"), good_body, hashlib.sha256).digest()).decode(
+			"ascii"
+		)
 		self.assertFalse(verify_webhook_signature(bad_body, sig, key))
 		self.assertFalse(verify_webhook_signature(good_body, "", key))
 		self.assertFalse(verify_webhook_signature(good_body, sig, ""))
@@ -149,9 +147,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 				}
 			}
 		).encode("utf-8")
-		sig = base64.b64encode(
-			hmac.new(b"whk_test_dummy", body, hashlib.sha256).digest()
-		).decode("ascii")
+		sig = base64.b64encode(hmac.new(b"whk_test_dummy", body, hashlib.sha256).digest()).decode("ascii")
 
 		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
 			payrexx_settings as ps_module,

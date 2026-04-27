@@ -34,9 +34,7 @@ class PayrexxSettings(Document):
 	def validate_transaction_currency(self, currency):
 		if currency not in self._supported_currencies():
 			frappe.throw(
-				_("Currency {0} is not supported by Payrexx gateway {1}.").format(
-					currency, self.gateway_name
-				)
+				_("Currency {0} is not supported by Payrexx gateway {1}.").format(currency, self.gateway_name)
 			)
 
 	def get_payment_url(self, **kwargs):
@@ -92,9 +90,7 @@ class PayrexxSettings(Document):
 			frappe.throw(_("Cannot reach Payrexx — check network connectivity."))
 
 		if resp.status_code in (401, 403):
-			frappe.throw(
-				_("Payrexx rejected the API Secret. Check the value in 'API Secret'.")
-			)
+			frappe.throw(_("Payrexx rejected the API Secret. Check the value in 'API Secret'."))
 		if resp.status_code != 200:
 			frappe.throw(_("Payrexx returned HTTP {0}").format(resp.status_code))
 		try:
@@ -103,9 +99,9 @@ class PayrexxSettings(Document):
 			body = {}
 		if "status" not in body:
 			frappe.throw(
-				_(
-					"Unexpected response from Payrexx. Check that 'Instance Name' ({0}) is correct."
-				).format(client.instance)
+				_("Unexpected response from Payrexx. Check that 'Instance Name' ({0}) is correct.").format(
+					client.instance
+				)
 			)
 
 	def _supported_currencies(self) -> set[str]:
@@ -167,7 +163,7 @@ class PayrexxSettings(Document):
 # =============================================================================
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(allow_guest=True)  # nosemgrep: guest-whitelisted-method
 def callback(gateway_name: str | None = None):
 	"""
 	Configure the following URL in Payrexx -> Webhooks for each gateway:
@@ -183,9 +179,7 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 		signature = frappe.get_request_header("X-Webhook-Signature", "")
 
 		settings = _resolve_settings(gateway_name)
-		if not verify_webhook_signature(
-			raw_body, signature, settings.get_password("webhook_signing_key")
-		):
+		if not verify_webhook_signature(raw_body, signature, settings.get_password("webhook_signing_key")):
 			frappe.throw(_("Invalid Payrexx webhook signature"), frappe.AuthenticationError)
 
 		body = json.loads(raw_body or b"{}") if raw_body else {}
@@ -199,9 +193,7 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 			return {"ok": True}
 
 		if not frappe.db.exists("Integration Request", ref_id):
-			frappe.log_error(
-				f"No Integration Request {ref_id}", "Payrexx webhook unknown reference"
-			)
+			frappe.log_error(f"No Integration Request {ref_id}", "Payrexx webhook unknown reference")
 			return {"ok": True}
 
 		ir = frappe.get_doc("Integration Request", ref_id)
@@ -243,9 +235,7 @@ def _resolve_settings(gateway_name: str | None) -> "PayrexxSettings":
 	rows = frappe.get_all("Payrexx Settings", pluck="name", limit=2)
 	if len(rows) == 1:
 		return frappe.get_cached_doc("Payrexx Settings", rows[0])
-	frappe.throw(
-		_("Multiple Payrexx Settings exist — webhook URL must include ?gateway_name=...")
-	)
+	frappe.throw(_("Multiple Payrexx Settings exist — webhook URL must include ?gateway_name=..."))
 
 
 def _on_payment_authorized(integration_request, status):

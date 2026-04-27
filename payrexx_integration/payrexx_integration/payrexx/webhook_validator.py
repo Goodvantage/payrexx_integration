@@ -5,9 +5,7 @@ import hashlib
 import hmac
 
 
-def verify_webhook_signature(
-	raw_body: bytes, received_signature: str, signing_key: str
-) -> bool:
+def verify_webhook_signature(raw_body: bytes, received_signature: str, signing_key: str) -> bool:
 	"""Verify the X-Webhook-Signature header on a Payrexx webhook.
 
 	Payrexx signs the raw request body with HMAC-SHA256 using the per-webhook

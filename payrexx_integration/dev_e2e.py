@@ -43,9 +43,7 @@ def _ensure_customer(contact_name: str) -> str:
 			"customer_primary_contact": contact_name,
 		}
 	).insert(ignore_permissions=True)
-	frappe.db.set_value(
-		"Customer", doc.name, "customer_primary_contact", contact_name, update_modified=False
-	)
+	frappe.db.set_value("Customer", doc.name, "customer_primary_contact", contact_name, update_modified=False)
 	return doc.name
 
 
@@ -227,16 +225,12 @@ def inspect_email_queue_row(name: str) -> dict:
 
 	# Decode the body's quoted-printable wrapping enough to find the URL.
 	# QP wraps long lines with =\r\n (or =\n) and encodes '=' as '=3D'.
-	plain = (
-		msg.replace("=\r\n", "").replace("=\n", "").replace("=3D", "=")
-	)
+	plain = msg.replace("=\r\n", "").replace("=\n", "").replace("=3D", "=")
 	# Pull the URL straight out of an <a href="…"> so HTML entity wrapping
 	# (e.g. ``&amp;``) doesn't break the match.
 	pay_m = re.search(r'href="([^"]*pay_invoice[^"]*)"', plain)
-	pay_url = (pay_m.group(1).replace("&amp;", "&") if pay_m else None)
-	has_qr_svg = "<svg" in plain and (
-		"Empfangsschein" in plain or "Receipt" in plain or "Récépissé" in plain
-	)
+	pay_url = pay_m.group(1).replace("&amp;", "&") if pay_m else None
+	has_qr_svg = "<svg" in plain and ("Empfangsschein" in plain or "Receipt" in plain or "Récépissé" in plain)
 
 	# Attachments listed in the MIME stream
 	atts = re.findall(r'Content-Disposition: attachment;\s*filename="?([^"\n;]+)', msg)
