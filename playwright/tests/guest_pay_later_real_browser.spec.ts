@@ -29,8 +29,11 @@ const OFFLINE_METHOD = process.env.TEST_GUEST_OFFLINE_METHOD || "68";
 const ADMIN_USER = process.env.FRAPPE_USERNAME || "Administrator";
 const ADMIN_PASS = process.env.FRAPPE_PASSWORD || "admin";
 const BASE = process.env.PLAYWRIGHT_BASE_URL || "http://localhost:8000";
-const FIXED_GUEST_EMAIL = process.env.TEST_GUEST_EMAIL || "";
-const FIXED_GUEST_FULL_NAME = process.env.TEST_GUEST_FULL_NAME || "";
+// Use the existing test website user by default. The regression under test is
+// anonymous booking submission, not guest-user creation; creating a fresh User
+// can fail on dev sites with overloaded background-job queues.
+const FIXED_GUEST_EMAIL = process.env.TEST_GUEST_EMAIL || "test@example.com";
+const FIXED_GUEST_FULL_NAME = process.env.TEST_GUEST_FULL_NAME || "Test User";
 
 // This file deliberately does NOT inherit the auth.json storageState — every
 // API call below uses freshly constructed contexts so the test mirrors a

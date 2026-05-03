@@ -164,7 +164,7 @@ class PayrexxSettings(Document):
 
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: guest-whitelisted-method
-def callback(gateway_name: str | None = None):
+def callback(gateway_name: str | None = None) -> dict[str, bool]:
 	"""
 	Configure the following URL in Payrexx -> Webhooks for each gateway:
 
@@ -225,7 +225,7 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 		raise
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "Payrexx callback error")
-		return {"ok": False}
+		raise
 
 
 def _resolve_settings(gateway_name: str | None) -> "PayrexxSettings":

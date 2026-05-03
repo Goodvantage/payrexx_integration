@@ -49,7 +49,9 @@ test("submitting create_sales_invoice queues a branded email with the pay URL", 
 	expect((queue as unknown[]).length).toBeGreaterThan(0);
 	const queueName = (queue as { name: string }[])[0].name;
 
-	// 4. The email body should contain the Payrexx pay URL + a Swiss QR-bill SVG.
+	// 4. The email body should contain the Payrexx pay URL and point to the
+	//    invoice PDF for the Swiss QR-bill. The QR itself belongs in the PDF,
+	//    not in the visible email body.
 	//    Decode the MIME quoted-printable wrapping (=\r\n line breaks, =3D for '=')
 	//    so substrings split across line wraps still match.
 	const fullDoc = await getDoc(request, "Email Queue", queueName);
@@ -61,8 +63,14 @@ test("submitting create_sales_invoice queues a branded email with the pay URL", 
 		.replace(/&amp;/g, "&");
 	expect(decoded).toContain("payrexx_integration.api.pay_invoice");
 	expect(decoded).toMatch(/[?&]si=/);
+	expect(decoded).toMatch(/[?&]gateway_name=/);
 	expect(decoded).toMatch(/[?&]token=[a-f0-9]{32}/);
-	// QR-bill: SVG embedded inline + multilingual receipt label (de/en/fr)
-	expect(decoded).toContain("<svg");
-	expect(decoded).toMatch(/Empfangsschein|Receipt|Récépissé/);
+	expect(decoded).toContain("Swiss QR-Bill");
+	expect(decoded).toContain("PDF");
+	expect(decoded).toContain("Content-Disposition: attachment");
+	expect(decoded).toContain(`${siName}.pdf`);
+	expect(decoded).not.toContain("Content-Disposition: inline");
+	expect(decoded).not.toContain("qr-bill.png");
+	expect(decoded).not.toContain("<svg");
+	expect(decoded).not.toMatch(/Receipt Account|Account \/ Payable to|Payment part/);
 });

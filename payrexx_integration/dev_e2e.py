@@ -150,15 +150,7 @@ def run_event_to_invoice_email(email: str = "benediktmathis@gmail.com") -> dict:
 		out["invoice"] = si.name
 		out["invoice_total"] = float(si.grand_total)
 
-		# 6. Force-flush the queue so the email actually goes out
-		try:
-			from frappe.email.doctype.email_queue.email_queue import flush
-		except ImportError:
-			from frappe.email.queue import flush
-		flush()
-		print("[OK] Email queue flushed", flush=True)
-
-		# 7. Verify email queue + show snippet
+		# 6. Verify email queue + show snippet
 		eq = frappe.get_all(
 			"Email Queue",
 			filters={"reference_doctype": "Sales Invoice", "reference_name": si_name},
@@ -166,15 +158,25 @@ def run_event_to_invoice_email(email: str = "benediktmathis@gmail.com") -> dict:
 			order_by="creation desc",
 			limit=3,
 		)
+		_send_only_created_invoice_emails(eq)
+		eq = frappe.get_all(
+			"Email Queue",
+			filters={"reference_doctype": "Sales Invoice", "reference_name": si_name},
+			fields=["name", "status", "message"],
+			order_by="creation desc",
+			limit=3,
+		)
+		print("[OK] Created invoice email queue row(s) sent", flush=True)
+
 		print(f"\n=== Email Queue rows: {len(eq)} ===", flush=True)
 		for row in eq:
 			msg = row.message or ""
 			# QP-decode so substrings split across line wraps still match.
 			plain = msg.replace("=\r\n", "").replace("=\n", "").replace("=3D", "=")
 			has_pay_url = "payrexx_integration.api.pay_invoice" in plain
-			has_qr = "<svg" in plain
+			has_qr_pdf = f"{si_name}.pdf" in plain and "Content-Disposition: attachment" in plain
 			print(
-				f"  {row.name} | status={row.status} | pay_url={has_pay_url} qr_svg={has_qr}",
+				f"  {row.name} | status={row.status} | pay_url={has_pay_url} qr_pdf={has_qr_pdf}",
 				flush=True,
 			)
 
@@ -208,6 +210,16 @@ def run_event_to_invoice_email(email: str = "benediktmathis@gmail.com") -> dict:
 		raise
 
 
+def _send_only_created_invoice_emails(queue_rows: list) -> None:
+	previous_testing_email = frappe.flags.get("testing_email")
+	frappe.flags.testing_email = True
+	try:
+		for row in queue_rows:
+			frappe.get_doc("Email Queue", row.name).send(force_send=True)
+	finally:
+		frappe.flags.testing_email = previous_testing_email
+
+
 def inspect_email_queue_row(name: str) -> dict:
 	"""Print a human-readable report of an Email Queue row and return key facts."""
 	import re
@@ -230,7 +242,7 @@ def inspect_email_queue_row(name: str) -> dict:
 	# (e.g. ``&amp;``) doesn't break the match.
 	pay_m = re.search(r'href="([^"]*pay_invoice[^"]*)"', plain)
 	pay_url = pay_m.group(1).replace("&amp;", "&") if pay_m else None
-	has_qr_svg = "<svg" in plain and ("Empfangsschein" in plain or "Receipt" in plain or "Récépissé" in plain)
+	has_qr_pdf = "Content-Disposition: attachment" in plain and ".pdf" in plain
 
 	# Attachments listed in the MIME stream
 	atts = re.findall(r'Content-Disposition: attachment;\s*filename="?([^"\n;]+)', msg)
@@ -253,7 +265,7 @@ def inspect_email_queue_row(name: str) -> dict:
 	print(f"  Subject:       {subject}", flush=True)
 	print(f"  Body bytes:    {len(msg)}  (incl. PDF attachment if present)", flush=True)
 	print(f"  Attachments:   {atts or '(none)'}", flush=True)
-	print(f"  QR-bill SVG:   {'embedded inline' if has_qr_svg else 'MISSING'}", flush=True)
+	print(f"  QR-bill PDF:   {'attached' if has_qr_pdf else 'MISSING'}", flush=True)
 	print(f"  Pay URL found: {bool(pay_url)}", flush=True)
 	if pay_url:
 		print(f"     {pay_url}", flush=True)

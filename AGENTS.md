@@ -24,6 +24,14 @@ Innermost package dir: `payrexx_integration/payrexx_integration/payrexx_integrat
 > that calls `payments.utils.create_payment_gateway`) without touching
 > upstream code.
 
+## Documentation Requirements
+
+- Keep root-level `HOW_TO.md` and `DOCUMENTATION.md` present and current.
+- Update `HOW_TO.md` when operator/admin procedures change.
+- Update `DOCUMENTATION.md` when doctypes, hooks, APIs, webhook contracts,
+  security assumptions, setup/migration behavior, or test commands change.
+- Keep `README.md` short; use these docs for runbooks and technical reference.
+
 ---
 
 ## Architecture

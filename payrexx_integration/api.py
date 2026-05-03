@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+from contextlib import contextmanager
 from urllib.parse import urlencode
 
 import frappe
@@ -38,23 +39,27 @@ def _signing_key() -> bytes:
 	return key.encode("utf-8") if isinstance(key, str) else bytes(key)
 
 
-def _sign(invoice_name: str) -> str:
-	digest = hmac.new(_signing_key(), invoice_name.encode("utf-8"), hashlib.sha256).hexdigest()
+def _sign(invoice_name: str, gateway_name: str | None = None) -> str:
+	payload = invoice_name if not gateway_name else f"{invoice_name}|{gateway_name}"
+	digest = hmac.new(_signing_key(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 	# 32 hex chars = 128 bits of HMAC output, enough to make guessing infeasible
 	# while keeping the URL compact in an email.
 	return digest[:32]
 
 
-def _verify(invoice_name: str, token: str) -> bool:
+def _verify(invoice_name: str, token: str, gateway_name: str | None = None) -> bool:
 	if not (invoice_name and token):
 		return False
+	if gateway_name:
+		return hmac.compare_digest(_sign(invoice_name, gateway_name), token)
+	# Backward compatible for links generated before gateway_name was included.
 	return hmac.compare_digest(_sign(invoice_name), token)
 
 
 # ---------------------------------------------------------------- jinja helper
 
 
-def payrexx_pay_url(sales_invoice: str | None) -> str:
+def payrexx_pay_url(sales_invoice: str | None, gateway_name: str | None = None) -> str:
 	"""Return the public pay-by-email URL for a Sales Invoice.
 
 	Registered as a jinja method via ``hooks.py`` — call from any email
@@ -65,7 +70,19 @@ def payrexx_pay_url(sales_invoice: str | None) -> str:
 	"""
 	if not sales_invoice:
 		return ""
-	params = {"si": sales_invoice, "token": _sign(sales_invoice)}
+	if frappe.db.exists("Sales Invoice", sales_invoice):
+		if frappe.db.get_value("Sales Invoice", sales_invoice, "docstatus") != 1:
+			return ""
+	try:
+		settings_name = gateway_name or _resolve_default_settings()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Payrexx pay URL unavailable")
+		return ""
+	params = {
+		"si": sales_invoice,
+		"gateway_name": settings_name,
+		"token": _sign(sales_invoice, settings_name),
+	}
 	return get_url("/api/method/payrexx_integration.api.pay_invoice?" + urlencode(params))
 
 
@@ -73,13 +90,13 @@ def payrexx_pay_url(sales_invoice: str | None) -> str:
 
 
 @frappe.whitelist(allow_guest=True)  # nosemgrep: guest-whitelisted-method
-def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: str | None = None):
+def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: str | None = None) -> None:
 	"""Lazy-create a Payrexx Gateway for a Sales Invoice and redirect to it.
 
 	Embedded in pay-by-email links via :func:`payrexx_pay_url`. The signed
 	token authorises the caller — without it, any URL is rejected.
 	"""
-	if not _verify(si, token):
+	if not _verify(si, token, gateway_name):
 		frappe.throw(_("Invalid or expired payment link"), frappe.PermissionError)
 
 	if not frappe.db.exists("Sales Invoice", si):
@@ -88,6 +105,8 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 	sales_invoice = frappe.get_doc("Sales Invoice", si)
 	if sales_invoice.docstatus == 2:
 		frappe.throw(_("This invoice has been cancelled"))
+	if sales_invoice.docstatus != 1:
+		frappe.throw(_("This invoice is not submitted"))
 	if sales_invoice.outstanding_amount is not None and sales_invoice.outstanding_amount <= 0:
 		# Already paid — send the customer to the success page instead of
 		# creating a duplicate Payrexx gateway.
@@ -100,8 +119,9 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 	# Re-use an existing Payment Request for this invoice if one is still
 	# pending, otherwise create a fresh one. This keeps the Payment Request
 	# log clean when a customer clicks the email link multiple times.
-	payment_request = _get_or_create_payment_request(sales_invoice, settings_name)
-	checkout_url = payment_request.get_payment_url()
+	with _as_automation_user():
+		payment_request = _get_or_create_payment_request(sales_invoice, settings_name)
+		checkout_url = payment_request.get_payment_url()
 
 	frappe.local.response["type"] = "redirect"
 	frappe.local.response["location"] = checkout_url
@@ -111,11 +131,12 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 
 
 def _resolve_default_settings() -> str:
-	rows = frappe.get_all("Payrexx Settings", pluck="name", limit=2)
+	rows = frappe.get_all("Payrexx Settings", pluck="name", order_by="creation asc")
 	if not rows:
 		frappe.throw(_("No Payrexx Settings configured"))
-	if len(rows) > 1:
-		frappe.throw(_("Multiple Payrexx Settings exist — pass ?gateway_name=... in the pay link"))
+	for preferred in ("Live", "Sandbox"):
+		if preferred in rows:
+			return preferred
 	return rows[0]
 
 
@@ -126,6 +147,7 @@ def _get_or_create_payment_request(sales_invoice, settings_name: str):
 		filters={
 			"reference_doctype": "Sales Invoice",
 			"reference_name": sales_invoice.name,
+			"payment_gateway": gateway,
 			"status": ["in", ("Draft", "Requested", "Initiated", "Partially Paid")],
 			"docstatus": ["<", 2],
 		},
@@ -136,14 +158,53 @@ def _get_or_create_payment_request(sales_invoice, settings_name: str):
 	if existing:
 		return frappe.get_doc("Payment Request", existing[0])
 
+	_delete_wrong_draft_payment_requests(sales_invoice.name, gateway)
+
 	from erpnext.accounts.doctype.payment_request.payment_request import make_payment_request
 
-	pr_name = make_payment_request(
+	payment_request = make_payment_request(
 		dt="Sales Invoice",
 		dn=sales_invoice.name,
 		payment_gateway=gateway,
+		payment_gateway_account=_gateway_account_filter(sales_invoice, gateway),
 		submit_doc=1,
 		mute_email=1,
-		return_doc=False,
+		return_doc=True,
 	)
-	return frappe.get_doc("Payment Request", pr_name)
+	return payment_request
+
+
+def _gateway_account_filter(sales_invoice, gateway: str) -> dict:
+	filters = {"payment_gateway": gateway, "company": sales_invoice.company}
+	if not frappe.db.exists("Payment Gateway Account", filters):
+		frappe.throw(_("No Payment Gateway Account configured for {0}").format(gateway))
+	return filters
+
+
+def _delete_wrong_draft_payment_requests(sales_invoice_name: str, gateway: str) -> None:
+	wrong_drafts = frappe.get_all(
+		"Payment Request",
+		filters={
+			"reference_doctype": "Sales Invoice",
+			"reference_name": sales_invoice_name,
+			"docstatus": 0,
+			"payment_gateway": ["!=", gateway],
+		},
+		pluck="name",
+	)
+	for payment_request_name in wrong_drafts:
+		frappe.delete_doc("Payment Request", payment_request_name, ignore_permissions=True, force=True)
+
+
+@contextmanager
+def _as_automation_user(user: str = "Administrator"):
+	previous_user = frappe.session.user
+	previous_sid = frappe.session.sid
+	previous_data = frappe.session.data
+	frappe.set_user(user)  # nosemgrep: frappe-setuser
+	try:
+		yield
+	finally:
+		frappe.set_user(previous_user)  # nosemgrep: frappe-setuser
+		frappe.session.sid = previous_sid
+		frappe.session.data = previous_data

@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlparse
 
 import frappe
 from frappe.tests import IntegrationTestCase
@@ -72,13 +73,23 @@ class TestPayrexxSettings(IntegrationTestCase):
 	# ----------------------------------------------------- HMAC pay-link token
 
 	def test_pay_url_token_round_trip(self):
-		url = payrexx_pay_url("ACC-SINV-2026-00001")
-		self.assertIn("si=ACC-SINV-2026-00001", url)
-		self.assertIn("token=", url)
-		token = url.split("token=")[1]
+		url = payrexx_pay_url("ACC-SINV-2026-00001", gateway_name=self.settings_name)
+		params = parse_qs(urlparse(url).query)
+		self.assertEqual(params.get("si"), ["ACC-SINV-2026-00001"])
+		self.assertEqual(params.get("gateway_name"), [self.settings_name])
+		token = params["token"][0]
 		self.assertEqual(len(token), 32)
 		# Tampering with the invoice name must invalidate the token.
-		self.assertNotEqual(token, _sign("ACC-SINV-2026-00002"))
+		self.assertNotEqual(token, _sign("ACC-SINV-2026-00002", self.settings_name))
+		# Tampering with the gateway must also invalidate links generated with gateway_name.
+		self.assertNotEqual(token, _sign("ACC-SINV-2026-00001", "OtherGateway"))
+
+	def test_pay_url_explicit_gateway_name(self):
+		other_settings = _ensure_settings("OtherGateway")
+		url = payrexx_pay_url("ACC-SINV-2026-00001", gateway_name=other_settings)
+		params = parse_qs(urlparse(url).query)
+		self.assertEqual(params.get("gateway_name"), [other_settings])
+		self.assertEqual(params.get("token"), [_sign("ACC-SINV-2026-00001", other_settings)])
 
 	def test_pay_url_blank_invoice_returns_blank(self):
 		self.assertEqual(payrexx_pay_url(None), "")
