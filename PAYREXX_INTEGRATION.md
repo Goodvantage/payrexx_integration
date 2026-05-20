@@ -50,7 +50,7 @@ Payrexx → POST callback URL (webhook)
         │  • update status → Completed / Authorized / Failed
         │  • run reference_doc.on_payment_authorized("Completed")
         ▼
-Customer redirected to /payment-success?doctype=...&docname=...
+Customer redirected to redirect_to when present, otherwise /payment-success?doctype=...&docname=...
 ```
 
 ---
@@ -94,7 +94,7 @@ query param to disambiguate which signing key to verify against.
 | `supported_currencies` | Small Text, default `CHF,EUR,USD,GBP` | Comma list, validated per transaction |
 | `psp` | Small Text | Optional comma list of PSP IDs |
 | `validity_minutes` | Int | Optional gateway TTL |
-| `success_redirect_url` / `failed_redirect_url` / `cancel_redirect_url` | Data | Optional overrides; defaults bring the customer back to `/payment-success` / `/payment-failed` on the Frappe site |
+| `success_redirect_url` / `failed_redirect_url` / `cancel_redirect_url` | Data | Optional overrides; defaults bring the customer through the success reconciliation endpoint, then to the Integration Request `redirect_to` when present or `/payment-success` on the Frappe site |
 
 ---
 

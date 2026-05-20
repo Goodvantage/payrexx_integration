@@ -44,11 +44,31 @@ Pay-by-email links are generated only for submitted Sales Invoices. Draft
 invoices return no payment URL, and `pay_invoice` rejects draft invoices before
 creating a Payrexx gateway.
 
+Externally shared URLs are built from `host_name` exactly as configured. This
+avoids leaking a local bench `webserver_port` such as `:8000` into Payrexx
+checkout links when the site is exposed through a reverse proxy or ngrok URL.
+
 Webhook endpoint:
 
 ```text
 /api/method/payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings.callback?gateway_name=<Payrexx Settings name>
 ```
+
+Success redirect endpoint:
+
+```text
+/api/method/payrexx_integration.api.payment_success?ir=<Integration Request>&gateway_name=<Payrexx Settings name>
+```
+
+Payrexx success redirects reconcile the Integration Request by fetching the
+Gateway from Payrexx server-side. Webhooks remain the primary completion path,
+but the success return is a safe fallback because payment side effects only run
+after Payrexx reports the Gateway or one of its transactions as `confirmed`.
+If the Integration Request data contains a `redirect_to` value, the endpoint
+redirects directly to that same-site return URL after reconciliation; otherwise
+it falls back to the standard `/payment-success` page. If Payrexx does not yet
+report a confirmed payment, the endpoint redirects to `/payment-failed` instead
+of showing a success page prematurely.
 
 ## Security Model
 

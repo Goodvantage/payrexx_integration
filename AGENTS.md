@@ -73,11 +73,28 @@ The `gateway_name` query param is required when more than one Payrexx
 Settings row exists. The desk form's dashboard surfaces this URL so admins
 can paste it into the Payrexx webhook settings.
 
+### Success redirect URL (generated per Gateway)
+
+```
+{{ host_name }}/api/method/payrexx_integration.api.payment_success
+  ?ir=<Integration Request name>
+  &gateway_name=<Payrexx Settings name>
+```
+
+This endpoint is a fallback reconciliation path. It retrieves the Payrexx
+Gateway server-side and only completes the Integration Request when Payrexx
+reports a confirmed Gateway/transaction, then redirects directly to the
+Integration Request's same-site `redirect_to` when present, otherwise to the
+standard `/payment-success` page.
+
 ### Host URL — IMPORTANT for production
 
-`payrexx_pay_url` calls `frappe.utils.get_url()`, which respects the
-site's `host_name` config. **No URL is hard-coded.** In production, set
-`host_name` on the site (`bench --site <site> set-config host_name "https://kursverwaltung.example.ch"`) and the embedded URLs resolve correctly.
+Payrexx-facing URLs use `payrexx_integration.url_utils.get_public_url()`,
+which takes the site's `host_name` exactly as configured and avoids appending
+the local bench `webserver_port` behind reverse proxies or ngrok. **No URL is
+hard-coded.** In production, set `host_name` on the site (`bench --site <site>
+set-config host_name "https://kursverwaltung.example.ch"`) and the embedded
+URLs resolve correctly.
 
 ---
 
@@ -142,9 +159,10 @@ name (use it for `TEST_BOOKING_NAME` afterwards).
 - **Settings row is single per environment** but the doctype is NOT a
   Single — multiple rows are supported (e.g. `Sandbox` + `Live`). Webhooks
   must include `?gateway_name=...` once you have more than one row.
-- **No URL hard-coding** — every URL goes through `frappe.utils.get_url()`,
-  which respects `host_name`. The Playwright config is the only place
-  `localhost:8000` appears (test runner, not embedded).
+- **No URL hard-coding** — externally shared URLs go through
+  `payrexx_integration.url_utils.get_public_url()`, which respects
+  `host_name` without leaking the local bench port. The Playwright config is
+  the only place `localhost:8000` appears (test runner, not embedded).
 
 ---
 

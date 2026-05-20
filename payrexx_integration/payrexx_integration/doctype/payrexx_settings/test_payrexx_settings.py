@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlparse
 import frappe
 from frappe.tests import IntegrationTestCase
 
-from payrexx_integration.api import _sign, payrexx_pay_url
+from payrexx_integration.api import _sign, payment_success, payrexx_pay_url
 from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
@@ -83,6 +83,19 @@ class TestPayrexxSettings(IntegrationTestCase):
 		self.assertNotEqual(token, _sign("ACC-SINV-2026-00002", self.settings_name))
 		# Tampering with the gateway must also invalidate links generated with gateway_name.
 		self.assertNotEqual(token, _sign("ACC-SINV-2026-00001", "OtherGateway"))
+
+	def test_pay_url_uses_configured_public_host_without_dev_port(self):
+		from payrexx_integration.url_utils import get_public_url
+
+		original_host_name = frappe.conf.get("host_name")
+		try:
+			frappe.conf.host_name = "https://demo.example.test"
+			self.assertEqual(get_public_url("/goodnpo?x=1"), "https://demo.example.test/goodnpo?x=1")
+		finally:
+			if original_host_name is None:
+				frappe.conf.pop("host_name", None)
+			else:
+				frappe.conf.host_name = original_host_name
 
 	def test_pay_url_explicit_gateway_name(self):
 		other_settings = _ensure_settings("OtherGateway")
@@ -190,3 +203,122 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 		ir.reload()
 		self.assertEqual(ir.status, "Completed")
+
+	def test_success_reconciliation_marks_integration_request_completed(self):
+		ir = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Queued",
+				"data": json.dumps(
+					{
+						"payrexx_gateway_id": 999,
+						"payment_gateway": "Payrexx-" + GATEWAY_NAME,
+					}
+				),
+			}
+		).insert(ignore_permissions=True)
+
+		class _FakeClient:
+			def retrieve_gateway(self, gateway_id: int) -> dict:
+				self.gateway_id = gateway_id
+				return {
+					"id": gateway_id,
+					"status": "confirmed",
+					"invoices": [
+						{
+							"transactions": [
+								{
+									"id": 12345,
+									"status": "confirmed",
+									"referenceId": ir.name,
+								}
+							]
+						}
+					],
+				}
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		with patch.object(ps_module.PayrexxSettings, "_client", return_value=_FakeClient()):
+			self.assertTrue(ps_module.reconcile_integration_request(ir.name))
+
+		ir.reload()
+		self.assertEqual(ir.status, "Completed")
+		self.assertEqual((frappe.parse_json(ir.data) or {})["payrexx_transaction"]["id"], 12345)
+
+	def test_payment_success_redirects_directly_to_custom_return_url(self):
+		return_url = "https://demo.example.test/goodnpo?donation_status=success&donation=NPO-DTN#donate"
+		ir = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Completed",
+				"data": json.dumps({"redirect_to": return_url}),
+			}
+		).insert(ignore_permissions=True)
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		original_host_name = frappe.conf.get("host_name")
+		original_response = getattr(frappe.local, "response", None)
+		try:
+			frappe.conf.host_name = "https://demo.example.test"
+			frappe.local.response = {}
+			with patch.object(ps_module, "reconcile_integration_request", return_value=True):
+				payment_success(ir=ir.name, gateway_name=GATEWAY_NAME)
+			response = dict(frappe.local.response)
+		finally:
+			if original_host_name is None:
+				frappe.conf.pop("host_name", None)
+			else:
+				frappe.conf.host_name = original_host_name
+			if original_response is None:
+				frappe.local.response = {}
+			else:
+				frappe.local.response = original_response
+
+		self.assertEqual(response["type"], "redirect")
+		self.assertEqual(response["location"], return_url)
+
+	def test_payment_success_redirects_to_failed_page_when_not_confirmed(self):
+		ir = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Queued",
+				"data": json.dumps({"reference_doctype": "Donation", "reference_docname": "NPO-DTN-PENDING"}),
+			}
+		).insert(ignore_permissions=True)
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		original_host_name = frappe.conf.get("host_name")
+		original_response = getattr(frappe.local, "response", None)
+		try:
+			frappe.conf.host_name = "https://demo.example.test"
+			frappe.local.response = {}
+			with patch.object(ps_module, "reconcile_integration_request", return_value=False):
+				payment_success(ir=ir.name, gateway_name=GATEWAY_NAME)
+			response = dict(frappe.local.response)
+		finally:
+			if original_host_name is None:
+				frappe.conf.pop("host_name", None)
+			else:
+				frappe.conf.host_name = original_host_name
+			if original_response is None:
+				frappe.local.response = {}
+			else:
+				frappe.local.response = original_response
+
+		self.assertEqual(response["type"], "redirect")
+		self.assertEqual(
+			response["location"],
+			"https://demo.example.test/payment-failed?doctype=Donation&docname=NPO-DTN-PENDING",
+		)

@@ -17,11 +17,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 from contextlib import contextmanager
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import frappe
 from frappe import _
-from frappe.utils import get_url
+from frappe.utils import cstr
+
+from payrexx_integration.url_utils import get_public_url
 
 # ---------------------------------------------------------------- token helpers
 
@@ -83,7 +85,7 @@ def payrexx_pay_url(sales_invoice: str | None, gateway_name: str | None = None) 
 		"gateway_name": settings_name,
 		"token": _sign(sales_invoice, settings_name),
 	}
-	return get_url("/api/method/payrexx_integration.api.pay_invoice?" + urlencode(params))
+	return get_public_url("/api/method/payrexx_integration.api.pay_invoice?" + urlencode(params))
 
 
 # -------------------------------------------------------------- redirect entry
@@ -111,7 +113,9 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 		# Already paid — send the customer to the success page instead of
 		# creating a duplicate Payrexx gateway.
 		frappe.local.response["type"] = "redirect"
-		frappe.local.response["location"] = get_url("/payment-success?doctype=Sales Invoice&docname=" + si)
+		frappe.local.response["location"] = get_public_url(
+			"/payment-success?doctype=Sales Invoice&docname=" + si
+		)
 		return
 
 	settings_name = gateway_name or _resolve_default_settings()
@@ -125,6 +129,27 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 
 	frappe.local.response["type"] = "redirect"
 	frappe.local.response["location"] = checkout_url
+
+
+@frappe.whitelist(allow_guest=True)  # nosemgrep: guest-whitelisted-method
+def payment_success(ir: str | None = None, gateway_name: str | None = None) -> None:
+	"""Reconcile a Payrexx success redirect, then send the customer to the final return URL."""
+	if not ir or not frappe.db.exists("Integration Request", ir):
+		frappe.throw(_("Payment reference not found"), frappe.DoesNotExistError)
+
+	from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+		payrexx_settings,
+	)
+
+	reconciled = payrexx_settings.reconcile_integration_request(ir, gateway_name=gateway_name)
+	integration_request = frappe.get_doc("Integration Request", ir)
+	if not reconciled and integration_request.status != "Completed":
+		frappe.local.response["type"] = "redirect"
+		frappe.local.response["location"] = _payment_failed_redirect_url(integration_request)
+		return
+	redirect_url = _payment_success_redirect_url(integration_request)
+	frappe.local.response["type"] = "redirect"
+	frappe.local.response["location"] = redirect_url
 
 
 # ------------------------------------------------------------------- internals
@@ -194,6 +219,38 @@ def _delete_wrong_draft_payment_requests(sales_invoice_name: str, gateway: str) 
 	)
 	for payment_request_name in wrong_drafts:
 		frappe.delete_doc("Payment Request", payment_request_name, ignore_permissions=True, force=True)
+
+
+def _payment_success_redirect_url(integration_request) -> str:
+	data = frappe.parse_json(integration_request.data) or {}
+	if data.get("redirect_to"):
+		return _safe_return_url(data["redirect_to"])
+
+	params = {
+		"doctype": integration_request.reference_doctype or data.get("reference_doctype") or "",
+		"docname": integration_request.reference_docname or data.get("reference_docname") or "",
+	}
+	return get_public_url("/payment-success?" + urlencode(params))
+
+
+def _payment_failed_redirect_url(integration_request) -> str:
+	data = frappe.parse_json(integration_request.data) or {}
+	params = {
+		"doctype": integration_request.reference_doctype or data.get("reference_doctype") or "",
+		"docname": integration_request.reference_docname or data.get("reference_docname") or "",
+	}
+	return get_public_url("/payment-failed?" + urlencode(params))
+
+
+def _safe_return_url(redirect_to: str) -> str:
+	target = cstr(redirect_to).strip()
+	parts = urlsplit(target)
+	if parts.scheme or parts.netloc:
+		public_parts = urlsplit(get_public_url(""))
+		if parts.scheme in {"http", "https"} and parts.netloc == public_parts.netloc:
+			return target
+		frappe.throw(_("Unsafe payment redirect URL"), frappe.PermissionError)
+	return get_public_url(target)
 
 
 @contextmanager

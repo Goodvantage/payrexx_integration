@@ -1,20 +1,20 @@
 # Copyright (c) 2026, Goodvantage GmbH and contributors
 # For license information, please see license.txt
 
-import json
 from urllib.parse import urlencode
 
 import frappe
 from frappe import _
 from frappe.integrations.utils import create_request_log
 from frappe.model.document import Document
-from frappe.utils import call_hook_method, flt, get_url
+from frappe.utils import call_hook_method, flt
 from payments.utils import create_payment_gateway
 
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import PayrexxClient
 from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
+from payrexx_integration.url_utils import get_public_url
 
 
 class PayrexxSettings(Document):
@@ -125,7 +125,7 @@ class PayrexxSettings(Document):
 			"fields[forename][value]": first,
 			"fields[surname][value]": last,
 			"fields[email][value]": kwargs.get("payer_email") or "",
-			"successRedirectUrl": self._return_url(kwargs, "success"),
+			"successRedirectUrl": self._return_url(kwargs, "success", integration_request_name),
 			"failedRedirectUrl": self._return_url(kwargs, "failed"),
 			"cancelRedirectUrl": self._return_url(kwargs, "cancel"),
 		}
@@ -139,7 +139,7 @@ class PayrexxSettings(Document):
 
 		return payload
 
-	def _return_url(self, kwargs: dict, kind: str) -> str:
+	def _return_url(self, kwargs: dict, kind: str, integration_request_name: str | None = None) -> str:
 		override = {
 			"success": self.success_redirect_url,
 			"failed": self.failed_redirect_url,
@@ -148,7 +148,18 @@ class PayrexxSettings(Document):
 		if override:
 			return override
 
-		base = get_url("/payment-success" if kind == "success" else "/payment-failed")
+		if kind == "success" and integration_request_name:
+			return get_public_url(
+				"/api/method/payrexx_integration.api.payment_success?"
+				+ urlencode(
+					{
+						"ir": integration_request_name,
+						"gateway_name": self.name,
+					}
+				)
+			)
+
+		base = get_public_url("/payment-success" if kind == "success" else "/payment-failed")
 		params = {
 			"doctype": kwargs.get("reference_doctype", ""),
 			"docname": kwargs.get("reference_docname", ""),
@@ -182,7 +193,7 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 		if not verify_webhook_signature(raw_body, signature, settings.get_password("webhook_signing_key")):
 			frappe.throw(_("Invalid Payrexx webhook signature"), frappe.AuthenticationError)
 
-		body = json.loads(raw_body or b"{}") if raw_body else {}
+		body = frappe.parse_json(raw_body.decode("utf-8") if raw_body else "{}") or {}
 		txn = body.get("transaction") or {}
 		invoice = txn.get("invoice") or {}
 		ref_id = invoice.get("referenceId") or txn.get("referenceId")
@@ -202,10 +213,7 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 		ir.data = frappe.as_json(ir_data)
 
 		if status == "confirmed":
-			ir.status = "Completed"
-			ir.save(ignore_permissions=True)
-			frappe.db.commit()
-			_on_payment_authorized(ir, "Completed")
+			_complete_integration_request(ir, txn)
 		elif status in ("authorized", "reserved"):
 			ir.status = "Authorized"
 			ir.save(ignore_permissions=True)
@@ -236,6 +244,75 @@ def _resolve_settings(gateway_name: str | None) -> "PayrexxSettings":
 	if len(rows) == 1:
 		return frappe.get_cached_doc("Payrexx Settings", rows[0])
 	frappe.throw(_("Multiple Payrexx Settings exist — webhook URL must include ?gateway_name=..."))
+
+
+def reconcile_integration_request(
+	integration_request_name: str,
+	gateway_name: str | None = None,
+) -> bool:
+	"""Confirm an Integration Request by asking Payrexx for the Gateway status.
+
+	This is a fallback for success redirects. Webhooks remain the primary source
+	of truth, but the browser return can safely reconcile because the server
+	checks Payrexx before applying payment side effects.
+	"""
+	if not integration_request_name or not frappe.db.exists("Integration Request", integration_request_name):
+		return False
+
+	ir = frappe.get_doc("Integration Request", integration_request_name)
+	if ir.integration_request_service != "Payrexx":
+		return False
+	if ir.status == "Completed":
+		return True
+
+	ir_data = frappe.parse_json(ir.data) or {}
+	gateway_id = ir_data.get("payrexx_gateway_id")
+	if not gateway_id:
+		return False
+
+	settings = _resolve_settings(gateway_name or _settings_name_from_request_data(ir_data))
+	gateway = settings._client().retrieve_gateway(int(gateway_id))
+	status = (gateway.get("status") or "").lower()
+	transaction = _confirmed_transaction_from_gateway(gateway)
+
+	if status == "confirmed" or (transaction and (transaction.get("status") or "").lower() == "confirmed"):
+		_complete_integration_request(ir, transaction or gateway)
+		return True
+	if status in ("cancelled", "declined", "error", "expired", "chargeback"):
+		ir.status = "Failed"
+		ir.error = f"Payrexx status: {status}"
+		ir.save(ignore_permissions=True)
+		frappe.db.commit()
+	return False
+
+
+def _settings_name_from_request_data(ir_data: dict) -> str | None:
+	payment_gateway = (ir_data.get("payment_gateway") or "").strip()
+	if payment_gateway.startswith("Payrexx-"):
+		return payment_gateway.removeprefix("Payrexx-")
+	return None
+
+
+def _confirmed_transaction_from_gateway(gateway: dict) -> dict:
+	for invoice in gateway.get("invoices") or []:
+		for transaction in invoice.get("transactions") or []:
+			if (transaction.get("status") or "").lower() == "confirmed":
+				return transaction
+	return {}
+
+
+def _complete_integration_request(integration_request, transaction: dict | None = None) -> None:
+	was_completed = integration_request.status == "Completed"
+	ir_data = frappe.parse_json(integration_request.data) or {}
+	if transaction:
+		ir_data["payrexx_transaction"] = transaction
+	integration_request.data = frappe.as_json(ir_data)
+	integration_request.status = "Completed"
+	integration_request.save(ignore_permissions=True)
+	frappe.db.commit()
+	if not was_completed:
+		_on_payment_authorized(integration_request, "Completed")
+		frappe.db.commit()
 
 
 def _on_payment_authorized(integration_request, status):

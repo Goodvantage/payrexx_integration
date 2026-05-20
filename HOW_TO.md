@@ -36,9 +36,27 @@ The helper returns a signed URL:
 
 When clicked, the endpoint verifies the token, lazy-creates a Payment Request through ERPNext, and redirects to Payrexx hosted checkout.
 
-## 4. Set The Production Host URL
+## 4. Success Redirect Fallback
 
-The app uses `frappe.utils.get_url()`. Set the site `host_name` in production so emails contain the public URL:
+Payrexx webhooks should still be configured, but every generated Gateway also
+uses a success redirect back into:
+
+```text
+https://<site>/api/method/payrexx_integration.api.payment_success?ir=<Integration Request>&gateway_name=<Payrexx Settings name>
+```
+
+That endpoint asks Payrexx for the Gateway status server-side and only marks the
+Integration Request complete when Payrexx reports a confirmed payment.
+When a payment creator stored `redirect_to` in the Integration Request, the
+endpoint sends the customer directly back to that same-site URL after
+reconciliation instead of showing the generic `/payment-success` page. If the
+Gateway is not confirmed, the customer is sent to `/payment-failed`.
+
+## 5. Set The Production Host URL
+
+The app uses the configured public `host_name` for externally shared URLs. Set
+it in production so emails and Payrexx redirects contain the public URL without
+the local bench port:
 
 ```bash
 cd frappe-bench
@@ -46,7 +64,7 @@ bench --site <site> set-config host_name "https://kursverwaltung.example.ch"
 bench --site <site> clear-cache
 ```
 
-## 5. Troubleshoot A Failed Save
+## 6. Troubleshoot A Failed Save
 
 If saving Payrexx Settings fails:
 
@@ -57,7 +75,7 @@ If saving Payrexx Settings fails:
 
 The app pings `GET /Gateway/0/`; a Payrexx JSON response with `status: error` can still mean credentials are accepted if the error is "gateway not found".
 
-## 6. Troubleshoot A Payment Link
+## 7. Troubleshoot A Payment Link
 
 If a pay link returns 403:
 
@@ -66,9 +84,11 @@ If a pay link returns 403:
 3. Confirm the site's `encryption_key` was not rotated after the email was sent.
 4. Confirm URL parameters were not stripped by an email client.
 
-If the link opens but payment does not update, check **Integration Request** rows and Payrexx webhook delivery logs.
+If the link opens but payment does not update, check **Integration Request**
+rows, Payrexx webhook delivery logs, and whether Payrexx can reach the success
+redirect URL on the public `host_name`.
 
-## 7. Run Tests
+## 8. Run Tests
 
 ```bash
 cd frappe-bench
