@@ -232,11 +232,17 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 		status = (txn.get("status") or "").lower()
 
 		if not ref_id:
-			frappe.log_error(frappe.as_json(body), "Payrexx webhook missing referenceId")
+			frappe.log_error(
+				frappe.as_json(_webhook_log_summary(txn, ref_id, status)),
+				"Payrexx webhook missing referenceId",
+			)
 			return {"ok": True}
 
 		if not frappe.db.exists("Integration Request", ref_id):
-			frappe.log_error(f"No Integration Request {ref_id}", "Payrexx webhook unknown reference")
+			frappe.log_error(
+				frappe.as_json(_webhook_log_summary(txn, ref_id, status)),
+				"Payrexx webhook unknown reference",
+			)
 			return {"ok": True}
 
 		ir = frappe.get_doc("Integration Request", ref_id)
@@ -296,6 +302,20 @@ def _gateway_name_from_request(gateway_name: str | None) -> str | None:
 			return cstr(form_gateway_name).strip()
 
 	return None
+
+
+def _webhook_log_summary(txn: dict, ref_id: str | None, status: str | None) -> dict[str, str | int | None]:
+	invoice = txn.get("invoice") or {}
+	instance = txn.get("instance") or {}
+	return {
+		"reference_id": ref_id,
+		"status": status or txn.get("status"),
+		"transaction_id": txn.get("id"),
+		"transaction_uuid": txn.get("uuid"),
+		"mode": txn.get("mode"),
+		"instance_name": instance.get("name"),
+		"payment_request_id": invoice.get("paymentRequestId"),
+	}
 
 
 def reconcile_integration_request(

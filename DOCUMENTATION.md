@@ -80,6 +80,11 @@ After signature verification, payment side effects run as the configured
 as `Administrator`. Transient `QueryDeadlockError` failures while running the
 reference document's `on_payment_authorized` hook are retried before the webhook
 is allowed to fail.
+If a webhook is missing `referenceId` or references an unknown Integration
+Request, the callback logs only a compact transaction summary
+(`reference_id`, status, transaction id/uuid, mode, instance, and payment
+request id) instead of the full Payrexx payload, because the full payload can
+contain payer contact data.
 
 Success redirect endpoint:
 
@@ -105,6 +110,7 @@ instead of the generic failed-payment page.
 - Pay-by-email URLs are signed with an HMAC derived from the site's `encryption_key`.
 - Payrexx webhooks are validated with `X-Webhook-Signature`.
 - Webhook signing key and API secret are separate values.
+- Webhook diagnostics avoid logging full payer/payment payloads.
 - Guest endpoints are intentionally whitelisted and documented in `SEMGREP_OVERRIDES.md`.
 
 ## Cross-App Integration
