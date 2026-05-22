@@ -143,9 +143,9 @@ instance credentials with 401/403/404, the client retries once on the default
 `https://api.payrexx.com/v1.14/...` host.
 
 After `Gateway Name` is filled, the settings form immediately displays the
-webhook callback URL. The row does not need to be saved yet, so you can create
-the webhook in Payrexx first and then paste the generated signing key into
-**Webhook Signing Key**.
+webhook callback URL using the configured public `host_name` where available.
+The row does not need to be saved yet, so you can create the webhook in Payrexx
+first and then paste the generated signing key into **Webhook Signing Key**.
 
 Save. Two things happen automatically:
 1. `validate()` pings `GET /Gateway/?limit=1` — if your credentials are wrong

@@ -9,9 +9,11 @@ Payrexx Integration adds Payrexx hosted checkout support as a standalone app on 
 3. Save.
 
 The form shows one callback URL as soon as `gateway_name` is filled, even before
-the row can be saved. Refreshing or saving the form replaces that hint in place
-instead of appending duplicate lines. Use that URL to create the Payrexx webhook,
-then paste the generated signing key back into **Webhook Signing Key**.
+the row can be saved. The URL uses the site's configured public `host_name` when
+available, so admins do not accidentally copy a temporary tunnel URL. Refreshing
+or saving the form replaces that hint in place instead of appending duplicate
+lines. Use that URL to create the Payrexx webhook, then paste the generated
+signing key back into **Webhook Signing Key**.
 
 On save, the controller verifies credentials unless running in tests/install and creates the corresponding `Payment Gateway` row.
 
@@ -75,15 +77,20 @@ need a branded failed-payment state can pass `failed_redirect_to` and
 
 ## 5. Set The Production Host URL
 
-The app uses the configured public `host_name` for externally shared URLs. Set
-it in production so emails and Payrexx redirects contain the public URL without
-the local bench port:
+The app uses the configured public `host_name` for externally shared URLs,
+including pay links, redirects, and the webhook URL shown in Desk. Set it in
+production so Payrexx never receives a local bench port or temporary tunnel URL:
 
 ```bash
 cd frappe-bench
 bench --site <site> set-config host_name "https://kursverwaltung.example.ch"
 bench --site <site> clear-cache
 ```
+
+If Payrexx logs show an ngrok HTML response such as `ERR_NGROK_3200`, the
+webhook was configured with an offline tunnel URL. Update the webhook in the
+Payrexx dashboard to the current public `host_name` URL from **Payrexx
+Settings**.
 
 ## 6. Troubleshoot A Failed Save
 

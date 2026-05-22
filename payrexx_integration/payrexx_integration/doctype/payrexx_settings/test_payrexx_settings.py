@@ -101,6 +101,30 @@ class TestPayrexxSettings(IntegrationTestCase):
 			else:
 				frappe.conf.host_name = original_host_name
 
+	def test_webhook_url_uses_configured_public_host_without_dev_port(self):
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings import (
+			get_webhook_url,
+		)
+
+		original_host_name = frappe.conf.get("host_name")
+		try:
+			frappe.conf.host_name = "https://demo.example.test"
+			url = get_webhook_url("Sandbox")
+			parts = urlparse(url)
+			self.assertEqual(parts.scheme, "https")
+			self.assertEqual(parts.netloc, "demo.example.test")
+			self.assertEqual(
+				parts.path,
+				"/api/method/payrexx_integration.payrexx_integration.doctype."
+				"payrexx_settings.payrexx_settings.callback",
+			)
+			self.assertEqual(parse_qs(parts.query).get("gateway_name"), ["Sandbox"])
+		finally:
+			if original_host_name is None:
+				frappe.conf.pop("host_name", None)
+			else:
+				frappe.conf.host_name = original_host_name
+
 	def test_payrexx_client_uses_default_api_domain(self):
 		client = PayrexxClient(instance="demo", api_secret="sk_test_dummy", api_version="v1.14")
 		self.assertEqual(

@@ -194,6 +194,18 @@ class PayrexxSettings(Document):
 # =============================================================================
 
 
+@frappe.whitelist()
+def get_webhook_url(gateway_name: str | None = None) -> str:
+	gateway_name = cstr(gateway_name).strip()
+	if not gateway_name:
+		return ""
+
+	return get_public_url(
+		"/api/method/payrexx_integration.payrexx_integration.doctype.payrexx_settings."
+		"payrexx_settings.callback?" + urlencode({"gateway_name": gateway_name})
+	)
+
+
 @frappe.whitelist(allow_guest=True)  # nosemgrep: guest-whitelisted-method
 def callback(gateway_name: str | None = None) -> dict[str, bool]:
 	"""

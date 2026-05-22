@@ -56,8 +56,9 @@ invoices return no payment URL, and `pay_invoice` rejects draft invoices before
 creating a Payrexx gateway.
 
 Externally shared URLs are built from `host_name` exactly as configured. This
-avoids leaking a local bench `webserver_port` such as `:8000` into Payrexx
-checkout links when the site is exposed through a reverse proxy or ngrok URL.
+avoids leaking a local bench `webserver_port` such as `:8000`, or a temporary
+tunnel origin, into Payrexx checkout links and webhook instructions when the
+site is exposed through a reverse proxy or ngrok URL.
 
 Webhook endpoint:
 
@@ -65,8 +66,10 @@ Webhook endpoint:
 /api/method/payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings.callback?gateway_name=<Payrexx Settings name>
 ```
 
-The Desk form renders this callback URL as soon as `gateway_name` is filled,
-including on unsaved rows. Refreshing or saving the form replaces the existing
+The Desk form asks the server for this callback URL as soon as `gateway_name`
+is filled, including on unsaved rows. The helper uses the configured public
+`host_name` when available and falls back to the current browser origin only if
+the server call fails. Refreshing or saving the form replaces the existing
 webhook URL hint instead of appending duplicate headline rows. The webhook
 signing key can therefore stay blank until the webhook has been created in
 Payrexx.
