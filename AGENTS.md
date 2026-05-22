@@ -39,7 +39,7 @@ Innermost package dir: `payrexx_integration/payrexx_integration/payrexx_integrat
 | File | Purpose |
 |---|---|
 | `payrexx_integration/payrexx_integration/doctype/payrexx_settings/` | The settings DocType. One row per environment (`Sandbox` / `Live`). `on_update` auto-creates the matching `Payment Gateway` row (`Payrexx-<gateway_name>`). |
-| `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client. **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The legacy `ApiSignature` body field is no longer used. |
+| `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client. **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The legacy `ApiSignature` body field is no longer used. Supports Payrexx Platform domains through `Payrexx Settings.api_base_domain`. |
 | `payrexx_integration/payrexx_integration/payrexx/webhook_validator.py` | HMAC-SHA256 verification of `X-Webhook-Signature`. Tries base64 first, falls back to hex. The signing key is **separate** from the API secret (configured per webhook in the Payrexx dashboard). |
 | `api.py::payrexx_pay_url(sales_invoice)` | Jinja helper (registered via `hooks.py.jinja`). Returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
 | `api.py::pay_invoice(si, token)` | Whitelisted redirect endpoint. Verifies the HMAC token, looks up the Sales Invoice, lazy-creates a Payment Request via ERPNext's `make_payment_request`, and 302s to the Payrexx hosted checkout. **Both args are optional kwargs** so missing-param requests return clean 403, not 500. |
@@ -102,7 +102,7 @@ URLs resolve correctly.
 
 | | |
 |---|---|
-| Base URL | `https://api.payrexx.com/v1.14/` |
+| Base URL | `https://api.<api_base_domain>/v1.14/`; default `https://api.payrexx.com/v1.14/` |
 | Auth | `x-api-key: <api_secret>` header |
 | Required query param | `?instance=<instance_name>` on every call |
 | POST body format | `application/x-www-form-urlencoded` |
@@ -112,6 +112,11 @@ URLs resolve correctly.
 
 A "no gateway found" GET against `/Gateway/0/` is the cheap auth-check used
 by `_ping()` — HTTP 200 with `status: error` means creds are valid.
+
+For Payrexx Platform / partner accounts, split the checkout/login domain:
+`kibesuisse.pay.goodvantage.ch` means `instance_name = "kibesuisse"` and
+`api_base_domain = "pay.goodvantage.ch"`. Do not put the full login domain in
+`instance_name`.
 
 ### Status mapping (webhook)
 

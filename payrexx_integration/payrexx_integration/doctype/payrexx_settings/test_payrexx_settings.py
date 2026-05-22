@@ -12,6 +12,7 @@ import frappe
 from frappe.tests import IntegrationTestCase
 
 from payrexx_integration.api import _sign, payment_success, payrexx_pay_url
+from payrexx_integration.payrexx_integration.payrexx.payrexx_client import PayrexxClient
 from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
@@ -30,6 +31,7 @@ def _ensure_settings(name: str = GATEWAY_NAME) -> str:
 			"doctype": "Payrexx Settings",
 			"gateway_name": name,
 			"instance_name": "test-instance",
+			"api_base_domain": "payrexx.com",
 			"api_secret": "sk_test_dummy",
 			"webhook_signing_key": "whk_test_dummy",
 			"api_version": "v1.14",
@@ -96,6 +98,66 @@ class TestPayrexxSettings(IntegrationTestCase):
 				frappe.conf.pop("host_name", None)
 			else:
 				frappe.conf.host_name = original_host_name
+
+	def test_payrexx_client_uses_default_api_domain(self):
+		client = PayrexxClient(instance="demo", api_secret="sk_test_dummy", api_version="v1.14")
+		self.assertEqual(
+			client._url("Gateway/"),
+			"https://api.payrexx.com/v1.14/Gateway/?instance=demo",
+		)
+
+	def test_payrexx_client_uses_platform_api_domain(self):
+		client = PayrexxClient(
+			instance="kibesuisse",
+			api_secret="sk_test_dummy",
+			api_version="v1.14",
+			api_base_domain="pay.goodvantage.ch",
+		)
+		self.assertEqual(
+			client._url("Gateway/"),
+			"https://api.pay.goodvantage.ch/v1.14/Gateway/?instance=kibesuisse",
+		)
+
+	def test_settings_client_passes_platform_api_domain(self):
+		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
+		doc.instance_name = "kibesuisse"
+		doc.api_base_domain = "pay.goodvantage.ch"
+		client = doc._client()
+		self.assertEqual(client.instance, "kibesuisse")
+		self.assertEqual(client.api_base_domain, "pay.goodvantage.ch")
+		self.assertEqual(
+			client._url("Gateway/0/"),
+			"https://api.pay.goodvantage.ch/v1.14/Gateway/0/?instance=kibesuisse",
+		)
+
+	def test_gateway_payload_uses_per_checkout_failure_return_url(self):
+		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
+		original_host_name = frappe.conf.get("host_name")
+		try:
+			frappe.conf.host_name = "https://demo.example.test"
+			payload = doc._build_create_gateway_payload(
+				{
+					"amount": 50,
+					"currency": "CHF",
+					"description": "Demo donation",
+					"reference_doctype": "Donation",
+					"reference_docname": "NPO-DTN-TEST",
+					"failed_redirect_to": "/demo?donation_status=failed&donation=NPO-DTN-TEST",
+					"cancel_redirect_to": "/demo?donation_status=failed&donation=NPO-DTN-TEST",
+				},
+				"PAYREXX-IR-TEST",
+			)
+		finally:
+			if original_host_name is None:
+				frappe.conf.pop("host_name", None)
+			else:
+				frappe.conf.host_name = original_host_name
+
+		self.assertEqual(
+			payload["failedRedirectUrl"],
+			"https://demo.example.test/demo?donation_status=failed&donation=NPO-DTN-TEST",
+		)
+		self.assertEqual(payload["cancelRedirectUrl"], payload["failedRedirectUrl"])
 
 	def test_pay_url_explicit_gateway_name(self):
 		other_settings = _ensure_settings("OtherGateway")

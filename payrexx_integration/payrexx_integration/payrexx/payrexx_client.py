@@ -1,10 +1,10 @@
 # Copyright (c) 2026, Goodvantage GmbH and contributors
 
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from frappe.integrations.utils import make_get_request, make_post_request
 
-BASE_URL = "https://api.payrexx.com"
+DEFAULT_API_BASE_DOMAIN = "payrexx.com"
 
 
 class PayrexxAPIError(RuntimeError):
@@ -16,10 +16,17 @@ class PayrexxClient:
 
 	Auth: API secret is sent in the 'x-api-key' header (current Payrexx scheme,
 	per the official PHP SDK in payrexx/payrexx-php). The legacy ApiSignature
-	body field is no longer required.
+	body field is no longer required. Platform accounts can pass a custom
+	``api_base_domain`` such as ``pay.goodvantage.ch``.
 	"""
 
-	def __init__(self, instance: str, api_secret: str, api_version: str = "v1.14"):
+	def __init__(
+		self,
+		instance: str,
+		api_secret: str,
+		api_version: str = "v1.14",
+		api_base_domain: str | None = None,
+	):
 		if not instance:
 			raise ValueError("Payrexx instance name is required")
 		if not api_secret:
@@ -27,6 +34,7 @@ class PayrexxClient:
 		self.instance = instance
 		self.api_secret = api_secret
 		self.version = api_version
+		self.api_base_domain = _normalize_api_base_domain(api_base_domain)
 
 	# ----------------------------------------------------------------- Gateway
 
@@ -74,7 +82,7 @@ class PayrexxClient:
 		q = {"instance": self.instance}
 		if query:
 			q.update(query)
-		return f"{BASE_URL}/{self.version}/{path.lstrip('/')}?{urlencode(q)}"
+		return f"https://api.{self.api_base_domain}/{self.version}/{path.lstrip('/')}?{urlencode(q)}"
 
 	def _headers(self) -> dict:
 		return {"x-api-key": self.api_secret, "Accept": "application/json"}
@@ -86,3 +94,16 @@ def _unwrap(resp: dict) -> dict:
 		raise PayrexxAPIError((resp or {}).get("message", "Unknown Payrexx error"))
 	data = resp.get("data") or []
 	return data[0] if data else {}
+
+
+def _normalize_api_base_domain(value: str | None) -> str:
+	raw = (value or DEFAULT_API_BASE_DOMAIN).strip().rstrip("/")
+	if not raw:
+		return DEFAULT_API_BASE_DOMAIN
+	if "://" in raw:
+		parts = urlsplit(raw)
+		raw = parts.netloc or parts.path
+	raw = raw.strip().strip("/")
+	if raw.startswith("api."):
+		raw = raw[4:]
+	return raw or DEFAULT_API_BASE_DOMAIN

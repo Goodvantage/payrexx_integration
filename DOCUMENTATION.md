@@ -20,6 +20,13 @@ Do not modify `apps/payments` directly for Payrexx behavior.
 | `Payrexx Settings` | Per-environment Payrexx credentials and gateway settings. |
 
 Saving Payrexx Settings creates/updates the matching `Payment Gateway` row through the standard payments utility.
+Normal Payrexx accounts use `api_base_domain = "payrexx.com"`, producing API
+calls to `https://api.payrexx.com/...`. Payrexx Platform / partner accounts
+store only the first subdomain in `instance_name` and the remaining platform
+domain in `api_base_domain`; for example, `kibesuisse.pay.goodvantage.ch`
+uses `instance_name = "kibesuisse"` and
+`api_base_domain = "pay.goodvantage.ch"`, producing API calls to
+`https://api.pay.goodvantage.ch/...`.
 
 ## Important Modules
 
@@ -68,7 +75,10 @@ If the Integration Request data contains a `redirect_to` value, the endpoint
 redirects directly to that same-site return URL after reconciliation; otherwise
 it falls back to the standard `/payment-success` page. If Payrexx does not yet
 report a confirmed payment, the endpoint redirects to `/payment-failed` instead
-of showing a success page prematurely.
+of showing a success page prematurely. Payment creators can pass per-checkout
+`failed_redirect_to` and `cancel_redirect_to` values to `get_payment_url()` when
+they need failed or cancelled Payrexx returns to land back in their own UI
+instead of the generic failed-payment page.
 
 ## Security Model
 

@@ -87,14 +87,15 @@ query param to disambiguate which signing key to verify against.
 | Field | Type | Notes |
 |---|---|---|
 | `gateway_name` | Data, unique, reqd | `Live`, `Sandbox`, … — used to build `Payrexx-{name}` |
-| `instance_name` | Data, reqd | Payrexx subdomain (before `.payrexx.com`) |
+| `instance_name` | Data, reqd | Payrexx instance subdomain. For `kibesuisse.pay.goodvantage.ch`, use `kibesuisse` |
+| `api_base_domain` | Data, default `payrexx.com`, reqd | API base domain. Normal accounts use `payrexx.com`; platform accounts use the remaining domain, e.g. `pay.goodvantage.ch` |
 | `api_version` | Data, default `v1.14` | Bump without code change |
 | `api_secret` | Password, reqd | Sent as `x-api-key` header |
 | `webhook_signing_key` | Password, reqd | HMAC key for `X-Webhook-Signature` |
 | `supported_currencies` | Small Text, default `CHF,EUR,USD,GBP` | Comma list, validated per transaction |
 | `psp` | Small Text | Optional comma list of PSP IDs |
 | `validity_minutes` | Int | Optional gateway TTL |
-| `success_redirect_url` / `failed_redirect_url` / `cancel_redirect_url` | Data | Optional overrides; defaults bring the customer through the success reconciliation endpoint, then to the Integration Request `redirect_to` when present or `/payment-success` on the Frappe site |
+| `success_redirect_url` / `failed_redirect_url` / `cancel_redirect_url` | Data | Optional global overrides; defaults bring success through the reconciliation endpoint and failed/cancelled returns to `/payment-failed`. Per-checkout `failed_redirect_to` / `cancel_redirect_to` kwargs override the generic failed/cancelled pages for branded flows. |
 
 ---
 
@@ -129,9 +130,15 @@ In the desk, open **Payrexx Settings → New** and fill in:
 | Field | Value |
 |---|---|
 | Gateway Name | `Live` (or `Sandbox`) |
-| Instance Name | your Payrexx subdomain |
+| Instance Name | your Payrexx instance subdomain |
+| API Base Domain | `payrexx.com`, or the partner/platform base domain such as `pay.goodvantage.ch` |
 | API Secret | from Payrexx → Integrations → API & Plugins |
 | Webhook Signing Key | from Payrexx → Webhooks → (signing key field) |
+
+For a partner checkout domain such as `kibesuisse.pay.goodvantage.ch`, set
+`Instance Name` to `kibesuisse` and `API Base Domain` to
+`pay.goodvantage.ch`. The app then calls
+`https://api.pay.goodvantage.ch/v1.14/...`.
 
 Save. Two things happen automatically:
 1. `validate()` pings `GET /Gateway/?limit=1` — if your credentials are wrong
@@ -170,7 +177,7 @@ In a `Payment Request` (or any flow that takes a Payment Gateway), pick
 
 | | |
 |---|---|
-| **Base URL** | `https://api.payrexx.com/v1.14/` |
+| **Base URL** | `https://api.<api_base_domain>/v1.14/`, default `https://api.payrexx.com/v1.14/` |
 | **Auth** | `x-api-key: <api_secret>` header |
 | **Required query param** | `?instance=<your_instance>` on every request |
 | **POST body format** | `application/x-www-form-urlencoded` |

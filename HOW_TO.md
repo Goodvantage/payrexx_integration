@@ -5,10 +5,19 @@ Payrexx Integration adds Payrexx hosted checkout support as a standalone app on 
 ## 1. Create Payrexx Settings
 
 1. Open **Payrexx Settings**.
-2. Set `gateway_name`, environment, instance name, API secret, and webhook signing key.
+2. Set `gateway_name`, environment, instance name, API base domain, API secret, and webhook signing key.
 3. Save.
 
 On save, the controller verifies credentials unless running in tests/install and creates the corresponding `Payment Gateway` row.
+
+For normal Payrexx accounts, keep `api_base_domain` as `payrexx.com`. For
+Payrexx Platform / partner accounts, split the login domain into instance and
+base domain. Example: `kibesuisse.pay.goodvantage.ch` becomes:
+
+```text
+Instance Name: kibesuisse
+API Base Domain: pay.goodvantage.ch
+```
 
 ## 2. Configure The Webhook In Payrexx
 
@@ -50,7 +59,9 @@ Integration Request complete when Payrexx reports a confirmed payment.
 When a payment creator stored `redirect_to` in the Integration Request, the
 endpoint sends the customer directly back to that same-site URL after
 reconciliation instead of showing the generic `/payment-success` page. If the
-Gateway is not confirmed, the customer is sent to `/payment-failed`.
+Gateway is not confirmed, the customer is sent to `/payment-failed`. Apps that
+need a branded failed-payment state can pass `failed_redirect_to` and
+`cancel_redirect_to` to `get_payment_url()` for that individual checkout.
 
 ## 5. Set The Production Host URL
 
@@ -68,10 +79,11 @@ bench --site <site> clear-cache
 
 If saving Payrexx Settings fails:
 
-1. Confirm the instance name matches Payrexx exactly.
-2. Confirm the API secret is current.
-3. Confirm outbound network access from the bench.
-4. Try saving in Sandbox first.
+1. Confirm the instance name matches the first subdomain of the checkout/login domain.
+2. Confirm the API base domain is correct (`payrexx.com` for normal accounts, e.g. `pay.goodvantage.ch` for GoodVantage partner accounts).
+3. Confirm the API secret is current.
+4. Confirm outbound network access from the bench.
+5. Try saving in Sandbox first.
 
 The app pings `GET /Gateway/0/`; a Payrexx JSON response with `status: error` can still mean credentials are accepted if the error is "gateway not found".
 

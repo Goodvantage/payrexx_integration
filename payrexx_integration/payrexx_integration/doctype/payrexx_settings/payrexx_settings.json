@@ -9,6 +9,7 @@
   "credentials_section",
   "gateway_name",
   "instance_name",
+  "api_base_domain",
   "api_version",
   "column_break_creds",
   "api_secret",
@@ -39,11 +40,19 @@
    "unique": 1
   },
   {
-   "description": "Your Payrexx instance subdomain (the part before .payrexx.com).",
+   "description": "Your Payrexx instance subdomain. For kibesuisse.pay.goodvantage.ch, use kibesuisse here and pay.goodvantage.ch in API Base Domain.",
    "fieldname": "instance_name",
    "fieldtype": "Data",
    "in_list_view": 1,
    "label": "Instance Name",
+   "reqd": 1
+  },
+  {
+   "default": "payrexx.com",
+   "description": "API base domain for Payrexx platform accounts. Use payrexx.com for normal Payrexx instances, or e.g. pay.goodvantage.ch for kibesuisse.pay.goodvantage.ch.",
+   "fieldname": "api_base_domain",
+   "fieldtype": "Data",
+   "label": "API Base Domain",
    "reqd": 1
   },
   {

@@ -1,13 +1,13 @@
 # Copyright (c) 2026, Goodvantage GmbH and contributors
 # For license information, please see license.txt
 
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import frappe
 from frappe import _
 from frappe.integrations.utils import create_request_log
 from frappe.model.document import Document
-from frappe.utils import call_hook_method, flt
+from frappe.utils import call_hook_method, cstr, flt
 from payments.utils import create_payment_gateway
 
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import PayrexxClient
@@ -70,6 +70,7 @@ class PayrexxSettings(Document):
 			instance=self.instance_name,
 			api_secret=self.get_password("api_secret"),
 			api_version=self.api_version or "v1.14",
+			api_base_domain=self.get("api_base_domain"),
 		)
 
 	def _ping(self):
@@ -83,7 +84,7 @@ class PayrexxSettings(Document):
 		import requests
 
 		client = self._client()
-		url = f"https://api.payrexx.com/{client.version}/Gateway/0/?instance={client.instance}"
+		url = client._url("Gateway/0/")
 		try:
 			resp = requests.get(url, headers=client._headers(), timeout=10)
 		except Exception:
@@ -99,9 +100,10 @@ class PayrexxSettings(Document):
 			body = {}
 		if "status" not in body:
 			frappe.throw(
-				_("Unexpected response from Payrexx. Check that 'Instance Name' ({0}) is correct.").format(
-					client.instance
-				)
+				_(
+					"Unexpected response from Payrexx. Check that 'Instance Name' ({0}) and "
+					"'API Base Domain' ({1}) are correct."
+				).format(client.instance, client.api_base_domain)
 			)
 
 	def _supported_currencies(self) -> set[str]:
@@ -140,6 +142,10 @@ class PayrexxSettings(Document):
 		return payload
 
 	def _return_url(self, kwargs: dict, kind: str, integration_request_name: str | None = None) -> str:
+		request_redirect = kwargs.get(f"{kind}_redirect_to") or kwargs.get(f"{kind}_redirect_url")
+		if request_redirect:
+			return self._safe_return_url(request_redirect)
+
 		override = {
 			"success": self.success_redirect_url,
 			"failed": self.failed_redirect_url,
@@ -167,6 +173,16 @@ class PayrexxSettings(Document):
 		if kwargs.get("redirect_to"):
 			params["redirect_to"] = kwargs["redirect_to"]
 		return f"{base}?{urlencode(params)}"
+
+	def _safe_return_url(self, redirect_to: str) -> str:
+		target = cstr(redirect_to).strip()
+		parts = urlsplit(target)
+		if parts.scheme or parts.netloc:
+			public_parts = urlsplit(get_public_url(""))
+			if parts.scheme in {"http", "https"} and parts.netloc == public_parts.netloc:
+				return target
+			frappe.throw(_("Unsafe Payrexx return URL"), frappe.PermissionError)
+		return get_public_url(target)
 
 
 # =============================================================================
