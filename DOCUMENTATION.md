@@ -66,8 +66,10 @@ Webhook endpoint:
 ```
 
 The Desk form renders this callback URL as soon as `gateway_name` is filled,
-including on unsaved rows. The webhook signing key can therefore stay blank
-until the webhook has been created in Payrexx.
+including on unsaved rows. Refreshing or saving the form replaces the existing
+webhook URL hint instead of appending duplicate headline rows. The webhook
+signing key can therefore stay blank until the webhook has been created in
+Payrexx.
 Payrexx sends JSON webhooks, so the callback reads `gateway_name` directly from
 the request query string before resolving the signing key.
 After signature verification, payment side effects run as the configured

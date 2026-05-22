@@ -25,6 +25,13 @@ test.describe("Payrexx Settings — installed gateway", () => {
 		await expect(
 			page.locator('input[data-fieldname="instance_name"]').first(),
 		).not.toHaveValue("");
+		const webhookMessage = page.locator(".form-message", {
+			hasText: "Webhook URL for Payrexx:",
+		});
+		await expect(webhookMessage).toHaveCount(1);
+		await page.evaluate(() => (window as any).cur_frm.trigger("gateway_name"));
+		await page.evaluate(() => (window as any).cur_frm.trigger("gateway_name"));
+		await expect(webhookMessage).toHaveCount(1);
 
 		// 2. The matching Payment Gateway registry row was auto-created by on_update
 		const gateway = await getDoc(request, "Payment Gateway", PAYMENT_GATEWAY_PK);

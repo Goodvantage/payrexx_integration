@@ -8,9 +8,10 @@ Payrexx Integration adds Payrexx hosted checkout support as a standalone app on 
 2. Set `gateway_name`, environment, instance name, API base domain, API secret, and webhook signing key.
 3. Save.
 
-The form shows the callback URL as soon as `gateway_name` is filled, even before
-the row can be saved. Use that URL to create the Payrexx webhook, then paste the
-generated signing key back into **Webhook Signing Key**.
+The form shows one callback URL as soon as `gateway_name` is filled, even before
+the row can be saved. Refreshing or saving the form replaces that hint in place
+instead of appending duplicate lines. Use that URL to create the Payrexx webhook,
+then paste the generated signing key back into **Webhook Signing Key**.
 
 On save, the controller verifies credentials unless running in tests/install and creates the corresponding `Payment Gateway` row.
 
