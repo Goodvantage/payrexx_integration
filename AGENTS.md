@@ -72,6 +72,12 @@ from old and new emails both work. To invalidate, rotate the site's
 The `gateway_name` query param is required when more than one Payrexx
 Settings row exists. The desk form's dashboard surfaces this URL so admins
 can paste it into the Payrexx webhook settings.
+Payrexx JSON webhook requests keep the query string in `frappe.request.args`,
+not in the whitelisted method kwargs, so the callback intentionally reads both.
+After signature verification, callback side effects run as the configured
+`Non Profit Settings.creation_user` when available, else `Administrator`, and
+transient `QueryDeadlockError` failures around `on_payment_authorized` are
+retried.
 
 ### Success redirect URL (generated per Gateway)
 
@@ -114,9 +120,11 @@ A "no gateway found" GET against `/Gateway/0/` is the cheap auth-check used
 by `_ping()` — HTTP 200 with `status: error` means creds are valid.
 
 For Payrexx Platform / partner accounts, split the checkout/login domain:
-`kibesuisse.pay.goodvantage.ch` means `instance_name = "kibesuisse"` and
+`customer.pay.goodvantage.ch` means `instance_name = "customer"` and
 `api_base_domain = "pay.goodvantage.ch"`. Do not put the full login domain in
-`instance_name`.
+`instance_name`. If a custom API domain returns 401/403/404, the client retries
+the same request once against `api.payrexx.com` so instance API keys still work
+when only the checkout/login surface uses a custom domain.
 
 ### Status mapping (webhook)
 

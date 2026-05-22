@@ -3,6 +3,7 @@
 from urllib.parse import urlencode, urlsplit
 
 from frappe.integrations.utils import make_get_request, make_post_request
+from requests import HTTPError
 
 DEFAULT_API_BASE_DOMAIN = "payrexx.com"
 
@@ -41,24 +42,15 @@ class PayrexxClient:
 	def create_gateway(self, params: dict) -> dict:
 		"""POST /Gateway/  ->  dict with id, link, hash, status, ..."""
 		return _unwrap(
-			make_post_request(
-				url=self._url("Gateway/"),
+			self._post(
+				"Gateway/",
 				data=params,
-				headers={
-					**self._headers(),
-					"Content-Type": "application/x-www-form-urlencoded",
-				},
 			)
 		)
 
 	def retrieve_gateway(self, gateway_id: int) -> dict:
 		"""GET /Gateway/{id}/"""
-		return _unwrap(
-			make_get_request(
-				url=self._url(f"Gateway/{gateway_id}/"),
-				headers=self._headers(),
-			)
-		)
+		return _unwrap(self._get(f"Gateway/{gateway_id}/"))
 
 	def delete_gateway(self, gateway_id: int) -> dict:
 		# DELETE not exposed by frappe.integrations.utils; use a plain request
@@ -69,20 +61,57 @@ class PayrexxClient:
 
 	def retrieve_transaction(self, transaction_id: int) -> dict:
 		"""GET /Transaction/{id}/"""
-		return _unwrap(
-			make_get_request(
-				url=self._url(f"Transaction/{transaction_id}/"),
-				headers=self._headers(),
-			)
-		)
+		return _unwrap(self._get(f"Transaction/{transaction_id}/"))
 
 	# ----------------------------------------------------------------- internal
 
-	def _url(self, path: str, query: dict | None = None) -> str:
+	def _get(self, path: str) -> dict:
+		try:
+			return make_get_request(url=self._url(path), headers=self._headers())
+		except Exception as exc:
+			if self._should_retry_default_domain(exc):
+				return make_get_request(
+					url=self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN),
+					headers=self._headers(),
+				)
+			raise
+
+	def _post(self, path: str, *, data: dict) -> dict:
+		headers = {
+			**self._headers(),
+			"Content-Type": "application/x-www-form-urlencoded",
+		}
+		try:
+			return make_post_request(url=self._url(path), data=data, headers=headers)
+		except Exception as exc:
+			if self._should_retry_default_domain(exc):
+				return make_post_request(
+					url=self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN),
+					data=data,
+					headers=headers,
+				)
+			raise
+
+	def _should_retry_default_domain(self, exc: Exception) -> bool:
+		if self.api_base_domain == DEFAULT_API_BASE_DOMAIN:
+			return False
+		if not isinstance(exc, HTTPError):
+			return False
+		status_code = getattr(exc.response, "status_code", None)
+		return status_code in {401, 403, 404}
+
+	def _url(
+		self,
+		path: str,
+		query: dict | None = None,
+		*,
+		api_base_domain: str | None = None,
+	) -> str:
 		q = {"instance": self.instance}
 		if query:
 			q.update(query)
-		return f"https://api.{self.api_base_domain}/{self.version}/{path.lstrip('/')}?{urlencode(q)}"
+		domain = api_base_domain or self.api_base_domain
+		return f"https://api.{domain}/{self.version}/{path.lstrip('/')}?{urlencode(q)}"
 
 	def _headers(self) -> dict:
 		return {"x-api-key": self.api_secret, "Accept": "application/json"}

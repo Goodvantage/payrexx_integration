@@ -23,10 +23,14 @@ Saving Payrexx Settings creates/updates the matching `Payment Gateway` row throu
 Normal Payrexx accounts use `api_base_domain = "payrexx.com"`, producing API
 calls to `https://api.payrexx.com/...`. Payrexx Platform / partner accounts
 store only the first subdomain in `instance_name` and the remaining platform
-domain in `api_base_domain`; for example, `kibesuisse.pay.goodvantage.ch`
-uses `instance_name = "kibesuisse"` and
+domain in `api_base_domain`; for example, `customer.pay.goodvantage.ch`
+uses `instance_name = "customer"` and
 `api_base_domain = "pay.goodvantage.ch"`, producing API calls to
-`https://api.pay.goodvantage.ch/...`.
+`https://api.pay.goodvantage.ch/...`. If a custom API domain rejects the
+instance credentials with 401/403/404, the client retries the same request
+against the default `api.payrexx.com` host. This keeps instance API keys working
+when a checkout/login custom domain exists but the REST API still authenticates
+on Payrexx's default API domain.
 
 ## Important Modules
 
@@ -60,6 +64,17 @@ Webhook endpoint:
 ```text
 /api/method/payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings.callback?gateway_name=<Payrexx Settings name>
 ```
+
+The Desk form renders this callback URL as soon as `gateway_name` is filled,
+including on unsaved rows. The webhook signing key can therefore stay blank
+until the webhook has been created in Payrexx.
+Payrexx sends JSON webhooks, so the callback reads `gateway_name` directly from
+the request query string before resolving the signing key.
+After signature verification, payment side effects run as the configured
+`Non Profit Settings.creation_user` when that DocType is installed, otherwise
+as `Administrator`. Transient `QueryDeadlockError` failures while running the
+reference document's `on_payment_authorized` hook are retried before the webhook
+is allowed to fail.
 
 Success redirect endpoint:
 

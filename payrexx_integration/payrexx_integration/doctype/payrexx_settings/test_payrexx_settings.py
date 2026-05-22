@@ -10,6 +10,8 @@ from urllib.parse import parse_qs, urlparse
 
 import frappe
 from frappe.tests import IntegrationTestCase
+from requests import HTTPError
+from requests.models import Response
 
 from payrexx_integration.api import _sign, payment_success, payrexx_pay_url
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import PayrexxClient
@@ -108,26 +110,59 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 	def test_payrexx_client_uses_platform_api_domain(self):
 		client = PayrexxClient(
-			instance="kibesuisse",
+			instance="customer",
 			api_secret="sk_test_dummy",
 			api_version="v1.14",
 			api_base_domain="pay.goodvantage.ch",
 		)
 		self.assertEqual(
 			client._url("Gateway/"),
-			"https://api.pay.goodvantage.ch/v1.14/Gateway/?instance=kibesuisse",
+			"https://api.pay.goodvantage.ch/v1.14/Gateway/?instance=customer",
 		)
 
 	def test_settings_client_passes_platform_api_domain(self):
 		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
-		doc.instance_name = "kibesuisse"
+		doc.instance_name = "customer"
 		doc.api_base_domain = "pay.goodvantage.ch"
 		client = doc._client()
-		self.assertEqual(client.instance, "kibesuisse")
+		self.assertEqual(client.instance, "customer")
 		self.assertEqual(client.api_base_domain, "pay.goodvantage.ch")
 		self.assertEqual(
 			client._url("Gateway/0/"),
-			"https://api.pay.goodvantage.ch/v1.14/Gateway/0/?instance=kibesuisse",
+			"https://api.pay.goodvantage.ch/v1.14/Gateway/0/?instance=customer",
+		)
+
+	def test_payrexx_client_falls_back_to_default_api_domain_on_custom_auth_reject(self):
+		client = PayrexxClient(
+			instance="customer",
+			api_secret="sk_test_dummy",
+			api_version="v1.14",
+			api_base_domain="pay.goodvantage.ch",
+		)
+		called_urls = []
+
+		def fake_post_request(url, **kwargs):
+			called_urls.append(url)
+			if "api.pay.goodvantage.ch" in url:
+				response = Response()
+				response.status_code = 403
+				response.url = url
+				raise HTTPError(response=response)
+			return {"status": "success", "data": [{"id": 123, "link": "https://pay.example"}]}
+
+		with patch(
+			"payrexx_integration.payrexx_integration.payrexx.payrexx_client.make_post_request",
+			side_effect=fake_post_request,
+		):
+			gateway = client.create_gateway({"amount": 100})
+
+		self.assertEqual(gateway["link"], "https://pay.example")
+		self.assertEqual(
+			called_urls,
+			[
+				"https://api.pay.goodvantage.ch/v1.14/Gateway/?instance=customer",
+				"https://api.payrexx.com/v1.14/Gateway/?instance=customer",
+			],
 		)
 
 	def test_gateway_payload_uses_per_checkout_failure_return_url(self):
@@ -265,6 +300,91 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 		ir.reload()
 		self.assertEqual(ir.status, "Completed")
+
+	def test_callback_reads_gateway_name_from_query_args_for_json_webhook(self):
+		_ensure_settings("OtherGateway")
+		ir = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Queued",
+				"data": json.dumps({"payrexx_gateway_id": 999}),
+			}
+		).insert(ignore_permissions=True)
+
+		body = json.dumps(
+			{
+				"transaction": {
+					"id": 12345,
+					"status": "confirmed",
+					"referenceId": ir.name,
+					"invoice": {"referenceId": ir.name},
+				}
+			}
+		).encode("utf-8")
+		sig = base64.b64encode(hmac.new(b"whk_test_dummy", body, hashlib.sha256).digest()).decode("ascii")
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		class _FakeRequest:
+			def __init__(self):
+				self.args = {"gateway_name": GATEWAY_NAME}
+				self.form = {}
+
+			def get_data(self):
+				return body
+
+		original_request = getattr(frappe.local, "request", None)
+		original_header = frappe.get_request_header
+		frappe.local.request = _FakeRequest()
+		frappe.get_request_header = lambda name, default="": (  # type: ignore[assignment]
+			sig if name == "X-Webhook-Signature" else default
+		)
+		try:
+			ps_module.callback()
+		finally:
+			frappe.get_request_header = original_header  # type: ignore[assignment]
+			if original_request is None:
+				delattr(frappe.local, "request")
+			else:
+				frappe.local.request = original_request
+
+		ir.reload()
+		self.assertEqual(ir.status, "Completed")
+
+	def test_payment_authorized_retries_transient_deadlock(self):
+		ir = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Completed",
+				"data": "{}",
+			}
+		).insert(ignore_permissions=True)
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		calls = []
+
+		def fake_payment_authorized(integration_request, status):
+			calls.append((integration_request.name, status))
+			if len(calls) == 1:
+				raise frappe.QueryDeadlockError((1020, "Record has changed since last read"))
+
+		with (
+			patch.object(ps_module, "_on_payment_authorized", side_effect=fake_payment_authorized),
+			patch.object(ps_module.frappe.db, "rollback") as rollback,
+			patch.object(ps_module.time, "sleep") as sleep,
+		):
+			ps_module._run_payment_authorized_with_retries(ir.name, "Completed")
+
+		self.assertEqual(calls, [(ir.name, "Completed"), (ir.name, "Completed")])
+		rollback.assert_called_once()
+		sleep.assert_called_once_with(0.25)
 
 	def test_success_reconciliation_marks_integration_request_completed(self):
 		ir = frappe.get_doc(

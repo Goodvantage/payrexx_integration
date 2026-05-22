@@ -17,3 +17,9 @@
 - Rule: `frappe-setuser`
 - What it prevents: Unsafe privilege switching that can leave requests running under the wrong user.
 - Why this override is safe: `pay_invoice` is a signed public email link. The automation-user block is limited to creating/reusing the `Payment Request` and Payrexx checkout URL for the HMAC-verified Sales Invoice, and `_as_automation_user` restores the original Frappe session in `finally`.
+
+## `frappe-setuser` in `payrexx_integration/payrexx_integration/doctype/payrexx_settings/payrexx_settings.py`
+
+- Rule: `frappe-setuser`
+- What it prevents: Unsafe privilege switching that can leave requests running under the wrong user.
+- Why this override is safe: `callback` verifies the Payrexx webhook signature before any privilege switch. The automation-user block is limited to running the reference document's post-payment `on_payment_authorized` hook, uses the configured `Non Profit Settings.creation_user` when available, and restores the original Frappe session in `finally`.

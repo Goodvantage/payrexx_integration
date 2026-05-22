@@ -87,7 +87,7 @@ query param to disambiguate which signing key to verify against.
 | Field | Type | Notes |
 |---|---|---|
 | `gateway_name` | Data, unique, reqd | `Live`, `Sandbox`, … — used to build `Payrexx-{name}` |
-| `instance_name` | Data, reqd | Payrexx instance subdomain. For `kibesuisse.pay.goodvantage.ch`, use `kibesuisse` |
+| `instance_name` | Data, reqd | Payrexx instance subdomain. For `customer.pay.goodvantage.ch`, use `customer` |
 | `api_base_domain` | Data, default `payrexx.com`, reqd | API base domain. Normal accounts use `payrexx.com`; platform accounts use the remaining domain, e.g. `pay.goodvantage.ch` |
 | `api_version` | Data, default `v1.14` | Bump without code change |
 | `api_secret` | Password, reqd | Sent as `x-api-key` header |
@@ -135,10 +135,17 @@ In the desk, open **Payrexx Settings → New** and fill in:
 | API Secret | from Payrexx → Integrations → API & Plugins |
 | Webhook Signing Key | from Payrexx → Webhooks → (signing key field) |
 
-For a partner checkout domain such as `kibesuisse.pay.goodvantage.ch`, set
-`Instance Name` to `kibesuisse` and `API Base Domain` to
+For a partner checkout domain such as `customer.pay.goodvantage.ch`, set
+`Instance Name` to `customer` and `API Base Domain` to
 `pay.goodvantage.ch`. The app then calls
-`https://api.pay.goodvantage.ch/v1.14/...`.
+`https://api.pay.goodvantage.ch/v1.14/...`. If that custom API host rejects the
+instance credentials with 401/403/404, the client retries once on the default
+`https://api.payrexx.com/v1.14/...` host.
+
+After `Gateway Name` is filled, the settings form immediately displays the
+webhook callback URL. The row does not need to be saved yet, so you can create
+the webhook in Payrexx first and then paste the generated signing key into
+**Webhook Signing Key**.
 
 Save. Two things happen automatically:
 1. `validate()` pings `GET /Gateway/?limit=1` — if your credentials are wrong

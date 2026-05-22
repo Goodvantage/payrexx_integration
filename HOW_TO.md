@@ -8,16 +8,25 @@ Payrexx Integration adds Payrexx hosted checkout support as a standalone app on 
 2. Set `gateway_name`, environment, instance name, API base domain, API secret, and webhook signing key.
 3. Save.
 
+The form shows the callback URL as soon as `gateway_name` is filled, even before
+the row can be saved. Use that URL to create the Payrexx webhook, then paste the
+generated signing key back into **Webhook Signing Key**.
+
 On save, the controller verifies credentials unless running in tests/install and creates the corresponding `Payment Gateway` row.
 
 For normal Payrexx accounts, keep `api_base_domain` as `payrexx.com`. For
 Payrexx Platform / partner accounts, split the login domain into instance and
-base domain. Example: `kibesuisse.pay.goodvantage.ch` becomes:
+base domain. Example: `customer.pay.goodvantage.ch` becomes:
 
 ```text
-Instance Name: kibesuisse
+Instance Name: customer
 API Base Domain: pay.goodvantage.ch
 ```
+
+If that custom API domain rejects an otherwise valid instance key, the client
+automatically retries on `api.payrexx.com`. This is useful when the checkout
+uses a partner/custom domain but Payrexx still authenticates API calls on the
+default API host.
 
 ## 2. Configure The Webhook In Payrexx
 
@@ -80,7 +89,7 @@ bench --site <site> clear-cache
 If saving Payrexx Settings fails:
 
 1. Confirm the instance name matches the first subdomain of the checkout/login domain.
-2. Confirm the API base domain is correct (`payrexx.com` for normal accounts, e.g. `pay.goodvantage.ch` for GoodVantage partner accounts).
+2. Confirm the API base domain is correct (`payrexx.com` for normal accounts, e.g. `pay.goodvantage.ch` for GoodVantage partner accounts). A 401/403/404 from a custom API domain is retried once on `api.payrexx.com`.
 3. Confirm the API secret is current.
 4. Confirm outbound network access from the bench.
 5. Try saving in Sandbox first.
@@ -99,6 +108,9 @@ If a pay link returns 403:
 If the link opens but payment does not update, check **Integration Request**
 rows, Payrexx webhook delivery logs, and whether Payrexx can reach the success
 redirect URL on the public `host_name`.
+If Payrexx reports a transient `tabSeries` / `QueryDeadlockError`, retry the
+webhook after the latest app code is loaded. The callback retries those
+deadlocks around payment side effects before returning an error to Payrexx.
 
 ## 8. Run Tests
 

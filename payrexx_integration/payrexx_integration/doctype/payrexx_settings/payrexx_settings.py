@@ -1,6 +1,8 @@
 # Copyright (c) 2026, Goodvantage GmbH and contributors
 # For license information, please see license.txt
 
+import time
+from contextlib import contextmanager
 from urllib.parse import urlencode, urlsplit
 
 import frappe
@@ -15,6 +17,8 @@ from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
 from payrexx_integration.url_utils import get_public_url
+
+PAYMENT_AUTHORIZED_MAX_ATTEMPTS = 3
 
 
 class PayrexxSettings(Document):
@@ -205,7 +209,7 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 		raw_body = frappe.request.get_data() or b""
 		signature = frappe.get_request_header("X-Webhook-Signature", "")
 
-		settings = _resolve_settings(gateway_name)
+		settings = _resolve_settings(_gateway_name_from_request(gateway_name))
 		if not verify_webhook_signature(raw_body, signature, settings.get_password("webhook_signing_key")):
 			frappe.throw(_("Invalid Payrexx webhook signature"), frappe.AuthenticationError)
 
@@ -260,6 +264,26 @@ def _resolve_settings(gateway_name: str | None) -> "PayrexxSettings":
 	if len(rows) == 1:
 		return frappe.get_cached_doc("Payrexx Settings", rows[0])
 	frappe.throw(_("Multiple Payrexx Settings exist — webhook URL must include ?gateway_name=..."))
+
+
+def _gateway_name_from_request(gateway_name: str | None) -> str | None:
+	if gateway_name:
+		return cstr(gateway_name).strip()
+
+	request = getattr(frappe.local, "request", None)
+	request_args = getattr(request, "args", None) if request else None
+	if request_args:
+		request_gateway_name = request_args.get("gateway_name")
+		if request_gateway_name:
+			return cstr(request_gateway_name).strip()
+
+	form_dict = getattr(frappe.local, "form_dict", None)
+	if form_dict:
+		form_gateway_name = form_dict.get("gateway_name")
+		if form_gateway_name:
+			return cstr(form_gateway_name).strip()
+
+	return None
 
 
 def reconcile_integration_request(
@@ -327,17 +351,61 @@ def _complete_integration_request(integration_request, transaction: dict | None 
 	integration_request.save(ignore_permissions=True)
 	frappe.db.commit()
 	if not was_completed:
-		_on_payment_authorized(integration_request, "Completed")
+		_run_payment_authorized_with_retries(integration_request.name, "Completed")
 		frappe.db.commit()
+
+
+def _run_payment_authorized_with_retries(integration_request_name: str, status: str) -> None:
+	for attempt in range(1, PAYMENT_AUTHORIZED_MAX_ATTEMPTS + 1):
+		try:
+			integration_request = frappe.get_doc("Integration Request", integration_request_name)
+			_on_payment_authorized(integration_request, status)
+			return
+		except frappe.QueryDeadlockError:
+			frappe.db.rollback()
+			if attempt == PAYMENT_AUTHORIZED_MAX_ATTEMPTS:
+				raise
+			time.sleep(0.25 * attempt)
 
 
 def _on_payment_authorized(integration_request, status):
 	if not (integration_request.reference_doctype and integration_request.reference_docname):
 		return
 	try:
-		frappe.get_doc(
-			integration_request.reference_doctype,
-			integration_request.reference_docname,
-		).run_method("on_payment_authorized", status)
+		with _payment_authorization_user():
+			frappe.get_doc(
+				integration_request.reference_doctype,
+				integration_request.reference_docname,
+			).run_method("on_payment_authorized", status)
+	except frappe.QueryDeadlockError:
+		raise
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "Payrexx on_payment_authorized")
+
+
+@contextmanager
+def _payment_authorization_user():
+	automation_user = _payment_authorization_user_name()
+	previous_user = frappe.session.user
+	previous_sid = getattr(frappe.session, "sid", None)
+	previous_data = getattr(frappe.session, "data", None)
+
+	if automation_user and automation_user != previous_user:
+		frappe.set_user(automation_user)  # nosemgrep: frappe-setuser
+
+	try:
+		yield
+	finally:
+		if automation_user and automation_user != previous_user:
+			frappe.set_user(previous_user)  # nosemgrep: frappe-setuser
+			frappe.session.sid = previous_sid
+			frappe.session.data = previous_data
+
+
+def _payment_authorization_user_name() -> str:
+	if frappe.db.exists("DocType", "Non Profit Settings"):
+		creation_user = frappe.db.get_single_value("Non Profit Settings", "creation_user")
+		if creation_user and frappe.db.exists("User", creation_user):
+			return creation_user
+
+	return "Administrator"
