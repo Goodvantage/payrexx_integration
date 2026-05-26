@@ -48,7 +48,7 @@ on Payrexx's default API domain.
 Pay-by-email endpoint:
 
 ```text
-/api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&token=<hmac>
+GET /api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&token=<hmac>
 ```
 
 Pay-by-email links are generated only for submitted Sales Invoices. Draft
@@ -63,7 +63,7 @@ site is exposed through a reverse proxy or ngrok URL.
 Webhook endpoint:
 
 ```text
-/api/method/payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings.callback?gateway_name=<Payrexx Settings name>
+POST /api/method/payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings.callback?gateway_name=<Payrexx Settings name>
 ```
 
 The Desk form asks the server for this callback URL as soon as `gateway_name`
@@ -79,7 +79,10 @@ After signature verification, payment side effects run as the configured
 `Non Profit Settings.creation_user` when that DocType is installed, otherwise
 as `Administrator`. Transient `QueryDeadlockError` failures while running the
 reference document's `on_payment_authorized` hook are retried before the webhook
-is allowed to fail.
+is allowed to fail. Non-deadlock failures are logged and re-raised so Payrexx
+can retry the webhook; the Integration Request and downstream payment side
+effects are committed together by Frappe's request transaction instead of a
+mid-callback manual commit.
 If a webhook is missing `referenceId` or references an unknown Integration
 Request, the callback logs only a compact transaction summary
 (`reference_id`, status, transaction id/uuid, mode, instance, and payment
@@ -89,7 +92,7 @@ contain payer contact data.
 Success redirect endpoint:
 
 ```text
-/api/method/payrexx_integration.api.payment_success?ir=<Integration Request>&gateway_name=<Payrexx Settings name>
+GET /api/method/payrexx_integration.api.payment_success?ir=<Integration Request>&gateway_name=<Payrexx Settings name>
 ```
 
 Payrexx success redirects reconcile the Integration Request by fetching the

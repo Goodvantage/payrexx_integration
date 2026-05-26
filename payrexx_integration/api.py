@@ -91,7 +91,7 @@ def payrexx_pay_url(sales_invoice: str | None, gateway_name: str | None = None) 
 # -------------------------------------------------------------- redirect entry
 
 
-@frappe.whitelist(allow_guest=True)  # nosemgrep: guest-whitelisted-method
+@frappe.whitelist(allow_guest=True, methods=["GET"])  # nosemgrep: guest-whitelisted-method
 def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: str | None = None) -> None:
 	"""Lazy-create a Payrexx Gateway for a Sales Invoice and redirect to it.
 
@@ -131,7 +131,7 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 	frappe.local.response["location"] = checkout_url
 
 
-@frappe.whitelist(allow_guest=True)  # nosemgrep: guest-whitelisted-method
+@frappe.whitelist(allow_guest=True, methods=["GET"])  # nosemgrep: guest-whitelisted-method
 def payment_success(ir: str | None = None, gateway_name: str | None = None) -> None:
 	"""Reconcile a Payrexx success redirect, then send the customer to the final return URL."""
 	if not ir or not frappe.db.exists("Integration Request", ir):

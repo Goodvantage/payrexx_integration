@@ -60,7 +60,6 @@ class PayrexxSettings(Document):
 			data["payrexx_gateway_hash"] = gateway.get("hash")
 			integration_request.data = frappe.as_json(data)
 			integration_request.save(ignore_permissions=True)
-			frappe.db.commit()
 
 			return gateway["link"]
 		except Exception:
@@ -206,7 +205,7 @@ def get_webhook_url(gateway_name: str | None = None) -> str:
 	)
 
 
-@frappe.whitelist(allow_guest=True)  # nosemgrep: guest-whitelisted-method
+@frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep: guest-whitelisted-method
 def callback(gateway_name: str | None = None) -> dict[str, bool]:
 	"""
 	Configure the following URL in Payrexx -> Webhooks for each gateway:
@@ -255,16 +254,13 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 		elif status in ("authorized", "reserved"):
 			ir.status = "Authorized"
 			ir.save(ignore_permissions=True)
-			frappe.db.commit()
 		elif status in ("cancelled", "declined", "error", "expired", "chargeback"):
 			ir.status = "Failed"
 			ir.error = f"Payrexx status: {status}"
 			ir.save(ignore_permissions=True)
-			frappe.db.commit()
 		else:
 			# 'waiting' and anything we don't recognise — keep listening.
 			ir.save(ignore_permissions=True)
-			frappe.db.commit()
 
 		return {"ok": True}
 	except frappe.AuthenticationError:
@@ -354,7 +350,6 @@ def reconcile_integration_request(
 		ir.status = "Failed"
 		ir.error = f"Payrexx status: {status}"
 		ir.save(ignore_permissions=True)
-		frappe.db.commit()
 	return False
 
 
@@ -381,10 +376,8 @@ def _complete_integration_request(integration_request, transaction: dict | None 
 	integration_request.data = frappe.as_json(ir_data)
 	integration_request.status = "Completed"
 	integration_request.save(ignore_permissions=True)
-	frappe.db.commit()
 	if not was_completed:
 		_run_payment_authorized_with_retries(integration_request.name, "Completed")
-		frappe.db.commit()
 
 
 def _run_payment_authorized_with_retries(integration_request_name: str, status: str) -> None:
@@ -413,6 +406,7 @@ def _on_payment_authorized(integration_request, status):
 		raise
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "Payrexx on_payment_authorized")
+		raise
 
 
 @contextmanager

@@ -36,7 +36,7 @@ default API host.
 Copy the callback URL from the settings form or build it with this shape:
 
 ```text
-https://<site>/api/method/payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings.callback?gateway_name=<Payrexx Settings name>
+POST https://<site>/api/method/payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings.callback?gateway_name=<Payrexx Settings name>
 ```
 
 Use the Payrexx dashboard's webhook signing key as the app's webhook signing key. This is separate from the API secret.
@@ -49,10 +49,10 @@ Invoice emails can call the Jinja helper:
 {{ payrexx_pay_url(doc.name) }}
 ```
 
-The helper returns a signed URL:
+The helper returns a signed GET URL:
 
 ```text
-/api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&token=<hmac>
+GET /api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&token=<hmac>
 ```
 
 When clicked, the endpoint verifies the token, lazy-creates a Payment Request through ERPNext, and redirects to Payrexx hosted checkout.
@@ -63,7 +63,7 @@ Payrexx webhooks should still be configured, but every generated Gateway also
 uses a success redirect back into:
 
 ```text
-https://<site>/api/method/payrexx_integration.api.payment_success?ir=<Integration Request>&gateway_name=<Payrexx Settings name>
+GET https://<site>/api/method/payrexx_integration.api.payment_success?ir=<Integration Request>&gateway_name=<Payrexx Settings name>
 ```
 
 That endpoint asks Payrexx for the Gateway status server-side and only marks the
@@ -119,6 +119,10 @@ redirect URL on the public `host_name`.
 If Payrexx reports a transient `tabSeries` / `QueryDeadlockError`, retry the
 webhook after the latest app code is loaded. The callback retries those
 deadlocks around payment side effects before returning an error to Payrexx.
+Other downstream payment-hook failures are logged and returned as webhook
+errors so Payrexx can retry; the app no longer marks the Integration Request
+complete in a separate manual commit before the referenced document accepts the
+payment.
 
 ## 8. Run Tests
 

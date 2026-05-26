@@ -202,7 +202,7 @@ def run_event_to_invoice_email(email: str = "benediktmathis@gmail.com") -> dict:
 		for k, v in out.items():
 			print(f"  {k:18s} = {v}", flush=True)
 
-		frappe.db.commit()
+		frappe.db.commit()  # nosemgrep: frappe-manual-commit
 		return out
 
 	except Exception:
