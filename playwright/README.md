@@ -47,6 +47,7 @@ npm run report
 | `payrexx_settings.spec.ts` | Creates a `Payrexx Settings` row in the desk and verifies the matching `Payment Gateway` row appears. Also exercises the `payrexx_pay_url` jinja helper through the REST API. | Nothing extra. |
 | `pay_invoice_redirect.spec.ts` | Hits `/api/method/payrexx_integration.api.pay_invoice` with bad/missing tokens and unknown invoices. Verifies the 403/404 paths. | Nothing extra. |
 | `booking_email.spec.ts` | Calls `Event Booking.create_sales_invoice`, then asserts the Email Queue contains a row whose body has the Payrexx `pay?si=…&token=…` URL. | `TEST_BOOKING_NAME` env var pointing at a seeded `Event Booking` with a customer + contact email. |
+| Legacy Buzz specs | `/anmelden` picker and `buzz.api.process_booking` guest pay-later regressions. | Skipped by default. Set `RUN_LEGACY_BUZZ_E2E=1` on a site that still serves those retired Buzz routes. |
 
 ## What's *not* covered (yet)
 

@@ -2,7 +2,7 @@ import { test, expect, request as playwrightRequest } from "@playwright/test";
 import { callMethod } from "./helpers/frappe";
 
 /**
- * Real-browser guest pay-later regression test.
+ * Legacy Buzz real-browser guest pay-later regression test.
  *
  * Why this exists separately from the existing Python / mock-guest tests:
  * `frappe.set_user("Guest")` in a backend test runs through the desk-side
@@ -22,6 +22,7 @@ import { callMethod } from "./helpers/frappe";
  *   4. asserts docstatus=1, workflow_state="Confirmed", sales_invoice set
  */
 
+const RUN_LEGACY_BUZZ_E2E = process.env.RUN_LEGACY_BUZZ_E2E === "1";
 const EVENT_NAME = process.env.TEST_GUEST_EVENT || "2997"; // Notfallkurs für Kinder
 const TICKET_TYPE = process.env.TEST_GUEST_TICKET || "5782"; // Standard ticket
 // Offline Payment Method NAME (not title) on the event. buzz looks this up via
@@ -42,6 +43,11 @@ const FIXED_GUEST_FULL_NAME = process.env.TEST_GUEST_FULL_NAME || "Test User";
 test.use({ storageState: { cookies: [], origins: [] } });
 
 test.describe("Guest pay-later flow over HTTP", () => {
+	test.skip(
+		!RUN_LEGACY_BUZZ_E2E,
+		"Set RUN_LEGACY_BUZZ_E2E=1 to run retired Buzz guest booking specs.",
+	);
+
 	test("anonymous process_booking → after_insert auto-submit → Confirmed + emails", async () => {
 		const guestCtx = await playwrightRequest.newContext({
 			baseURL: BASE,

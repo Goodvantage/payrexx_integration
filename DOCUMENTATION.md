@@ -134,6 +134,10 @@ cd frappe-bench/apps/payrexx_integration/playwright
 npx playwright test
 ```
 
+Legacy Buzz browser specs for `/anmelden` and `buzz.api.process_booking` are
+skipped by default because the current native Event App no longer serves those
+routes. Run them only on a Buzz-compatible site with `RUN_LEGACY_BUZZ_E2E=1`.
+
 ## Related Docs
 
 - `README.md` - installation notes.

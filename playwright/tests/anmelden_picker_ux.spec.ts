@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 
 /**
- * Regression for the /anmelden picker UX:
+ * Legacy Buzz regression for the /anmelden picker UX:
  *   1. Picking "Im Namen einer Trägerschaft" must reveal exactly ONE
  *      visible search input (the hidden ea_customer field stays hidden).
  *   2. The typeahead dropdown must FLOAT above neighbouring content —
@@ -10,11 +10,14 @@ import { test, expect } from "@playwright/test";
  * Runs as Guest (no admin login needed for this public route).
  */
 
+const RUN_LEGACY_BUZZ_E2E = process.env.RUN_LEGACY_BUZZ_E2E === "1";
 const SLUG = process.env.TEST_GUEST_EVENT_SLUG || "notfallkurs-f%C3%BCr-kinder";
 
 test.use({ storageState: { cookies: [], origins: [] } });
 
 test.describe("/anmelden picker UX", () => {
+	test.skip(!RUN_LEGACY_BUZZ_E2E, "Set RUN_LEGACY_BUZZ_E2E=1 to run retired Buzz /anmelden specs.");
+
 	test("Trägerschaft mode: exactly one visible input + floating typeahead", async ({ page }) => {
 		await page.goto(`/anmelden/${SLUG}`);
 		await page.waitForLoadState("networkidle");
