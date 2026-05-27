@@ -325,6 +325,60 @@ class TestPayrexxSettings(IntegrationTestCase):
 		ir.reload()
 		self.assertEqual(ir.status, "Completed")
 
+	def test_callback_ignores_non_payrexx_integration_request(self):
+		ir = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "OtherGateway",
+				"status": "Queued",
+				"data": "{}",
+			}
+		).insert(ignore_permissions=True)
+
+		body = json.dumps(
+			{
+				"transaction": {
+					"id": 12345,
+					"status": "confirmed",
+					"referenceId": ir.name,
+					"invoice": {"referenceId": ir.name},
+				}
+			}
+		).encode("utf-8")
+		sig = base64.b64encode(hmac.new(b"whk_test_dummy", body, hashlib.sha256).digest()).decode("ascii")
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		class _FakeRequest:
+			def __init__(self):
+				self.args = {}
+				self.form = {}
+
+			def get_data(self):
+				return body
+
+		original_request = getattr(frappe.local, "request", None)
+		original_header = frappe.get_request_header
+		frappe.local.request = _FakeRequest()
+		frappe.get_request_header = lambda name, default="": (  # type: ignore[assignment]
+			sig if name == "X-Webhook-Signature" else default
+		)
+		try:
+			with patch("frappe.log_error") as log_error:
+				self.assertEqual(ps_module.callback(gateway_name=GATEWAY_NAME), {"ok": True})
+				log_error.assert_called_once()
+		finally:
+			frappe.get_request_header = original_header  # type: ignore[assignment]
+			if original_request is None:
+				delattr(frappe.local, "request")
+			else:
+				frappe.local.request = original_request
+
+		ir.reload()
+		self.assertEqual(ir.status, "Queued")
+
 	def test_callback_reads_gateway_name_from_query_args_for_json_webhook(self):
 		_ensure_settings("OtherGateway")
 		ir = frappe.get_doc(

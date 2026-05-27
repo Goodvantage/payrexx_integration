@@ -245,6 +245,13 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 			return {"ok": True}
 
 		ir = frappe.get_doc("Integration Request", ref_id)
+		if ir.integration_request_service != "Payrexx":
+			frappe.log_error(
+				frappe.as_json(_webhook_log_summary(txn, ref_id, status)),
+				"Payrexx webhook wrong Integration Request service",
+			)
+			return {"ok": True}
+
 		ir_data = frappe.parse_json(ir.data) or {}
 		ir_data["payrexx_transaction"] = txn
 		ir.data = frappe.as_json(ir_data)

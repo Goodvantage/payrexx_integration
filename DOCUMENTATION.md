@@ -83,8 +83,9 @@ is allowed to fail. Non-deadlock failures are logged and re-raised so Payrexx
 can retry the webhook; the Integration Request and downstream payment side
 effects are committed together by Frappe's request transaction instead of a
 mid-callback manual commit.
-If a webhook is missing `referenceId` or references an unknown Integration
-Request, the callback logs only a compact transaction summary
+If a webhook is missing `referenceId`, references an unknown Integration
+Request, or references an Integration Request whose service is not `Payrexx`,
+the callback logs only a compact transaction summary
 (`reference_id`, status, transaction id/uuid, mode, instance, and payment
 request id) instead of the full Payrexx payload, because the full payload can
 contain payer contact data.

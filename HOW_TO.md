@@ -116,6 +116,9 @@ If a pay link returns 403:
 If the link opens but payment does not update, check **Integration Request**
 rows, Payrexx webhook delivery logs, and whether Payrexx can reach the success
 redirect URL on the public `host_name`.
+The webhook only updates Integration Requests whose service is `Payrexx`; if a
+Payrexx reference ID points at a row owned by another gateway, the callback logs
+the mismatch and ignores it.
 If Payrexx reports a transient `tabSeries` / `QueryDeadlockError`, retry the
 webhook after the latest app code is loaded. The callback retries those
 deadlocks around payment side effects before returning an error to Payrexx.
