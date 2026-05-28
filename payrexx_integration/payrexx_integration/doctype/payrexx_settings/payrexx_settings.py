@@ -12,7 +12,7 @@ from frappe.model.document import Document
 from frappe.utils import call_hook_method, cstr, flt
 from payments.utils import create_payment_gateway
 
-from payrexx_integration.payrexx_integration.payrexx.payrexx_client import PayrexxClient
+from payrexx_integration.payrexx_integration.payrexx.payrexx_client import PayrexxClient, get_http_status
 from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
@@ -84,24 +84,18 @@ class PayrexxSettings(Document):
 		API key + instance are valid. A 401/403 (or unparseable response)
 		means the credentials are wrong.
 		"""
-		import requests
-
 		client = self._client()
-		url = client._url("Gateway/0/")
 		try:
-			resp = requests.get(url, headers=client._headers(), timeout=10)
-		except Exception:
+			body = client.ping_gateway()
+		except Exception as exc:
+			status_code = get_http_status(exc)
+			if status_code in (401, 403):
+				frappe.throw(_("Payrexx rejected the API Secret. Check the value in 'API Secret'."))
+			if status_code:
+				frappe.throw(_("Payrexx returned HTTP {0}").format(status_code))
 			frappe.throw(_("Cannot reach Payrexx — check network connectivity."))
 
-		if resp.status_code in (401, 403):
-			frappe.throw(_("Payrexx rejected the API Secret. Check the value in 'API Secret'."))
-		if resp.status_code != 200:
-			frappe.throw(_("Payrexx returned HTTP {0}").format(resp.status_code))
-		try:
-			body = resp.json()
-		except Exception:
-			body = {}
-		if "status" not in body:
+		if not isinstance(body, dict) or "status" not in body:
 			frappe.throw(
 				_(
 					"Unexpected response from Payrexx. Check that 'Instance Name' ({0}) and "

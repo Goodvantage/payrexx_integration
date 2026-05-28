@@ -52,6 +52,10 @@ class PayrexxClient:
 		"""GET /Gateway/{id}/"""
 		return _unwrap(self._get(f"Gateway/{gateway_id}/"))
 
+	def ping_gateway(self) -> dict:
+		"""GET /Gateway/0/ for a cheap credential check without creating checkout data."""
+		return self._get("Gateway/0/")
+
 	def delete_gateway(self, gateway_id: int) -> dict:
 		# DELETE not exposed by frappe.integrations.utils; use a plain request
 		# only when needed. Stub here for completeness.
@@ -136,3 +140,8 @@ def _normalize_api_base_domain(value: str | None) -> str:
 	if raw.startswith("api."):
 		raw = raw[4:]
 	return raw or DEFAULT_API_BASE_DOMAIN
+
+
+def get_http_status(exc: Exception) -> int | None:
+	response = getattr(exc, "response", None)
+	return getattr(response, "status_code", None)

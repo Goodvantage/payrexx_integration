@@ -156,6 +156,46 @@ class TestPayrexxSettings(IntegrationTestCase):
 			"https://api.pay.goodvantage.ch/v1.14/Gateway/0/?instance=customer",
 		)
 
+	def test_settings_ping_uses_client(self):
+		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
+
+		class _FakeClient:
+			instance = "test-instance"
+			api_base_domain = "payrexx.com"
+
+			def ping_gateway(self) -> dict:
+				return {"status": "error", "message": "No Gateway found with id 0"}
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		with patch.object(ps_module.PayrexxSettings, "_client", return_value=_FakeClient()):
+			doc._ping()
+
+	def test_settings_ping_rejects_http_auth_error(self):
+		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
+		response = Response()
+		response.status_code = 403
+
+		class _FakeClient:
+			instance = "test-instance"
+			api_base_domain = "payrexx.com"
+
+			def ping_gateway(self) -> dict:
+				raise HTTPError(response=response)
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		with (
+			patch.object(ps_module.PayrexxSettings, "_client", return_value=_FakeClient()),
+			self.assertRaises(frappe.ValidationError) as exc,
+		):
+			doc._ping()
+		self.assertIn("Payrexx rejected the API Secret", str(exc.exception))
+
 	def test_payrexx_client_falls_back_to_default_api_domain_on_custom_auth_reject(self):
 		client = PayrexxClient(
 			instance="customer",
