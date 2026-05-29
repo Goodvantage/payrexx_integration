@@ -4,7 +4,7 @@ These are intentionally not whitelisted — call via:
 
     bench --site <site> execute \\
       payrexx_integration.dev_e2e.run_event_to_invoice_email \\
-      --kwargs '{"email": "benediktmathis@gmail.com"}'
+      --kwargs '{"email": "test@example.com"}'
 """
 
 from __future__ import annotations
@@ -20,25 +20,26 @@ def _ensure_contact(email: str) -> str:
 	name = frappe.db.get_value("Contact", {"email_id": email}, "name")
 	if name:
 		return name
+	local = email.split("@", 1)[0] if "@" in email else email
 	doc = frappe.get_doc(
 		{
 			"doctype": "Contact",
-			"first_name": "Benedikt",
-			"last_name": "Mathis",
+			"first_name": local,
 			"email_ids": [{"email_id": email, "is_primary": 1}],
 		}
 	).insert(ignore_permissions=True)
 	return doc.name
 
 
-def _ensure_customer(contact_name: str) -> str:
+def _ensure_customer(contact_name: str, email: str) -> str:
 	name = frappe.db.get_value("Customer", {"customer_primary_contact": contact_name}, "name")
 	if name:
 		return name
+	local = email.split("@", 1)[0] if "@" in email else "E2E"
 	doc = frappe.get_doc(
 		{
 			"doctype": "Customer",
-			"customer_name": "Benedikt Mathis (E2E)",
+			"customer_name": f"{local} (E2E)",
 			"customer_type": "Individual",
 			"customer_primary_contact": contact_name,
 		}
@@ -47,7 +48,7 @@ def _ensure_customer(contact_name: str) -> str:
 	return doc.name
 
 
-def run_event_to_invoice_email(email: str = "benediktmathis@gmail.com") -> dict:
+def run_event_to_invoice_email(email: str = "test@example.com") -> dict:
 	"""Create event → publish → book (pay-later) → invoice → email; print + return summary."""
 	tag = f"E2E-{int(time.time())}"
 	out: dict = {"tag": tag}
@@ -56,7 +57,7 @@ def run_event_to_invoice_email(email: str = "benediktmathis@gmail.com") -> dict:
 	try:
 		# 1. Customer + Contact
 		contact_name = _ensure_contact(email)
-		customer_name = _ensure_customer(contact_name)
+		customer_name = _ensure_customer(contact_name, email)
 		print(f"[OK] Contact: {contact_name}", flush=True)
 		print(f"[OK] Customer: {customer_name}", flush=True)
 		out.update({"contact": contact_name, "customer": customer_name})
@@ -112,15 +113,15 @@ def run_event_to_invoice_email(email: str = "benediktmathis@gmail.com") -> dict:
 				"pay_later_selected": 1,
 				"payment_preference": "Pay Later",
 				"attendees": [
-					{
-						"first_name": "Benedikt",
-						"last_name": "Mathis",
-						"email": email,
-						"ticket_type": tt.name,
-						"currency": "CHF",
-						"participant_contact": contact_name,
-						"participant_name": "Benedikt Mathis",
-					}
+				{
+					"first_name": email.split("@", 1)[0] if "@" in email else "Test",
+					"last_name": "(E2E)",
+					"email": email,
+					"ticket_type": tt.name,
+					"currency": "CHF",
+					"participant_contact": contact_name,
+					"participant_name": f"{email.split('@', 1)[0]} (E2E)" if "@" in email else "Test (E2E)",
+				}
 				],
 			}
 		)

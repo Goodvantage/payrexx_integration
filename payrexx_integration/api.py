@@ -17,13 +17,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 from contextlib import contextmanager
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 
 import frappe
 from frappe import _
-from frappe.utils import cstr
 
 from payrexx_integration.url_utils import get_public_url
+from payrexx_integration.url_utils import safe_return_url as _safe_return_url
 
 # ---------------------------------------------------------------- token helpers
 
@@ -242,17 +242,8 @@ def _payment_failed_redirect_url(integration_request) -> str:
 	return get_public_url("/payment-failed?" + urlencode(params))
 
 
-def _safe_return_url(redirect_to: str) -> str:
-	target = cstr(redirect_to).strip()
-	parts = urlsplit(target)
-	if parts.scheme or parts.netloc:
-		public_parts = urlsplit(get_public_url(""))
-		if parts.scheme in {"http", "https"} and parts.netloc == public_parts.netloc:
-			return target
-		frappe.throw(_("Unsafe payment redirect URL"), frappe.PermissionError)
-	return get_public_url(target)
-
-
+# Duplicates good_connector.workflow_support.as_automation_user — kept locally
+# because payrexx_integration does not depend on good_connector.
 @contextmanager
 def _as_automation_user(user: str = "Administrator"):
 	previous_user = frappe.session.user

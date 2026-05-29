@@ -3,7 +3,8 @@ from __future__ import annotations
 from urllib.parse import urlsplit
 
 import frappe
-from frappe.utils import get_url
+from frappe import _
+from frappe.utils import cstr, get_url
 
 
 def get_public_url(path: str = "") -> str:
@@ -18,6 +19,17 @@ def get_public_url(path: str = "") -> str:
 	if _has_absolute_host(host_name):
 		return f"{host_name}/{path.lstrip('/')}" if path else host_name
 	return get_url(path)
+
+
+def safe_return_url(redirect_to: str, error_label: str = "Unsafe payment redirect URL") -> str:
+	target = cstr(redirect_to).strip()
+	parts = urlsplit(target)
+	if parts.scheme or parts.netloc:
+		public_parts = urlsplit(get_public_url(""))
+		if parts.scheme in {"http", "https"} and parts.netloc == public_parts.netloc:
+			return target
+		frappe.throw(_(error_label), frappe.PermissionError)
+	return get_public_url(target)
 
 
 def _has_absolute_host(host_name: str) -> bool:

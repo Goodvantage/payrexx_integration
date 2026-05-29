@@ -3,7 +3,7 @@
 
 import time
 from contextlib import contextmanager
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 
 import frappe
 from frappe import _
@@ -16,7 +16,7 @@ from payrexx_integration.payrexx_integration.payrexx.payrexx_client import Payre
 from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
-from payrexx_integration.url_utils import get_public_url
+from payrexx_integration.url_utils import get_public_url, safe_return_url
 
 PAYMENT_AUTHORIZED_MAX_ATTEMPTS = 3
 
@@ -141,7 +141,7 @@ class PayrexxSettings(Document):
 	def _return_url(self, kwargs: dict, kind: str, integration_request_name: str | None = None) -> str:
 		request_redirect = kwargs.get(f"{kind}_redirect_to") or kwargs.get(f"{kind}_redirect_url")
 		if request_redirect:
-			return self._safe_return_url(request_redirect)
+			return safe_return_url(request_redirect, error_label="Unsafe Payrexx return URL")
 
 		override = {
 			"success": self.success_redirect_url,
@@ -170,16 +170,6 @@ class PayrexxSettings(Document):
 		if kwargs.get("redirect_to"):
 			params["redirect_to"] = kwargs["redirect_to"]
 		return f"{base}?{urlencode(params)}"
-
-	def _safe_return_url(self, redirect_to: str) -> str:
-		target = cstr(redirect_to).strip()
-		parts = urlsplit(target)
-		if parts.scheme or parts.netloc:
-			public_parts = urlsplit(get_public_url(""))
-			if parts.scheme in {"http", "https"} and parts.netloc == public_parts.netloc:
-				return target
-			frappe.throw(_("Unsafe Payrexx return URL"), frappe.PermissionError)
-		return get_public_url(target)
 
 
 # =============================================================================
@@ -410,6 +400,8 @@ def _on_payment_authorized(integration_request, status):
 		raise
 
 
+# Duplicates good_connector.workflow_support.as_automation_user — kept locally
+# because payrexx_integration does not depend on good_connector.
 @contextmanager
 def _payment_authorization_user():
 	automation_user = _payment_authorization_user_name()
