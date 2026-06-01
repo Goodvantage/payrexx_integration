@@ -2,7 +2,7 @@ import { test, expect } from "@playwright/test";
 import { callMethod, getDoc } from "./helpers/frappe";
 
 /**
- * End-to-end: trigger ``create_sales_invoice`` on a pre-seeded Event Booking,
+ * End-to-end: trigger ``create_sales_invoice`` on a pre-seeded Good Event Booking,
  * then verify that the Email Queue has a row containing the Payrexx pay-by-
  * email URL.
  *
@@ -11,7 +11,7 @@ import { callMethod, getDoc } from "./helpers/frappe";
  * the assertions to hold. To bootstrap one for testing:
  *
  *   bench --site <site> console
- *   >>> from event_app.tests.fixtures import seed_pay_later_booking
+ *   >>> from good_event.tests.fixtures import seed_pay_later_booking
  *   >>> seed_pay_later_booking()
  */
 
@@ -25,7 +25,7 @@ test("submitting create_sales_invoice queues a branded email with the pay URL", 
 	// 1. Trigger the whitelisted method on the booking.
 	//    Frappe's modern path is /api/method/run_doc_method (not frappe.client.*).
 	const siName = await callMethod(request, "run_doc_method", {
-		dt: "Event Booking",
+		dt: "Good Event Booking",
 		dn: BOOKING,
 		method: "create_sales_invoice",
 	});

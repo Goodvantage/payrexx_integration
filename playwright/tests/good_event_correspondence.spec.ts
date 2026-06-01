@@ -66,11 +66,11 @@ async function fetchLatestQueueFor(
 	return { name: full.name, subject: subjectMatch ? subjectMatch[1] : "", message: decoded };
 }
 
-test.describe("Event Booking workflow state", () => {
+test.describe("Good Event Booking workflow state", () => {
 	test("workflow_state is populated on the booking (backfill or live derivation)", async ({
 		request,
 	}) => {
-		const booking = (await getDoc(request, "Event Booking", BOOKING!)) as {
+		const booking = (await getDoc(request, "Good Event Booking", BOOKING!)) as {
 			workflow_state: string;
 		};
 		expect(booking).not.toBeNull();
@@ -89,7 +89,7 @@ test.describe("Event Booking workflow state", () => {
 	test("pay-later booking ends up Confirmed AND queues both auto emails", async ({
 		request,
 	}) => {
-		const booking = (await getDoc(request, "Event Booking", BOOKING!)) as {
+		const booking = (await getDoc(request, "Good Event Booking", BOOKING!)) as {
 			workflow_state: string;
 			docstatus: number;
 			payment_preference: string;
@@ -108,7 +108,7 @@ test.describe("Event Booking workflow state", () => {
 		// (a) booking-referenced email — registration_confirmation or combined_bundle
 		const bookingQ = (await callMethod(request, "frappe.client.get_list", {
 			doctype: "Email Queue",
-			filters: { reference_doctype: "Event Booking", reference_name: BOOKING },
+			filters: { reference_doctype: "Good Event Booking", reference_name: BOOKING },
 			fields: ["name"],
 			limit_page_length: 1,
 			order_by: "creation desc",
@@ -141,45 +141,45 @@ test.describe("Manual correspondence triggers (api.send_correspondence)", () => 
 	test("registration_confirmation queues a German confirmation email per attendee", async ({
 		request,
 	}) => {
-		const result = (await callMethod(request, "event_app.api.send_correspondence", {
+		const result = (await callMethod(request, "good_event.api.send_correspondence", {
 			booking: BOOKING!,
 			flow: "registration_confirmation",
 		})) as { sent: string[]; skipped: string[]; flow: string };
 		expect(result.flow).toBe("registration_confirmation");
 		expect(result.sent.length).toBeGreaterThan(0);
 
-		const { subject, message } = await fetchLatestQueueFor(request, "Event Booking", BOOKING!);
+		const { subject, message } = await fetchLatestQueueFor(request, "Good Event Booking", BOOKING!);
 		expect(subject).toContain("Anmeldebest"); // "Anmeldebestätigung" — accent encoded in MIME header
 		expect(message).toContain("Anmeldung");
 		expect(message).toContain("ist bestätigt");
 	});
 
 	test("acceptance flow queues a German Zusage email", async ({ request }) => {
-		const result = (await callMethod(request, "event_app.api.send_correspondence", {
+		const result = (await callMethod(request, "good_event.api.send_correspondence", {
 			booking: BOOKING!,
 			flow: "acceptance",
 		})) as { sent: string[] };
 		expect(result.sent.length).toBeGreaterThan(0);
 
-		const { subject, message } = await fetchLatestQueueFor(request, "Event Booking", BOOKING!);
+		const { subject, message } = await fetchLatestQueueFor(request, "Good Event Booking", BOOKING!);
 		expect(subject).toContain("Zusage");
 		expect(message).toContain("freuen uns");
 	});
 
 	test("rejection flow queues a German Absage email", async ({ request }) => {
-		const result = (await callMethod(request, "event_app.api.send_correspondence", {
+		const result = (await callMethod(request, "good_event.api.send_correspondence", {
 			booking: BOOKING!,
 			flow: "rejection",
 		})) as { sent: string[] };
 		expect(result.sent.length).toBeGreaterThan(0);
 
-		const { subject, message } = await fetchLatestQueueFor(request, "Event Booking", BOOKING!);
+		const { subject, message } = await fetchLatestQueueFor(request, "Good Event Booking", BOOKING!);
 		expect(subject).toContain("Absage");
 		expect(message).toContain("Leider");
 	});
 
 	test("rejects unknown flow keys", async ({ request }) => {
-		const r = await request.post("/api/method/event_app.api.send_correspondence", {
+		const r = await request.post("/api/method/good_event.api.send_correspondence", {
 			form: {
 				booking: BOOKING!,
 				flow: "not_a_real_flow_key",
@@ -190,54 +190,54 @@ test.describe("Manual correspondence triggers (api.send_correspondence)", () => 
 	});
 
 	test("forced language fr produces a French body", async ({ request }) => {
-		const result = (await callMethod(request, "event_app.api.send_correspondence", {
+		const result = (await callMethod(request, "good_event.api.send_correspondence", {
 			booking: BOOKING!,
 			flow: "acceptance",
 			language: "fr",
 		})) as { sent: string[] };
 		expect(result.sent.length).toBeGreaterThan(0);
 
-		const { subject, message } = await fetchLatestQueueFor(request, "Event Booking", BOOKING!);
+		const { subject, message } = await fetchLatestQueueFor(request, "Good Event Booking", BOOKING!);
 		expect(subject).toMatch(/Acceptation/);
 		expect(message).toContain("Bonjour");
 	});
 
 	test("combined_bundle queues the comprehensive German confirmation", async ({ request }) => {
-		const result = (await callMethod(request, "event_app.api.send_correspondence", {
+		const result = (await callMethod(request, "good_event.api.send_correspondence", {
 			booking: BOOKING!,
 			flow: "combined_bundle",
 		})) as { sent: string[] };
 		expect(result.sent.length).toBeGreaterThan(0);
 
-		const { subject, message } = await fetchLatestQueueFor(request, "Event Booking", BOOKING!);
+		const { subject, message } = await fetchLatestQueueFor(request, "Good Event Booking", BOOKING!);
 		expect(subject).toContain("Bestätigung");
 		expect(message).toContain("ist bestätigt");
 	});
 
 	test("webinar_access queues the webinar credentials email", async ({ request }) => {
-		const result = (await callMethod(request, "event_app.api.send_correspondence", {
+		const result = (await callMethod(request, "good_event.api.send_correspondence", {
 			booking: BOOKING!,
 			flow: "webinar_access",
 		})) as { sent: string[] };
 		expect(result.sent.length).toBeGreaterThan(0);
 
-		const { subject } = await fetchLatestQueueFor(request, "Event Booking", BOOKING!);
+		const { subject } = await fetchLatestQueueFor(request, "Good Event Booking", BOOKING!);
 		expect(subject).toContain("Webinar-Zugangsdaten");
 	});
 
 	test("waitlist_offer queues the offer email with deadline placeholder", async ({ request }) => {
-		const result = (await callMethod(request, "event_app.api.send_correspondence", {
+		const result = (await callMethod(request, "good_event.api.send_correspondence", {
 			booking: BOOKING!,
 			flow: "waitlist_offer",
 		})) as { sent: string[] };
 		expect(result.sent.length).toBeGreaterThan(0);
 
-		const { subject } = await fetchLatestQueueFor(request, "Event Booking", BOOKING!);
+		const { subject } = await fetchLatestQueueFor(request, "Good Event Booking", BOOKING!);
 		expect(subject).toContain("Warteliste");
 	});
 
 	test("ad_hoc rejects when no body is provided", async ({ request }) => {
-		const r = await request.post("/api/method/event_app.api.send_correspondence", {
+		const r = await request.post("/api/method/good_event.api.send_correspondence", {
 			form: {
 				booking: BOOKING!,
 				flow: "ad_hoc",
@@ -248,14 +248,14 @@ test.describe("Manual correspondence triggers (api.send_correspondence)", () => 
 	});
 
 	test("ad_hoc with body queues a custom-body email", async ({ request }) => {
-		const result = (await callMethod(request, "event_app.api.send_correspondence", {
+		const result = (await callMethod(request, "good_event.api.send_correspondence", {
 			booking: BOOKING!,
 			flow: "ad_hoc",
 			context_overrides: { ad_hoc_body: "<p>Custom test message — only on this run.</p>" },
 		})) as { sent: string[] };
 		expect(result.sent.length).toBeGreaterThan(0);
 
-		const { message } = await fetchLatestQueueFor(request, "Event Booking", BOOKING!);
+		const { message } = await fetchLatestQueueFor(request, "Good Event Booking", BOOKING!);
 		expect(message).toContain("Custom test message");
 	});
 });

@@ -119,7 +119,7 @@ instead of the generic failed-payment page.
 
 ## Cross-App Integration
 
-`event_app` imports `payrexx_pay_url` for invoice and combined-bundle emails. Missing Payrexx configuration should degrade gracefully: invoice emails still send without the online-pay button.
+`good_event` imports `payrexx_pay_url` for invoice and combined-bundle emails. Missing Payrexx configuration should degrade gracefully: invoice emails still send without the online-pay button.
 
 ## Testing
 
@@ -135,7 +135,7 @@ npx playwright test
 ```
 
 Legacy Buzz browser specs for `/anmelden` and `buzz.api.process_booking` are
-skipped by default because the current native Event App no longer serves those
+skipped by default because the current native Good Event no longer serves those
 routes. Run them only on a Buzz-compatible site with `RUN_LEGACY_BUZZ_E2E=1`.
 
 ## Related Docs

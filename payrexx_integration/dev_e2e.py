@@ -1,4 +1,4 @@
-"""Dev-only end-to-end test helpers for the Payrexx + event_app flow.
+"""Dev-only end-to-end test helpers for the Payrexx + good_event flow.
 
 These are intentionally not whitelisted — call via:
 
@@ -100,10 +100,10 @@ def run_event_to_invoice_email(email: str = "test@example.com") -> dict:
 		print(f"[OK] Ticket Type: {tt.name}  {tt.price} {tt.currency}", flush=True)
 		out["ticket_type"] = tt.name
 
-		# 4. Event Booking (pay-later)
+		# 4. Good Event Booking (pay-later)
 		booking = frappe.get_doc(
 			{
-				"doctype": "Event Booking",
+				"doctype": "Good Event Booking",
 				"event": event.name,
 				"user": "Administrator",
 				"currency": "CHF",

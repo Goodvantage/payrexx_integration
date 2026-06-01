@@ -21,7 +21,7 @@ test.describe("Payrexx hosted checkout sandbox payment", () => {
 		"Set RUN_PAYREXX_SANDBOX_PAYMENT=1 to submit a real Payrexx sandbox test payment.",
 	);
 
-	test("creates an Event App invoice and submits a Payrexx test payment", async ({ page }) => {
+	test("creates an Good Event invoice and submits a Payrexx test payment", async ({ page }) => {
 		const fixture = await createPayLaterInvoiceWithPayUrl();
 		expect(fixture.payUrl).toContain("payrexx_integration.api.pay_invoice");
 		expect(fixture.payUrl).toContain("gateway_name=Sandbox");
@@ -60,7 +60,7 @@ async function createPayLaterInvoiceWithPayUrl() {
 		const invoiceName = String(booking.sales_invoice || "");
 		expect(invoiceName, `booking ${bookingId} should have a Sales Invoice`).toBeTruthy();
 
-		await callMethod(adminCtx, "event_app.api.send_correspondence", {
+		await callMethod(adminCtx, "good_event.api.send_correspondence", {
 			booking: bookingId,
 			flow: "invoice",
 		});
@@ -120,7 +120,7 @@ async function waitForSubmittedBooking(adminCtx: APIRequestContext, bookingId: s
 	let booking: Record<string, unknown> | null = null;
 	const deadline = Date.now() + 30_000;
 	while (Date.now() < deadline) {
-		const response = await adminCtx.get(`/api/resource/Event Booking/${encodeURIComponent(bookingId)}`);
+		const response = await adminCtx.get(`/api/resource/Good Event Booking/${encodeURIComponent(bookingId)}`);
 		if (response.ok()) {
 			booking = (await response.json()).data;
 			if (booking?.docstatus === 1 && booking?.sales_invoice) break;

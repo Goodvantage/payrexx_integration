@@ -139,7 +139,7 @@ test.describe("Guest pay-later flow over HTTP", () => {
 			const deadline = Date.now() + 30_000;
 			while (Date.now() < deadline) {
 				const r = await adminCtx.get(
-					`/api/resource/Event Booking/${encodeURIComponent(bookingId)}`,
+					`/api/resource/Good Event Booking/${encodeURIComponent(bookingId)}`,
 				);
 				if (r.ok()) {
 					const body = await r.json();
@@ -171,13 +171,13 @@ test.describe("Guest pay-later flow over HTTP", () => {
 			if (!siName) {
 				siName = String(
 					await callMethod(adminCtx, "run_doc_method", {
-						dt: "Event Booking",
+						dt: "Good Event Booking",
 						dn: bookingId,
 						method: "create_sales_invoice",
 					}),
 				);
 				const refreshed = await adminCtx.get(
-					`/api/resource/Event Booking/${encodeURIComponent(bookingId)}`,
+					`/api/resource/Good Event Booking/${encodeURIComponent(bookingId)}`,
 				);
 				if (refreshed.ok()) {
 					booking = (await refreshed.json()).data;
@@ -195,7 +195,7 @@ test.describe("Guest pay-later flow over HTTP", () => {
 					"&filters=" +
 					encodeURIComponent(
 						JSON.stringify({
-							reference_doctype: "Event Booking",
+							reference_doctype: "Good Event Booking",
 							reference_name: bookingId,
 						}),
 					) +

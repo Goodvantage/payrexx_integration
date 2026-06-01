@@ -44,7 +44,7 @@ Innermost package dir: `payrexx_integration/payrexx_integration/payrexx_integrat
 | `api.py::payrexx_pay_url(sales_invoice)` | Jinja helper (registered via `hooks.py.jinja`). Returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
 | `api.py::pay_invoice(si, token)` | Whitelisted redirect endpoint. Verifies the HMAC token, looks up the Sales Invoice, lazy-creates a Payment Request via ERPNext's `make_payment_request`, and 302s to the Payrexx hosted checkout. **Both args are optional kwargs** so missing-param requests return clean 403, not 500. |
 | `dev_e2e.py::run_event_to_invoice_email(email)` | Bench-execute helper that creates an event → ticket → booking → invoice → triggers the email queue. Used from the conversation runbook for one-shot smoke tests against the live sandbox. |
-| `playwright/` | Self-contained Playwright project (npm). Covers Payrexx Settings desk flow, pay_invoice endpoint auth, and optional Event Booking → email queue flows. Legacy Buzz `/anmelden` specs are opt-in with `RUN_LEGACY_BUZZ_E2E=1`. |
+| `playwright/` | Self-contained Playwright project (npm). Covers Payrexx Settings desk flow, pay_invoice endpoint auth, and optional Good Event Booking → email queue flows. Legacy Buzz `/anmelden` specs are opt-in with `RUN_LEGACY_BUZZ_E2E=1`. |
 
 ---
 
@@ -145,7 +145,7 @@ when only the checkout/login surface uses a custom domain.
 bench --site <site> run-tests --app payrexx_integration \
   --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings
 
-# Playwright e2e (covers both this app + event_app correspondence flows)
+# Playwright e2e (covers both this app + good_event correspondence flows)
 cd playwright
 npm install && npx playwright install chromium
 TEST_BOOKING_NAME=<booking> npx playwright test
@@ -185,7 +185,7 @@ name (use it for `TEST_BOOKING_NAME` afterwards).
 
 ## Cross-app integration
 
-- `event_app` imports `from payrexx_integration.api import payrexx_pay_url`
+- `good_event` imports `from payrexx_integration.api import payrexx_pay_url`
   in `services/booking_confirmation.py` and `services/workflow.py`
   (`combined_bundle` flow). Both wrap the import in try/except so missing
   Payrexx config gracefully degrades — invoice email still ships, just
