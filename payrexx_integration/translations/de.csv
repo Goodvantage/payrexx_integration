@@ -1,0 +1,43 @@
+Source Text,Translated Text
+API Base Domain,API-Basisdomain
+API Version,API-Version
+"API base domain for Payrexx platform accounts. Use payrexx.com for normal Payrexx instances, or e.g. pay.goodvantage.ch for customer.pay.goodvantage.ch.","API-Basisdomain für Payrexx-Plattformkonten. Für normale Payrexx-Instanzen payrexx.com verwenden, oder z. B. pay.goodvantage.ch für customer.pay.goodvantage.ch."
+API secret from Payrexx → Integrations → API & Plugins. Sent as the 'x-api-key' header.,API-Secret aus Payrexx → Integrationen → API & Plugins. Wird als Header 'x-api-key' gesendet.
+Behavior,Verhalten
+Cancel Redirect URL,Abbruch-Weiterleitungs-URL
+Cannot reach Payrexx — check network connectivity.,Payrexx ist nicht erreichbar — Netzwerkverbindung prüfen.
+Comma-separated ISO 4217 currency codes accepted by this gateway.,"Durch Kommas getrennte ISO-4217-Währungscodes, die dieses Gateway akzeptiert."
+Could not generate Payrexx payment URL,Payrexx-Zahlungs-URL konnte nicht erzeugt werden
+Credentials,Zugangsdaten
+Currency {0} is not supported by Payrexx gateway {1}.,Währung {0} wird vom Payrexx-Gateway {1} nicht unterstützt.
+Failed Redirect URL,Fehler-Weiterleitungs-URL
+Gateway Name,Gateway-Name
+Gateway Validity (minutes),Gateway-Gültigkeit (Minuten)
+How long the generated checkout link stays valid (in minutes). Leave blank for the Payrexx default.,Wie lange der erzeugte Checkout-Link gültig bleibt (in Minuten). Leer lassen für den Payrexx-Standard.
+Instance Name,Instanzname
+Invalid Payrexx webhook signature,Ungueltige Payrexx-Webhook-Signatur
+Invalid or expired payment link,Ungueltiger oder abgelaufener Zahlungslink
+Invoice not found,Rechnung nicht gefunden
+Multiple Payrexx Settings exist — webhook URL must include ?gateway_name=...,Mehrere Payrexx-Einstellungen vorhanden — die Webhook-URL muss ?gateway_name=... enthalten
+No Payment Gateway Account configured for {0},Kein Payment Gateway Account für {0} konfiguriert
+No Payrexx Settings configured,Keine Payrexx-Einstellungen konfiguriert
+Optional override. By default the customer is sent back to '/payment-success?doctype=...&docname=...' on success.,Optionale Überschreibung. Standardmässig wird der Kunde bei Erfolg zu '/payment-success?doctype=...&docname=...' zurückgeleitet.
+"Optional: comma-separated list of Payrexx PSP IDs to restrict available payment providers (e.g. '4,17').","Optional: Durch Kommas getrennte Liste von Payrexx-PSP-IDs, um verfügbare Zahlungsanbieter einzuschränken (z. B. '4,17')."
+PSP Whitelist,PSP-Whitelist
+Payment Gateway: Payrexx-{0},Payment Gateway: Payrexx-{0}
+Payment reference not found,Zahlungsreferenz nicht gefunden
+Payrexx Integration,Payrexx-Integration
+Payrexx Settings,Payrexx-Einstellungen
+Payrexx rejected the API Secret. Check the value in 'API Secret'.,Payrexx hat das API-Secret abgelehnt. Prüfe den Wert in 'API Secret'.
+Payrexx returned HTTP {0},Payrexx gab HTTP {0} zurück
+Redirect Overrides,Weiterleitungs-Überschreibungen
+Signing key configured for the webhook in Payrexx → Webhooks. Used to verify the X-Webhook-Signature header.,"Signaturschlüssel, der in Payrexx → Webhooks für den Webhook konfiguriert ist. Wird zur Prüfung des Headers X-Webhook-Signature verwendet."
+Site encryption_key is not configured,Site encryption_key ist nicht konfiguriert
+Supported Currencies,Unterstützte Währungen
+This invoice has been cancelled,Diese Rechnung wurde storniert
+This invoice is not submitted,Diese Rechnung ist nicht eingereicht
+Unexpected response from Payrexx. Check that 'Instance Name' ({0}) and 'API Base Domain' ({1}) are correct.,"Unerwartete Antwort von Payrexx. Prüfe, ob 'Instance Name' ({0}) und 'API Base Domain' ({1}) korrekt sind."
+Used to build the Payment Gateway name as 'Payrexx-{gateway_name}'. e.g. 'Live' or 'Sandbox'.,"Wird verwendet, um den Payment-Gateway-Namen als 'Payrexx-{gateway_name}' zu bilden, z. B. 'Live' oder 'Sandbox'."
+Webhook Signing Key,Webhook-Signaturschluessel
+Webhook URL for Payrexx:,Webhook-URL für Payrexx:
+"Your Payrexx instance subdomain. For customer.pay.goodvantage.ch, use customer here and pay.goodvantage.ch in API Base Domain.",Subdomain deiner Payrexx-Instanz. Für customer.pay.goodvantage.ch hier customer und in API Base Domain pay.goodvantage.ch verwenden.
