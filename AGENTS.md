@@ -44,7 +44,7 @@ Innermost package dir: `payrexx_integration/payrexx_integration/payrexx_integrat
 | `api.py::payrexx_pay_url(sales_invoice)` | Jinja helper (registered via `hooks.py.jinja`). Returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
 | `api.py::pay_invoice(si, token)` | Whitelisted redirect endpoint. Verifies the HMAC token, looks up the Sales Invoice, lazy-creates a Payment Request via ERPNext's `make_payment_request`, and 302s to the Payrexx hosted checkout. **Both args are optional kwargs** so missing-param requests return clean 403, not 500. |
 | `dev_e2e.py::run_event_to_invoice_email(email)` | Bench-execute helper that creates an event → ticket → booking → invoice → triggers the email queue. Used from the conversation runbook for one-shot smoke tests against the live sandbox. |
-| `playwright/` | Self-contained Playwright project (npm). Covers Payrexx Settings desk flow, pay_invoice endpoint auth, and optional Good Event Booking → email queue flows. Legacy Buzz `/anmelden` specs are opt-in with `RUN_LEGACY_BUZZ_E2E=1`. |
+| `playwright/` | Self-contained Playwright project (npm). Covers Payrexx Settings desk flow, pay_invoice endpoint auth, and optional Good Event Booking → email queue flows. |
 
 ---
 
@@ -150,10 +150,6 @@ cd playwright
 npm install && npx playwright install chromium
 TEST_BOOKING_NAME=<booking> npx playwright test
 ```
-
-Legacy Buzz browser specs for `/anmelden` and `buzz.api.process_booking` are
-skipped by default. Run them only on a Buzz-compatible site with
-`RUN_LEGACY_BUZZ_E2E=1`.
 
 `dev_e2e.run_event_to_invoice_email("benediktmathis@gmail.com")` is the
 canonical end-to-end smoke test — creates an event, books it, generates

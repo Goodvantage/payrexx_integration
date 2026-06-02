@@ -2,6 +2,7 @@ app_name = "payrexx_integration"
 app_title = "Payrexx Integration"
 app_publisher = "Goodvantage GmbH"
 app_description = "Payrexx payment gateway integration for the Frappe payments app"
+app_logo_url = "/assets/payrexx_integration/images/payrexx-integration-app-logo.svg"
 app_email = "info@goodvanta.ge"
 app_license = "unlicense"
 

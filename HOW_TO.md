@@ -143,6 +143,5 @@ npm install
 npx playwright test
 ```
 
-Legacy Buzz browser specs for `/anmelden` and `buzz.api.process_booking` are
-skipped by default. Run them only on a site that still supports those retired
-routes with `RUN_LEGACY_BUZZ_E2E=1 npx playwright test`.
+The Playwright specs cover the current Payrexx Settings, pay-by-email, and Good
+Event correspondence flows.

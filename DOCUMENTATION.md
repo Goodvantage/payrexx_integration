@@ -13,6 +13,8 @@ payments
 
 Do not modify `apps/payments` directly for Payrexx behavior.
 
+The app metadata exposes `/assets/payrexx_integration/images/payrexx-integration-app-logo.svg`, following the shared Goodvantage `G` background pattern with a bottom-right white credit-card line symbol. Payrexx Integration does not add a Desk app tile by default; the logo is available for metadata or future app-surface use.
+
 ## Core DocTypes
 
 | DocType | Purpose |
@@ -134,9 +136,8 @@ cd frappe-bench/apps/payrexx_integration/playwright
 npx playwright test
 ```
 
-Legacy Buzz browser specs for `/anmelden` and `buzz.api.process_booking` are
-skipped by default because the current native Good Event no longer serves those
-routes. Run them only on a Buzz-compatible site with `RUN_LEGACY_BUZZ_E2E=1`.
+The Playwright project covers the current Payrexx Settings, pay-by-email, and
+Good Event correspondence flows.
 
 ## Related Docs
 

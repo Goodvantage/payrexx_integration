@@ -94,7 +94,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 		original_host_name = frappe.conf.get("host_name")
 		try:
 			frappe.conf.host_name = "https://demo.example.test"
-			self.assertEqual(get_public_url("/goodnpo?x=1"), "https://demo.example.test/goodnpo?x=1")
+			self.assertEqual(get_public_url("/demo?x=1"), "https://demo.example.test/demo?x=1")
 		finally:
 			if original_host_name is None:
 				frappe.conf.pop("host_name", None)
@@ -550,7 +550,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 		self.assertEqual((frappe.parse_json(ir.data) or {})["payrexx_transaction"]["id"], 12345)
 
 	def test_payment_success_redirects_directly_to_custom_return_url(self):
-		return_url = "https://demo.example.test/goodnpo?donation_status=success&donation=NPO-DTN#donate"
+		return_url = "https://demo.example.test/demo?donation_status=success&donation=NPO-DTN#donate"
 		ir = frappe.get_doc(
 			{
 				"doctype": "Integration Request",
