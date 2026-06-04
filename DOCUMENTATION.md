@@ -13,7 +13,7 @@ payments
 
 Do not modify `apps/payments` directly for Payrexx behavior.
 
-The app metadata exposes `/assets/payrexx_integration/images/payrexx-integration-app-logo.svg`, following the shared Goodvantage `G` background pattern with a bottom-right white credit-card line symbol. Payrexx Integration does not add a Desk app tile by default; the logo is available for metadata or future app-surface use.
+The app metadata exposes `/assets/payrexx_integration/images/payrexx-integration-app-logo.svg`, following the shared Goodvantage navy tile pattern with a centered white credit-card line symbol and small bottom-right white Goodvantage `g` mark. Payrexx Integration does not add a Desk app tile by default; the logo is available for metadata or future app-surface use.
 
 ## Core DocTypes
 
