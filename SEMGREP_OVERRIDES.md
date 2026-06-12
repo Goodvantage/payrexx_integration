@@ -10,19 +10,13 @@
 
 - Rule: `guest-whitelisted-method`
 - What it prevents: Accidental guest webhook endpoints that accept unauthenticated payment status changes.
-- Why this override is safe: `callback` is intentionally public for Payrexx POST webhooks, but it verifies `X-Webhook-Signature` with the per-webhook signing key before touching any Integration Request. Unknown or unsigned payloads are rejected or ignored without applying payment side effects.
+- Why this override is safe: `callback` is intentionally public for Payrexx POST webhooks, but it verifies `X-Webhook-Signature` with the per-webhook signing key before touching any Integration Request, and rejects webhooks whose verifying settings row does not match the gateway recorded on the Integration Request (`payrexx_settings` / `payment_gateway`). Unknown, unsigned, or cross-gateway payloads are rejected or ignored without applying payment side effects.
 
-## `frappe-setuser` in `payrexx_integration/api.py`
-
-- Rule: `frappe-setuser`
-- What it prevents: Unsafe privilege switching that can leave requests running under the wrong user.
-- Why this override is safe: `pay_invoice` is a signed public email link. The automation-user block is limited to creating/reusing the `Payment Request` and Payrexx checkout URL for the HMAC-verified Sales Invoice, and `_as_automation_user` restores the original Frappe session in `finally`.
-
-## `frappe-setuser` in `payrexx_integration/payrexx_integration/doctype/payrexx_settings/payrexx_settings.py`
+## `frappe-setuser` in `payrexx_integration/session_utils.py`
 
 - Rule: `frappe-setuser`
 - What it prevents: Unsafe privilege switching that can leave requests running under the wrong user.
-- Why this override is safe: `callback` verifies the Payrexx webhook signature before any privilege switch. The automation-user block is limited to running the reference document's post-payment `on_payment_authorized` hook, uses the configured `Non Profit Settings.creation_user` when available, and restores the original Frappe session in `finally`.
+- Why this override is safe: `as_automation_user` is the single privilege-switch context manager for both guest payment paths. `pay_invoice` only reaches it after HMAC verification of the signed email link; the webhook path only after `X-Webhook-Signature` verification. It resolves the configured least-privilege `Non Profit Settings.creation_user` (falling back to Administrator), and restores the original Frappe session in `finally`.
 
 ## `frappe-manual-commit` in `payrexx_integration/dev_e2e.py`
 

@@ -419,6 +419,130 @@ class TestPayrexxSettings(IntegrationTestCase):
 		ir.reload()
 		self.assertEqual(ir.status, "Queued")
 
+	def test_get_payment_url_records_owning_settings_on_integration_request(self):
+		"""The settings row that creates a checkout is recorded on the IR —
+		the webhook binding depends on this."""
+		settings = frappe.get_doc("Payrexx Settings", self.settings_name)
+
+		class _FakeClient:
+			def create_gateway(self, payload):
+				return {"id": 4242, "hash": "h", "link": "https://pay.example/checkout"}
+
+		with patch.object(type(settings), "_client", return_value=_FakeClient()):
+			# No reference document: create_request_log link-validates it,
+			# and the recording behavior under test is independent of it.
+			link = settings.get_payment_url(
+				amount=10,
+				currency="CHF",
+				payment_gateway="Payrexx-" + self.settings_name,
+			)
+		self.assertEqual(link, "https://pay.example/checkout")
+
+		ir_name = frappe.get_all(
+			"Integration Request",
+			filters={"integration_request_service": "Payrexx"},
+			order_by="creation desc",
+			limit=1,
+			pluck="name",
+		)[0]
+		data = frappe.parse_json(frappe.db.get_value("Integration Request", ir_name, "data"))
+		self.assertEqual(data.get("payrexx_settings"), self.settings_name)
+		self.assertEqual(data.get("payrexx_gateway_id"), 4242)
+
+	def test_reconcile_prefers_integration_requests_own_gateway(self):
+		"""The caller-supplied gateway_name must not pick the credentials —
+		the IR's stored gateway does."""
+		other_settings = _ensure_settings("OtherGateway")
+		ir = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Queued",
+				"data": json.dumps({"payrexx_gateway_id": 777, "payrexx_settings": other_settings}),
+			}
+		).insert(ignore_permissions=True)
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		resolved = []
+		original_resolve = ps_module._resolve_settings
+
+		def capture_resolve(gateway_name):
+			resolved.append(gateway_name)
+			settings = original_resolve(gateway_name)
+
+			class _FakeClient:
+				def retrieve_gateway(self, gateway_id):
+					return {"status": "waiting", "invoices": []}
+
+			settings._client = lambda: _FakeClient()
+			return settings
+
+		with patch.object(ps_module, "_resolve_settings", side_effect=capture_resolve):
+			ps_module.reconcile_integration_request(ir.name, gateway_name=GATEWAY_NAME)
+
+		self.assertEqual(resolved, [other_settings])
+
+	def test_callback_rejects_gateway_mismatch(self):
+		"""A webhook verified with one gateway's key must not complete another gateway's request."""
+		other_settings = _ensure_settings("OtherGateway")
+		ir = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Queued",
+				"data": json.dumps({"payrexx_gateway_id": 999, "payrexx_settings": other_settings}),
+			}
+		).insert(ignore_permissions=True)
+
+		body = json.dumps(
+			{
+				"transaction": {
+					"id": 12345,
+					"status": "confirmed",
+					"referenceId": ir.name,
+					"invoice": {"referenceId": ir.name},
+				}
+			}
+		).encode("utf-8")
+		# Signature is valid for GATEWAY_NAME's signing key, but the Integration
+		# Request belongs to OtherGateway — the callback must refuse to touch it.
+		sig = base64.b64encode(hmac.new(b"whk_test_dummy", body, hashlib.sha256).digest()).decode("ascii")
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		class _FakeRequest:
+			def __init__(self):
+				self.args = {}
+				self.form = {}
+
+			def get_data(self):
+				return body
+
+		original_request = getattr(frappe.local, "request", None)
+		original_header = frappe.get_request_header
+		frappe.local.request = _FakeRequest()
+		frappe.get_request_header = lambda name, default="": (  # type: ignore[assignment]
+			sig if name == "X-Webhook-Signature" else default
+		)
+		try:
+			with patch("frappe.log_error") as log_error:
+				self.assertEqual(ps_module.callback(gateway_name=GATEWAY_NAME), {"ok": True})
+				log_error.assert_called_once()
+		finally:
+			frappe.get_request_header = original_header  # type: ignore[assignment]
+			if original_request is None:
+				delattr(frappe.local, "request")
+			else:
+				frappe.local.request = original_request
+
+		ir.reload()
+		self.assertEqual(ir.status, "Queued", "Mismatched-gateway webhook must not complete the request")
+
 	def test_callback_reads_gateway_name_from_query_args_for_json_webhook(self):
 		_ensure_settings("OtherGateway")
 		ir = frappe.get_doc(

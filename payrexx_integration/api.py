@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from contextlib import contextmanager
 from urllib.parse import urlencode
 
 import frappe
 from frappe import _
 
+from payrexx_integration.session_utils import as_automation_user
 from payrexx_integration.url_utils import get_public_url
 from payrexx_integration.url_utils import safe_return_url as _safe_return_url
 
@@ -41,21 +41,37 @@ def _signing_key() -> bytes:
 	return key.encode("utf-8") if isinstance(key, str) else bytes(key)
 
 
-def _sign(invoice_name: str, gateway_name: str | None = None) -> str:
-	payload = invoice_name if not gateway_name else f"{invoice_name}|{gateway_name}"
+def sign_reference(payload: str) -> str:
+	"""HMAC-sign an arbitrary reference string with the site key.
+
+	Shared signer for compact email-link tokens (pay-by-email here, the dummy
+	checkout in good_demo). Callers compose the payload string; keep existing
+	compositions stable so in-flight links keep verifying.
+	"""
 	digest = hmac.new(_signing_key(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 	# 32 hex chars = 128 bits of HMAC output, enough to make guessing infeasible
 	# while keeping the URL compact in an email.
 	return digest[:32]
 
 
+def verify_reference(payload: str, token: str | None) -> bool:
+	if not (payload and token):
+		return False
+	return hmac.compare_digest(sign_reference(payload), str(token))
+
+
+def _sign(invoice_name: str, gateway_name: str | None = None) -> str:
+	payload = invoice_name if not gateway_name else f"{invoice_name}|{gateway_name}"
+	return sign_reference(payload)
+
+
 def _verify(invoice_name: str, token: str, gateway_name: str | None = None) -> bool:
 	if not (invoice_name and token):
 		return False
 	if gateway_name:
-		return hmac.compare_digest(_sign(invoice_name, gateway_name), token)
+		return verify_reference(f"{invoice_name}|{gateway_name}", token)
 	# Backward compatible for links generated before gateway_name was included.
-	return hmac.compare_digest(_sign(invoice_name), token)
+	return verify_reference(invoice_name, token)
 
 
 # ---------------------------------------------------------------- jinja helper
@@ -123,7 +139,9 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 	# Re-use an existing Payment Request for this invoice if one is still
 	# pending, otherwise create a fresh one. This keeps the Payment Request
 	# log clean when a customer clicks the email link multiple times.
-	with _as_automation_user():
+	# Runs as the configured least-privilege automation user (same resolution
+	# as the webhook path), never as a hardcoded Administrator.
+	with as_automation_user():
 		payment_request = _get_or_create_payment_request(sales_invoice, settings_name)
 		checkout_url = payment_request.get_payment_url()
 
@@ -240,19 +258,3 @@ def _payment_failed_redirect_url(integration_request) -> str:
 		"docname": integration_request.reference_docname or data.get("reference_docname") or "",
 	}
 	return get_public_url("/payment-failed?" + urlencode(params))
-
-
-# Duplicates good_connector.workflow_support.as_automation_user — kept locally
-# because payrexx_integration does not depend on good_connector.
-@contextmanager
-def _as_automation_user(user: str = "Administrator"):
-	previous_user = frappe.session.user
-	previous_sid = frappe.session.sid
-	previous_data = frappe.session.data
-	frappe.set_user(user)  # nosemgrep: frappe-setuser
-	try:
-		yield
-	finally:
-		frappe.set_user(previous_user)  # nosemgrep: frappe-setuser
-		frappe.session.sid = previous_sid
-		frappe.session.data = previous_data

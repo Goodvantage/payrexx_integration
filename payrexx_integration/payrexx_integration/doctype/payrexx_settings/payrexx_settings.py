@@ -2,14 +2,13 @@
 # For license information, please see license.txt
 
 import time
-from contextlib import contextmanager
 from urllib.parse import urlencode
 
 import frappe
 from frappe import _
 from frappe.integrations.utils import create_request_log
 from frappe.model.document import Document
-from frappe.utils import call_hook_method, cstr, flt
+from frappe.utils import call_hook_method, cint, cstr, flt
 from payments.utils import create_payment_gateway
 
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import PayrexxClient, get_http_status
@@ -58,6 +57,9 @@ class PayrexxSettings(Document):
 			data = frappe.parse_json(integration_request.data) or {}
 			data["payrexx_gateway_id"] = gateway.get("id")
 			data["payrexx_gateway_hash"] = gateway.get("hash")
+			# Authoritative record of which settings row created this request —
+			# the webhook only accepts callbacks verified with this row's key.
+			data["payrexx_settings"] = self.name
 			integration_request.data = frappe.as_json(data)
 			integration_request.save(ignore_permissions=True)
 
@@ -109,7 +111,8 @@ class PayrexxSettings(Document):
 
 	def _build_create_gateway_payload(self, kwargs: dict, integration_request_name: str) -> dict:
 		# Payrexx wants the amount in the smallest currency unit (e.g. cents).
-		amount_cents = round(flt(kwargs.get("amount")) * 100)
+		# Round to 2 decimals first so float artifacts cannot shift a cent.
+		amount_cents = cint(round(flt(kwargs.get("amount"), 2) * 100))
 		currency = (kwargs.get("currency") or "CHF").upper()
 		payer_name = (kwargs.get("payer_name") or "").strip()
 		first, last = [*payer_name.split(" ", 1), ""][:2] if payer_name else ("", "")
@@ -237,6 +240,21 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 			return {"ok": True}
 
 		ir_data = frappe.parse_json(ir.data) or {}
+
+		# Bind the verifying key to the Integration Request's own gateway: a
+		# webhook signed with one row's key (e.g. Sandbox) must not complete a
+		# request created by another row (e.g. Live).
+		expected_settings = ir_data.get("payrexx_settings") or _settings_name_from_request_data(ir_data)
+		if expected_settings and expected_settings != settings.name:
+			frappe.log_error(
+				frappe.as_json(
+					_webhook_log_summary(txn, ref_id, status)
+					| {"verified_with": settings.name, "expected": expected_settings}
+				),
+				"Payrexx webhook gateway mismatch",
+			)
+			return {"ok": True}
+
 		ir_data["payrexx_transaction"] = txn
 		ir.data = frappe.as_json(ir_data)
 
@@ -329,7 +347,12 @@ def reconcile_integration_request(
 	if not gateway_id:
 		return False
 
-	settings = _resolve_settings(gateway_name or _settings_name_from_request_data(ir_data))
+	# The Integration Request's own gateway decides which credentials confirm
+	# the payment; the caller-supplied gateway_name is only a legacy fallback
+	# for requests that predate the stored gateway reference.
+	settings = _resolve_settings(
+		ir_data.get("payrexx_settings") or _settings_name_from_request_data(ir_data) or gateway_name
+	)
 	gateway = settings._client().retrieve_gateway(int(gateway_id))
 	status = (gateway.get("status") or "").lower()
 	transaction = _confirmed_transaction_from_gateway(gateway)
@@ -400,31 +423,7 @@ def _on_payment_authorized(integration_request, status):
 		raise
 
 
-# Duplicates good_connector.workflow_support.as_automation_user — kept locally
-# because payrexx_integration does not depend on good_connector.
-@contextmanager
 def _payment_authorization_user():
-	automation_user = _payment_authorization_user_name()
-	previous_user = frappe.session.user
-	previous_sid = getattr(frappe.session, "sid", None)
-	previous_data = getattr(frappe.session, "data", None)
+	from payrexx_integration.session_utils import as_automation_user
 
-	if automation_user and automation_user != previous_user:
-		frappe.set_user(automation_user)  # nosemgrep: frappe-setuser
-
-	try:
-		yield
-	finally:
-		if automation_user and automation_user != previous_user:
-			frappe.set_user(previous_user)  # nosemgrep: frappe-setuser
-			frappe.session.sid = previous_sid
-			frappe.session.data = previous_data
-
-
-def _payment_authorization_user_name() -> str:
-	if frappe.db.exists("DocType", "Non Profit Settings"):
-		creation_user = frappe.db.get_single_value("Non Profit Settings", "creation_user")
-		if creation_user and frappe.db.exists("User", creation_user):
-			return creation_user
-
-	return "Administrator"
+	return as_automation_user()

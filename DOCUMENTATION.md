@@ -79,12 +79,21 @@ Payrexx sends JSON webhooks, so the callback reads `gateway_name` directly from
 the request query string before resolving the signing key.
 After signature verification, payment side effects run as the configured
 `Non Profit Settings.creation_user` when that DocType is installed, otherwise
-as `Administrator`. Transient `QueryDeadlockError` failures while running the
+as `Administrator`. The `pay_invoice` redirect endpoint uses the same
+least-privilege resolution (`session_utils.as_automation_user`) for its lazy
+Payment Request creation — no guest path runs as a hardcoded Administrator
+when an automation user is configured. Transient `QueryDeadlockError` failures while running the
 reference document's `on_payment_authorized` hook are retried before the webhook
 is allowed to fail. Non-deadlock failures are logged and re-raised so Payrexx
 can retry the webhook; the Integration Request and downstream payment side
 effects are committed together by Frappe's request transaction instead of a
 mid-callback manual commit.
+The callback also binds the verifying key to the Integration Request itself:
+`get_payment_url()` stores the originating Payrexx Settings name in the
+Integration Request data (`payrexx_settings`), and a webhook verified with a
+different settings row's key (for example a Sandbox-signed webhook referencing
+a Live request) is logged and ignored. Requests created before this field
+existed fall back to the `payment_gateway` value recorded at creation.
 If a webhook is missing `referenceId`, references an unknown Integration
 Request, or references an Integration Request whose service is not `Payrexx`,
 the callback logs only a compact transaction summary
@@ -102,6 +111,10 @@ Payrexx success redirects reconcile the Integration Request by fetching the
 Gateway from Payrexx server-side. Webhooks remain the primary completion path,
 but the success return is a safe fallback because payment side effects only run
 after Payrexx reports the Gateway or one of its transactions as `confirmed`.
+The credentials used for that confirmation come from the Integration Request's
+own stored gateway (`payrexx_settings`, falling back to `payment_gateway`); the
+caller-supplied `gateway_name` parameter is only honoured for legacy requests
+that carry neither value.
 If the Integration Request data contains a `redirect_to` value, the endpoint
 redirects directly to that same-site return URL after reconciliation; otherwise
 it falls back to the standard `/payment-success` page. If Payrexx does not yet
