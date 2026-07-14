@@ -55,7 +55,12 @@ The helper returns a signed GET URL:
 GET /api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&token=<hmac>
 ```
 
-When clicked, the endpoint verifies the token, lazy-creates a Payment Request through ERPNext, and redirects to Payrexx hosted checkout.
+When clicked, the endpoint verifies the token, lazy-creates and submits a Payment
+Request through ERPNext, and redirects to the checkout URL created during that
+submission. Repeated clicks reuse the same Payment Request and Payrexx checkout.
+If an older active Integration Request has no recoverable checkout URL, the app
+shows an error instead of creating a second potentially chargeable checkout;
+review that Integration Request in Desk.
 
 ## 4. Success Redirect Fallback
 
@@ -121,13 +126,31 @@ Payrexx reference ID points at a row owned by another gateway, the callback logs
 the mismatch and ignores it.
 If Payrexx reports a transient `tabSeries` / `QueryDeadlockError`, retry the
 webhook after the latest app code is loaded. The callback retries those
-deadlocks around payment side effects before returning an error to Payrexx.
+deadlocks from the locked Integration Request update through downstream
+settlement before returning an error to Payrexx.
 Other downstream payment-hook failures are logged and returned as webhook
 errors so Payrexx can retry; the app no longer marks the Integration Request
 complete in a separate manual commit before the referenced document accepts the
 payment.
 
-## 8. Run Tests
+For a confirmed Payment Request, verify that its status is **Paid**, its
+outstanding amount is zero, and exactly one submitted Payment Entry references
+it. ERPNext updates the linked Sales Invoice outstanding amount through the
+normal Payment Entry submission path.
+
+## 8. Handle A Chargeback
+
+When Payrexx reports a chargeback:
+
+1. Open the high-priority ToDo linked to the failed Integration Request.
+2. Review its stored Payrexx transaction and the submitted Payment Entry.
+3. Post the appropriate accounting reversal under your normal approval process.
+4. Close the ToDo after the reversal and customer/source-document follow-up are complete.
+
+The callback preserves submitted ledger records and never cancels them
+automatically. Repeated chargeback callbacks do not create additional ToDos.
+
+## 9. Run Tests
 
 ```bash
 cd frappe-bench

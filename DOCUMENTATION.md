@@ -55,7 +55,12 @@ GET /api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&token=<hm
 
 Pay-by-email links are generated only for submitted Sales Invoices. Draft
 invoices return no payment URL, and `pay_invoice` rejects draft invoices before
-creating a Payrexx gateway.
+creating a Payrexx gateway. Submitting the ERPNext Payment Request creates the
+Payrexx Gateway and stores its URL; `pay_invoice` redirects to that stored URL
+instead of requesting a second checkout. If a legacy Payment Request has no URL,
+the app recovers the URL recorded in its active Integration Request. An active
+request with no recoverable URL raises a clean error rather than creating a
+potential duplicate checkout.
 
 Externally shared URLs are built from `host_name` exactly as configured. This
 avoids leaking a local bench `webserver_port` such as `:8000`, or a temporary
@@ -82,12 +87,22 @@ After signature verification, payment side effects run as the configured
 as `Administrator`. The `pay_invoice` redirect endpoint uses the same
 least-privilege resolution (`session_utils.as_automation_user`) for its lazy
 Payment Request creation — no guest path runs as a hardcoded Administrator
-when an automation user is configured. Transient `QueryDeadlockError` failures while running the
-reference document's `on_payment_authorized` hook are retried before the webhook
-is allowed to fail. Non-deadlock failures are logged and re-raised so Payrexx
-can retry the webhook; the Integration Request and downstream payment side
-effects are committed together by Frappe's request transaction instead of a
-mid-callback manual commit.
+when an automation user is configured. A confirmed Integration Request that
+references an ERPNext Payment Request calls the standard `set_as_paid()` method
+under a row lock. This creates and submits one Payment Entry and lets ERPNext
+update the Payment Request status/outstanding amount and the source invoice
+outstanding amount. Other reference types continue to receive their existing
+`on_payment_authorized("Completed")` hook.
+
+Transient `QueryDeadlockError` failures retry the entire locked completion unit:
+the Integration Request is reloaded, transaction data and status are saved, and
+the downstream settlement runs again in one transaction. Duplicate confirmed
+callbacks return after observing the locked completed row, while separate
+requests for the same Payment Request are serialized on that Payment Request.
+Non-deadlock failures are logged and re-raised so Payrexx can retry the webhook;
+the Integration Request and downstream payment side effects are committed
+together by Frappe's request transaction instead of a mid-callback manual
+commit.
 The callback also binds the verifying key to the Integration Request itself:
 `get_payment_url()` stores the originating Payrexx Settings name in the
 Integration Request data (`payrexx_settings`), and a webhook verified with a
@@ -123,6 +138,17 @@ of showing a success page prematurely. Payment creators can pass per-checkout
 `failed_redirect_to` and `cancel_redirect_to` values to `get_payment_url()` when
 they need failed or cancelled Payrexx returns to land back in their own UI
 instead of the generic failed-payment page.
+
+## Chargebacks
+
+A signed Payrexx `chargeback` event changes the Integration Request to `Failed`
+and stores the provider transaction. The integration deliberately does not
+cancel or delete submitted Payment Entries or ledger records. It creates one
+idempotent, high-priority open ToDo assigned to the payment automation user and
+linked to the Integration Request for an accountant to review and post the
+appropriate reversal. Repeated chargeback callbacks reuse that exception, and a
+later duplicate confirmation cannot move the chargeback request back to
+`Completed`.
 
 ## Security Model
 

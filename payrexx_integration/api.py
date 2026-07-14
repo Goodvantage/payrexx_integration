@@ -143,7 +143,7 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 	# as the webhook path), never as a hardcoded Administrator.
 	with as_automation_user():
 		payment_request = _get_or_create_payment_request(sales_invoice, settings_name)
-		checkout_url = payment_request.get_payment_url()
+		checkout_url = _get_payment_request_checkout_url(payment_request)
 
 	frappe.local.response["type"] = "redirect"
 	frappe.local.response["location"] = checkout_url
@@ -184,6 +184,11 @@ def _resolve_default_settings() -> str:
 
 
 def _get_or_create_payment_request(sales_invoice, settings_name: str):
+	# Serialize first-click creation so concurrent email-link requests cannot
+	# create separate Payment Requests and Payrexx Gateways for one invoice.
+	frappe.db.get_value("Sales Invoice", sales_invoice.name, "name", for_update=True)
+	sales_invoice.reload()
+
 	gateway = "Payrexx-" + settings_name
 	existing = frappe.get_all(
 		"Payment Request",
@@ -215,6 +220,45 @@ def _get_or_create_payment_request(sales_invoice, settings_name: str):
 		return_doc=True,
 	)
 	return payment_request
+
+
+def _get_payment_request_checkout_url(payment_request) -> str:
+	"""Return the one checkout created by Payment Request submission."""
+	frappe.db.get_value("Payment Request", payment_request.name, "name", for_update=True)
+	payment_request.reload()
+	if payment_request.payment_url:
+		return payment_request.payment_url
+
+	active_requests = frappe.get_all(
+		"Integration Request",
+		filters={
+			"reference_doctype": "Payment Request",
+			"reference_docname": payment_request.name,
+			"integration_request_service": "Payrexx",
+			"status": ["in", ("Queued", "Authorized")],
+		},
+		fields=["name", "data"],
+		order_by="creation desc",
+		limit=1,
+	)
+	if active_requests:
+		checkout_url = (frappe.parse_json(active_requests[0].data) or {}).get("payrexx_checkout_url")
+		if not checkout_url:
+			frappe.throw(
+				_(
+					"The existing Payrexx checkout has no stored URL. No duplicate checkout was created; "
+					"please review Integration Request {0}."
+				).format(active_requests[0].name)
+			)
+	else:
+		# Legacy/manual Payment Requests can be submitted without a checkout.
+		# Generate it once while holding the Payment Request lock.
+		checkout_url = payment_request.get_payment_url()
+
+	if not checkout_url:
+		frappe.throw(_("Could not generate Payrexx payment URL"))
+	payment_request.db_set("payment_url", checkout_url, update_modified=False)
+	return checkout_url
 
 
 def _gateway_account_filter(sales_invoice, gateway: str) -> dict:

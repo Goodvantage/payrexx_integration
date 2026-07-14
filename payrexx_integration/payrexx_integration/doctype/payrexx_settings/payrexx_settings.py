@@ -18,6 +18,7 @@ from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 from payrexx_integration.url_utils import get_public_url, safe_return_url
 
 PAYMENT_AUTHORIZED_MAX_ATTEMPTS = 3
+CHARGEBACK_TODO_MARKER = "[Payrexx chargeback]"
 
 
 class PayrexxSettings(Document):
@@ -57,6 +58,7 @@ class PayrexxSettings(Document):
 			data = frappe.parse_json(integration_request.data) or {}
 			data["payrexx_gateway_id"] = gateway.get("id")
 			data["payrexx_gateway_hash"] = gateway.get("hash")
+			data["payrexx_checkout_url"] = gateway.get("link")
 			# Authoritative record of which settings row created this request —
 			# the webhook only accepts callbacks verified with this row's key.
 			data["payrexx_settings"] = self.name
@@ -255,20 +257,25 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 			)
 			return {"ok": True}
 
-		ir_data["payrexx_transaction"] = txn
-		ir.data = frappe.as_json(ir_data)
-
 		if status == "confirmed":
-			_complete_integration_request(ir, txn)
+			_complete_integration_request(ir.name, txn)
 		elif status in ("authorized", "reserved"):
+			ir_data["payrexx_transaction"] = txn
+			ir.data = frappe.as_json(ir_data)
 			ir.status = "Authorized"
 			ir.save(ignore_permissions=True)
-		elif status in ("cancelled", "declined", "error", "expired", "chargeback"):
+		elif status == "chargeback":
+			_mark_chargeback(ir.name, txn)
+		elif status in ("cancelled", "declined", "error", "expired"):
+			ir_data["payrexx_transaction"] = txn
+			ir.data = frappe.as_json(ir_data)
 			ir.status = "Failed"
 			ir.error = f"Payrexx status: {status}"
 			ir.save(ignore_permissions=True)
 		else:
 			# 'waiting' and anything we don't recognise — keep listening.
+			ir_data["payrexx_transaction"] = txn
+			ir.data = frappe.as_json(ir_data)
 			ir.save(ignore_permissions=True)
 
 		return {"ok": True}
@@ -358,9 +365,11 @@ def reconcile_integration_request(
 	transaction = _confirmed_transaction_from_gateway(gateway)
 
 	if status == "confirmed" or (transaction and (transaction.get("status") or "").lower() == "confirmed"):
-		_complete_integration_request(ir, transaction or gateway)
+		_complete_integration_request(ir.name, transaction or gateway)
 		return True
-	if status in ("cancelled", "declined", "error", "expired", "chargeback"):
+	if status == "chargeback":
+		_mark_chargeback(ir.name, transaction or gateway)
+	elif status in ("cancelled", "declined", "error", "expired"):
 		ir.status = "Failed"
 		ir.error = f"Payrexx status: {status}"
 		ir.save(ignore_permissions=True)
@@ -382,23 +391,11 @@ def _confirmed_transaction_from_gateway(gateway: dict) -> dict:
 	return {}
 
 
-def _complete_integration_request(integration_request, transaction: dict | None = None) -> None:
-	was_completed = integration_request.status == "Completed"
-	ir_data = frappe.parse_json(integration_request.data) or {}
-	if transaction:
-		ir_data["payrexx_transaction"] = transaction
-	integration_request.data = frappe.as_json(ir_data)
-	integration_request.status = "Completed"
-	integration_request.save(ignore_permissions=True)
-	if not was_completed:
-		_run_payment_authorized_with_retries(integration_request.name, "Completed")
-
-
-def _run_payment_authorized_with_retries(integration_request_name: str, status: str) -> None:
+def _complete_integration_request(integration_request_name: str, transaction: dict | None = None) -> None:
+	"""Atomically record confirmation and settle its reference, retrying the whole unit."""
 	for attempt in range(1, PAYMENT_AUTHORIZED_MAX_ATTEMPTS + 1):
 		try:
-			integration_request = frappe.get_doc("Integration Request", integration_request_name)
-			_on_payment_authorized(integration_request, status)
+			_complete_locked_integration_request(integration_request_name, transaction)
 			return
 		except frappe.QueryDeadlockError:
 			frappe.db.rollback()
@@ -407,20 +404,94 @@ def _run_payment_authorized_with_retries(integration_request_name: str, status: 
 			time.sleep(0.25 * attempt)
 
 
+def _complete_locked_integration_request(
+	integration_request_name: str, transaction: dict | None = None
+) -> None:
+	frappe.db.get_value("Integration Request", integration_request_name, "name", for_update=True)
+	integration_request = frappe.get_doc("Integration Request", integration_request_name)
+	ir_data = frappe.parse_json(integration_request.data) or {}
+	previous_transaction = ir_data.get("payrexx_transaction") or {}
+	if (previous_transaction.get("status") or "").lower() == "chargeback":
+		return
+	if integration_request.status == "Completed":
+		return
+
+	if transaction:
+		ir_data["payrexx_transaction"] = transaction
+	integration_request.data = frappe.as_json(ir_data)
+	integration_request.status = "Completed"
+	integration_request.error = ""
+	integration_request.save(ignore_permissions=True)
+	_on_payment_authorized(integration_request, "Completed")
+
+
 def _on_payment_authorized(integration_request, status):
 	if not (integration_request.reference_doctype and integration_request.reference_docname):
 		return
 	try:
 		with _payment_authorization_user():
-			frappe.get_doc(
-				integration_request.reference_doctype,
-				integration_request.reference_docname,
-			).run_method("on_payment_authorized", status)
+			if integration_request.reference_doctype == "Payment Request":
+				_set_payment_request_as_paid(integration_request.reference_docname)
+			else:
+				frappe.get_doc(
+					integration_request.reference_doctype,
+					integration_request.reference_docname,
+				).run_method("on_payment_authorized", status)
 	except frappe.QueryDeadlockError:
 		raise
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "Payrexx on_payment_authorized")
 		raise
+
+
+def _set_payment_request_as_paid(payment_request_name: str) -> None:
+	frappe.db.get_value("Payment Request", payment_request_name, "name", for_update=True)
+	payment_request = frappe.get_doc("Payment Request", payment_request_name)
+	if payment_request.status == "Paid" or flt(payment_request.outstanding_amount) <= 0:
+		return
+	payment_request.set_as_paid()
+
+
+def _mark_chargeback(integration_request_name: str, transaction: dict | None = None) -> None:
+	frappe.db.get_value("Integration Request", integration_request_name, "name", for_update=True)
+	integration_request = frappe.get_doc("Integration Request", integration_request_name)
+	ir_data = frappe.parse_json(integration_request.data) or {}
+	if transaction:
+		ir_data["payrexx_transaction"] = transaction
+	integration_request.db_set(
+		{
+			"data": frappe.as_json(ir_data),
+			"status": "Failed",
+			"error": "Payrexx status: chargeback",
+		}
+	)
+
+	with _payment_authorization_user():
+		if frappe.db.exists(
+			"ToDo",
+			{
+				"reference_type": "Integration Request",
+				"reference_name": integration_request.name,
+				"description": ["like", f"{CHARGEBACK_TODO_MARKER}%"],
+			},
+		):
+			return
+		frappe.get_doc(
+			{
+				"doctype": "ToDo",
+				"status": "Open",
+				"priority": "High",
+				"allocated_to": frappe.session.user,
+				"assigned_by": frappe.session.user,
+				"reference_type": "Integration Request",
+				"reference_name": integration_request.name,
+				"description": f"{CHARGEBACK_TODO_MARKER} "
+				+ _(
+					"Manual accounting reversal required. Review the linked settlement; "
+					"submitted ledger records were preserved."
+				),
+			}
+		).insert(ignore_permissions=True)
 
 
 def _payment_authorization_user():
