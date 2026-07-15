@@ -118,6 +118,48 @@ def _create_submitted_test_sales_invoice():
 	return sales_invoice
 
 
+def _ensure_test_payment_gateway_account(payment_gateway: str, sales_invoice) -> str:
+	payment_account = frappe.db.get_value(
+		"Account",
+		{
+			"company": sales_invoice.company,
+			"account_type": ["in", ["Bank", "Cash"]],
+			"is_group": 0,
+			"disabled": 0,
+		},
+		"name",
+	)
+	if not payment_account:
+		raise AssertionError(f"No payment account available for {sales_invoice.company}")
+
+	gateway_account = frappe.db.get_value(
+		"Payment Gateway Account",
+		{
+			"payment_gateway": payment_gateway,
+			"currency": sales_invoice.currency,
+			"company": sales_invoice.company,
+		},
+		"name",
+	)
+	if gateway_account:
+		return gateway_account
+
+	return (
+		frappe.get_doc(
+			{
+				"doctype": "Payment Gateway Account",
+				"is_default": 1,
+				"payment_gateway": payment_gateway,
+				"payment_account": payment_account,
+				"currency": sales_invoice.currency,
+				"company": sales_invoice.company,
+			}
+		)
+		.insert(ignore_permissions=True)
+		.name
+	)
+
+
 class TestPayrexxSettings(IntegrationTestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -538,6 +580,69 @@ class TestPayrexxSettings(IntegrationTestCase):
 		with self.assertRaises(frappe.DoesNotExistError):
 			pay_invoice(si=fake_name, token=_sign(fake_name))
 
+	def test_first_pay_invoice_click_creates_exactly_one_provider_checkout_and_request(self):
+		from payrexx_integration.api import pay_invoice
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		sales_invoice = _create_submitted_test_sales_invoice()
+		payment_gateway = "Payrexx-" + self.settings_name
+		_ensure_test_payment_gateway_account(payment_gateway, sales_invoice)
+		payment_request_filters = {
+			"reference_doctype": "Sales Invoice",
+			"reference_name": sales_invoice.name,
+			"payment_gateway": payment_gateway,
+		}
+		self.assertEqual(frappe.get_all("Payment Request", filters=payment_request_filters), [])
+
+		checkout_url = "https://pay.example/first-click-checkout"
+		client = Mock()
+		client.create_gateway.return_value = {
+			"id": 424242,
+			"hash": "first-click-hash",
+			"link": checkout_url,
+		}
+		original_response = getattr(frappe.local, "response", None)
+		try:
+			frappe.local.response = {}
+			with patch.object(ps_module.PayrexxSettings, "_client", return_value=client):
+				pay_invoice(
+					si=sales_invoice.name,
+					token=_sign(sales_invoice.name, self.settings_name),
+					gateway_name=self.settings_name,
+				)
+			response = dict(frappe.local.response)
+		finally:
+			frappe.local.response = original_response or {}
+
+		client.create_gateway.assert_called_once()
+		payment_request_names = frappe.get_all(
+			"Payment Request",
+			filters=payment_request_filters,
+			pluck="name",
+		)
+		self.assertEqual(len(payment_request_names), 1)
+		payment_request = frappe.get_doc("Payment Request", payment_request_names[0])
+		self.assertEqual(payment_request.docstatus, 1)
+		self.assertEqual(payment_request.payment_url, checkout_url)
+
+		integration_requests = frappe.get_all(
+			"Integration Request",
+			filters={
+				"reference_doctype": "Payment Request",
+				"reference_docname": payment_request.name,
+				"integration_request_service": "Payrexx",
+			},
+			fields=["name", "data"],
+		)
+		self.assertEqual(len(integration_requests), 1)
+		request_data = frappe.parse_json(integration_requests[0].data) or {}
+		self.assertEqual(request_data["payrexx_gateway_id"], 424242)
+		self.assertEqual(request_data["payrexx_checkout_url"], checkout_url)
+		self.assertEqual(response["type"], "redirect")
+		self.assertEqual(response["location"], checkout_url)
+
 	def test_payment_request_checkout_reuses_url_created_on_submission(self):
 		payment_request = Mock()
 		payment_request.name = "PAY-REQ-TEST"
@@ -918,6 +1023,99 @@ class TestPayrexxSettings(IntegrationTestCase):
 		ir.reload()
 		self.assertEqual(ir.status, "Completed")
 		self.assertEqual((frappe.parse_json(ir.data) or {})["payrexx_transaction"], transaction)
+
+	def test_deadlock_retry_completes_request_and_creates_exactly_one_payment_entry(self):
+		from erpnext.accounts.doctype.payment_request.payment_request import (
+			PaymentRequest,
+			make_payment_request,
+		)
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		payment_gateway = "_Test Gateway"
+		if not frappe.db.exists("Payment Gateway", payment_gateway):
+			frappe.get_doc({"doctype": "Payment Gateway", "gateway": payment_gateway}).insert(
+				ignore_permissions=True
+			)
+		sales_invoice = _create_submitted_test_sales_invoice()
+		gateway_account = _ensure_test_payment_gateway_account(payment_gateway, sales_invoice)
+		with patch.object(PaymentRequest, "get_payment_url", return_value="https://pay.example/checkout"):
+			payment_request = make_payment_request(
+				dt="Sales Invoice",
+				dn=sales_invoice.name,
+				recipient_id="payrexx-test@example.com",
+				mute_email=1,
+				payment_gateway_account=gateway_account,
+				submit_doc=1,
+				return_doc=1,
+			)
+
+		integration_request = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Queued",
+				"reference_doctype": "Payment Request",
+				"reference_docname": payment_request.name,
+				"data": "{}",
+			}
+		).insert(ignore_permissions=True)
+		confirmed = {"id": 54321, "status": "confirmed"}
+		savepoint = "payrexx_deadlock_retry"
+		frappe.db.savepoint(savepoint)
+		real_rollback = frappe.db.rollback
+		real_set_as_paid = PaymentRequest.set_as_paid
+		settlement_attempts = []
+		rollback_statuses = []
+
+		def settle_then_deadlock(request):
+			payment_entry = real_set_as_paid(request)
+			settlement_attempts.append(payment_entry.name)
+			if len(settlement_attempts) == 1:
+				raise frappe.QueryDeadlockError((1213, "Deadlock found when trying to get lock"))
+			return payment_entry
+
+		def rollback_to_savepoint():
+			rollback_statuses.append(
+				frappe.db.get_value("Integration Request", integration_request.name, "status")
+			)
+			real_rollback(save_point=savepoint)
+			rollback_statuses.append(
+				frappe.db.get_value("Integration Request", integration_request.name, "status")
+			)
+
+		with (
+			patch.object(PaymentRequest, "set_as_paid", autospec=True, side_effect=settle_then_deadlock),
+			patch.object(ps_module.frappe.db, "rollback", side_effect=rollback_to_savepoint) as rollback,
+			patch.object(ps_module.time, "sleep") as sleep,
+		):
+			ps_module._complete_integration_request(integration_request.name, confirmed)
+
+		self.assertEqual(len(settlement_attempts), 2)
+		self.assertEqual(rollback_statuses, ["Completed", "Queued"])
+		rollback.assert_called_once_with()
+		sleep.assert_called_once_with(0.25)
+		integration_request.reload()
+		payment_request.reload()
+		sales_invoice.reload()
+		payment_entries = set(
+			frappe.get_all(
+				"Payment Entry Reference",
+				filters={"payment_request": payment_request.name, "docstatus": 1},
+				pluck="parent",
+			)
+		)
+		self.assertEqual(integration_request.status, "Completed")
+		self.assertEqual(
+			(frappe.parse_json(integration_request.data) or {})["payrexx_transaction"], confirmed
+		)
+		self.assertEqual(payment_request.status, "Paid")
+		self.assertEqual(payment_request.outstanding_amount, 0)
+		self.assertEqual(sales_invoice.outstanding_amount, 0)
+		self.assertEqual(len(payment_entries), 1)
+		self.assertEqual(frappe.db.get_value("Payment Entry", payment_entries.pop(), "docstatus"), 1)
 
 	def test_non_payment_request_keeps_authorization_hook(self):
 		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
