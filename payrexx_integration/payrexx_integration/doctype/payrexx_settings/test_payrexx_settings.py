@@ -17,9 +17,11 @@ from requests.models import Response
 from payrexx_integration.api import (
 	_get_payment_request_checkout_url,
 	_sign,
+	_verify,
 	payment_success,
 	payrexx_pay_url,
 )
+from payrexx_integration.gateway_selection import resolve_payrexx_settings
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import PayrexxClient
 from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
@@ -270,6 +272,161 @@ class TestPayrexxSettings(IntegrationTestCase):
 		params = parse_qs(urlparse(url).query)
 		self.assertEqual(params.get("gateway_name"), [other_settings])
 		self.assertEqual(params.get("token"), [_sign("ACC-SINV-2026-00001", other_settings)])
+
+	def test_gateway_resolver_explicit_choice_precedes_caller_site_config(self):
+		settings = frappe._dict(name="Explicit")
+		with (
+			patch(
+				"payrexx_integration.gateway_selection.frappe.conf",
+				{"my_app_payrexx_gateway": "Configured"},
+			),
+			patch("payrexx_integration.gateway_selection.frappe.db.exists", return_value=True) as exists,
+			patch("payrexx_integration.gateway_selection.frappe.get_cached_doc", return_value=settings),
+			patch("payrexx_integration.gateway_selection.frappe.get_all") as get_all,
+		):
+			resolved = resolve_payrexx_settings(" Explicit ", site_config_key="my_app_payrexx_gateway")
+
+		self.assertIs(resolved, settings)
+		exists.assert_called_once_with("Payrexx Settings", "Explicit")
+		get_all.assert_not_called()
+
+	def test_gateway_resolver_uses_caller_site_config(self):
+		settings = frappe._dict(name="Configured")
+		with (
+			patch(
+				"payrexx_integration.gateway_selection.frappe.conf",
+				{"my_app_payrexx_gateway": "Configured"},
+			),
+			patch("payrexx_integration.gateway_selection.frappe.db.exists", return_value=True) as exists,
+			patch("payrexx_integration.gateway_selection.frappe.get_cached_doc", return_value=settings),
+			patch("payrexx_integration.gateway_selection.frappe.get_all") as get_all,
+		):
+			resolved = resolve_payrexx_settings(site_config_key="my_app_payrexx_gateway")
+
+		self.assertIs(resolved, settings)
+		exists.assert_called_once_with("Payrexx Settings", "Configured")
+		get_all.assert_not_called()
+
+	def test_gateway_resolver_rejects_missing_explicit_choice_without_using_config(self):
+		with (
+			patch(
+				"payrexx_integration.gateway_selection.frappe.conf",
+				{"my_app_payrexx_gateway": "Configured"},
+			),
+			patch("payrexx_integration.gateway_selection.frappe.db.exists", return_value=False),
+			patch("payrexx_integration.gateway_selection.frappe.get_all") as get_all,
+			self.assertRaises(frappe.ValidationError) as exc,
+		):
+			resolve_payrexx_settings("Missing", site_config_key="my_app_payrexx_gateway")
+
+		self.assertNotIn("site config", str(exc.exception))
+		get_all.assert_not_called()
+
+	def test_gateway_resolver_rejects_missing_configured_gateway_without_fallback(self):
+		with (
+			patch(
+				"payrexx_integration.gateway_selection.frappe.conf",
+				{"my_app_payrexx_gateway": "Missing"},
+			),
+			patch("payrexx_integration.gateway_selection.frappe.db.exists", return_value=False),
+			patch("payrexx_integration.gateway_selection.frappe.get_all") as get_all,
+			self.assertRaises(frappe.ValidationError) as exc,
+		):
+			resolve_payrexx_settings(site_config_key="my_app_payrexx_gateway")
+
+		self.assertIn("my_app_payrexx_gateway", str(exc.exception))
+		get_all.assert_not_called()
+
+	def test_gateway_resolver_rejects_missing_settings(self):
+		with (
+			patch("payrexx_integration.gateway_selection.frappe.get_all", return_value=[]),
+			self.assertRaises(frappe.ValidationError) as exc,
+		):
+			resolve_payrexx_settings()
+
+		self.assertIn("No Payrexx Settings", str(exc.exception))
+
+	def test_gateway_resolver_rejects_ambiguous_fallback(self):
+		with (
+			patch(
+				"payrexx_integration.gateway_selection.frappe.get_all",
+				return_value=["Live", "Sandbox"],
+			),
+			self.assertRaises(frappe.ValidationError) as exc,
+		):
+			resolve_payrexx_settings()
+
+		self.assertIn("Multiple Payrexx gateways", str(exc.exception))
+
+	def test_legacy_gateway_unbound_link_is_valid_but_requires_unambiguous_resolution(self):
+		invoice_name = "ACC-SINV-LEGACY-00001"
+		legacy_token = _sign(invoice_name)
+		self.assertTrue(_verify(invoice_name, legacy_token))
+		self.assertFalse(_verify(invoice_name, legacy_token, self.settings_name))
+
+		settings = frappe._dict(name="Live")
+		with (
+			patch("payrexx_integration.gateway_selection.frappe.get_all", return_value=["Live"]),
+			patch("payrexx_integration.gateway_selection.frappe.get_cached_doc", return_value=settings),
+		):
+			self.assertIs(resolve_payrexx_settings(), settings)
+
+		with (
+			patch(
+				"payrexx_integration.gateway_selection.frappe.get_all",
+				return_value=["Live", "Sandbox"],
+			),
+			self.assertRaises(frappe.ValidationError),
+		):
+			resolve_payrexx_settings()
+
+	def test_legacy_gateway_unbound_link_rejects_ambiguity_before_paid_redirect(self):
+		from payrexx_integration.api import pay_invoice
+
+		invoice_name = "ACC-SINV-LEGACY-PAID-00001"
+		invoice = frappe._dict(name=invoice_name, docstatus=1, outstanding_amount=0)
+		with (
+			patch("payrexx_integration.api.frappe.db.exists", return_value=True),
+			patch("payrexx_integration.api.frappe.get_doc", return_value=invoice),
+			patch(
+				"payrexx_integration.api.resolve_payrexx_settings",
+				side_effect=frappe.ValidationError("Multiple Payrexx gateways are configured."),
+			) as resolve_settings,
+			self.assertRaises(frappe.ValidationError),
+		):
+			pay_invoice(si=invoice_name, token=_sign(invoice_name))
+
+		resolve_settings.assert_called_once_with(None)
+
+	def test_legacy_gateway_unbound_link_accepts_single_gateway(self):
+		from payrexx_integration.api import pay_invoice
+
+		invoice_name = "ACC-SINV-LEGACY-PAID-00002"
+		invoice = frappe._dict(name=invoice_name, docstatus=1, outstanding_amount=0)
+		settings = frappe._dict(name="OnlyGateway")
+		original_response = getattr(frappe.local, "response", None)
+		try:
+			frappe.local.response = {}
+			with (
+				patch("payrexx_integration.api.frappe.db.exists", return_value=True),
+				patch("payrexx_integration.api.frappe.get_doc", return_value=invoice),
+				patch("payrexx_integration.gateway_selection.frappe.get_all", return_value=[settings.name]),
+				patch(
+					"payrexx_integration.gateway_selection.frappe.get_cached_doc",
+					return_value=settings,
+				),
+				patch(
+					"payrexx_integration.api.get_public_url",
+					return_value="https://example.test/payment-success",
+				),
+			):
+				pay_invoice(si=invoice_name, token=_sign(invoice_name))
+			response = dict(frappe.local.response)
+		finally:
+			frappe.local.response = original_response or {}
+
+		self.assertEqual(response["type"], "redirect")
+		self.assertEqual(response["location"], "https://example.test/payment-success")
 
 	def test_pay_url_blank_invoice_returns_blank(self):
 		self.assertEqual(payrexx_pay_url(None), "")

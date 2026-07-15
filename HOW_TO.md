@@ -49,15 +49,27 @@ Invoice emails can call the Jinja helper:
 {{ payrexx_pay_url(doc.name) }}
 ```
 
+This form requires exactly one Payrexx Settings row. If the site has multiple
+rows, choose the gateway explicitly so it is included in the signed link:
+
+```jinja
+{{ payrexx_pay_url(doc.name, "Live") }}
+```
+
 The helper returns a signed GET URL:
 
 ```text
-GET /api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&token=<hmac>
+GET /api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&gateway_name=<Payrexx Settings name>&token=<hmac>
 ```
 
 When clicked, the endpoint verifies the token, lazy-creates and submits a Payment
 Request through ERPNext, and redirects to the checkout URL created during that
 submission. Repeated clicks reuse the same Payment Request and Payrexx checkout.
+Links generated before gateway binding was introduced did not include
+`gateway_name`. They continue to work when exactly one settings row exists, but
+are rejected as ambiguous when multiple rows exist; resend the invoice email to
+issue a gateway-bound link.
+
 If an older active Integration Request has no recoverable checkout URL, the app
 shows an error instead of creating a second potentially chargeable checkout;
 review that Integration Request in Desk.

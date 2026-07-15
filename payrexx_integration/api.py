@@ -21,6 +21,7 @@ from urllib.parse import urlencode
 import frappe
 from frappe import _
 
+from payrexx_integration.gateway_selection import resolve_payrexx_settings
 from payrexx_integration.session_utils import as_automation_user
 from payrexx_integration.url_utils import get_public_url
 from payrexx_integration.url_utils import safe_return_url as _safe_return_url
@@ -92,7 +93,7 @@ def payrexx_pay_url(sales_invoice: str | None, gateway_name: str | None = None) 
 		if frappe.db.get_value("Sales Invoice", sales_invoice, "docstatus") != 1:
 			return ""
 	try:
-		settings_name = gateway_name or _resolve_default_settings()
+		settings_name = resolve_payrexx_settings(gateway_name).name
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "Payrexx pay URL unavailable")
 		return ""
@@ -125,6 +126,10 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 		frappe.throw(_("This invoice has been cancelled"))
 	if sales_invoice.docstatus != 1:
 		frappe.throw(_("This invoice is not submitted"))
+
+	# Resolve before the paid-invoice shortcut so legacy gateway-unbound links
+	# retain the same strict ambiguity contract on every successful path.
+	settings_name = resolve_payrexx_settings(gateway_name).name
 	if sales_invoice.outstanding_amount is not None and sales_invoice.outstanding_amount <= 0:
 		# Already paid — send the customer to the success page instead of
 		# creating a duplicate Payrexx gateway.
@@ -133,8 +138,6 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 			"/payment-success?doctype=Sales Invoice&docname=" + si
 		)
 		return
-
-	settings_name = gateway_name or _resolve_default_settings()
 
 	# Re-use an existing Payment Request for this invoice if one is still
 	# pending, otherwise create a fresh one. This keeps the Payment Request
@@ -171,16 +174,6 @@ def payment_success(ir: str | None = None, gateway_name: str | None = None) -> N
 
 
 # ------------------------------------------------------------------- internals
-
-
-def _resolve_default_settings() -> str:
-	rows = frappe.get_all("Payrexx Settings", pluck="name", order_by="creation asc")
-	if not rows:
-		frappe.throw(_("No Payrexx Settings configured"))
-	for preferred in ("Live", "Sandbox"):
-		if preferred in rows:
-			return preferred
-	return rows[0]
 
 
 def _get_or_create_payment_request(sales_invoice, settings_name: str):

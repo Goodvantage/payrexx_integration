@@ -46,7 +46,7 @@ npm run report
 |---|---|---|
 | `payrexx_settings.spec.ts` | Creates a `Payrexx Settings` row in the desk and verifies the matching `Payment Gateway` row appears. Also exercises the `payrexx_pay_url` jinja helper through the REST API. | Nothing extra. |
 | `pay_invoice_redirect.spec.ts` | Hits `/api/method/payrexx_integration.api.pay_invoice` with bad/missing tokens and unknown invoices. Verifies the 403/404 paths. | Nothing extra. |
-| `booking_email.spec.ts` | Calls `Good Event Booking.create_sales_invoice`, then asserts the Email Queue contains a row whose body has the Payrexx `pay?si=…&token=…` URL. | `TEST_BOOKING_NAME` env var pointing at a seeded `Good Event Booking` with a customer + contact email. |
+| `booking_email.spec.ts` | Calls `Good Event Booking.create_sales_invoice`, then asserts the Email Queue contains a gateway-bound Payrexx `pay_invoice?si=…&gateway_name=…&token=…` URL. | `TEST_BOOKING_NAME` env var pointing at a seeded `Good Event Booking` with a customer + contact email. |
 
 ## What's *not* covered (yet)
 

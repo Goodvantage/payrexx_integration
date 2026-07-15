@@ -64,6 +64,7 @@ apps/payrexx_integration/
 ├── README.md
 └── payrexx_integration/                    # Python package
     ├── hooks.py                            # required_apps = ["payments"]
+    ├── gateway_selection.py                # strict shared settings resolver
     ├── modules.txt                         # Payrexx Integration
     └── payrexx_integration/                # Frappe module folder
         ├── doctype/
@@ -81,6 +82,12 @@ The DocType is **not single** — you can have multiple `Payrexx Settings` rows
 (e.g. `Live` and `Sandbox`), each producing its own `Payment Gateway`
 (`Payrexx-Live`, `Payrexx-Sandbox`). The webhook URL takes a `?gateway_name=…`
 query param to disambiguate which signing key to verify against.
+
+Code that needs a settings controller should use
+`payrexx_integration.gateway_selection.resolve_payrexx_settings()`. It resolves
+an explicit gateway, an optional caller-owned site-config key, or the only row.
+It raises on zero or multiple fallback candidates and never guesses based on
+row order or names such as `Live` and `Sandbox`.
 
 ### `Payrexx Settings` fields
 

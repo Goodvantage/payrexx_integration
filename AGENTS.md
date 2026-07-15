@@ -38,11 +38,12 @@ Innermost package dir: `payrexx_integration/payrexx_integration/payrexx_integrat
 
 | File | Purpose |
 |---|---|
+| `gateway_selection.py` | Canonical strict resolver shared by native flows and downstream apps. Supports explicit selection, a caller-owned site-config key, and unambiguous single-row fallback. |
 | `payrexx_integration/payrexx_integration/doctype/payrexx_settings/` | The settings DocType. One row per environment (`Sandbox` / `Live`). `on_update` auto-creates the matching `Payment Gateway` row (`Payrexx-<gateway_name>`). |
 | `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client. **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The legacy `ApiSignature` body field is no longer used. Supports Payrexx Platform domains through `Payrexx Settings.api_base_domain`. |
 | `payrexx_integration/payrexx_integration/payrexx/webhook_validator.py` | HMAC-SHA256 verification of `X-Webhook-Signature`. Tries base64 first, falls back to hex. The signing key is **separate** from the API secret (configured per webhook in the Payrexx dashboard). |
-| `api.py::payrexx_pay_url(sales_invoice)` | Jinja helper (registered via `hooks.py.jinja`). Returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
-| `api.py::pay_invoice(si, token)` | Whitelisted redirect endpoint. Verifies the HMAC token, looks up the Sales Invoice, lazy-creates a Payment Request via ERPNext's `make_payment_request`, and 302s to the Payrexx hosted checkout. **Both args are optional kwargs** so missing-param requests return clean 403, not 500. |
+| `api.py::payrexx_pay_url(sales_invoice, gateway_name=None)` | Jinja helper (registered via `hooks.py.jinja`). Resolves the gateway and returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
+| `api.py::pay_invoice(si=None, token=None, gateway_name=None)` | Whitelisted redirect endpoint. Verifies the invoice-and-gateway-bound HMAC token, looks up the Sales Invoice, lazy-creates a Payment Request via ERPNext's `make_payment_request`, and 302s to the Payrexx hosted checkout. **All args remain optional kwargs** so missing-param requests return clean 403, not 500. |
 | `dev_e2e.py::run_event_to_invoice_email(email)` | Bench-execute helper that creates an event → ticket → booking → invoice → triggers the email queue. Used from the conversation runbook for one-shot smoke tests against the live sandbox. |
 | `playwright/` | Self-contained Playwright project (npm). Covers Payrexx Settings desk flow, pay_invoice endpoint auth, and optional Good Event Booking → email queue flows. |
 
@@ -55,12 +56,14 @@ Innermost package dir: `payrexx_integration/payrexx_integration/payrexx_integrat
 ```
 {{ host_name }}/api/method/payrexx_integration.api.pay_invoice
   ?si=<Sales Invoice name>
-  &token=<32 hex chars — first half of HMAC-SHA256(encryption_key, si_name)>
+  &gateway_name=<Payrexx Settings name>
+  &token=<32 hex chars — first half of HMAC-SHA256(encryption_key, si_name|gateway_name)>
 ```
 
-The token is deterministic per SI so resends produce the same URL — clicks
-from old and new emails both work. To invalidate, rotate the site's
-`encryption_key` (rare).
+The token is deterministic per SI and gateway, so resends with the same gateway
+produce the same URL. Legacy links omit `gateway_name` and sign only `si_name`;
+they remain valid only while gateway resolution is unambiguous. To invalidate
+all links, rotate the site's `encryption_key` (rare).
 
 ### Webhook URL (configured in Payrexx dashboard)
 
@@ -172,6 +175,10 @@ name (use it for `TEST_BOOKING_NAME` afterwards).
 - **Settings row is single per environment** but the doctype is NOT a
   Single — multiple rows are supported (e.g. `Sandbox` + `Live`). Webhooks
   must include `?gateway_name=...` once you have more than one row.
+- **Gateway fallback is strict.** `resolve_payrexx_settings()` never prefers a
+  row by name or creation order. Gateway-unbound legacy payment links work only
+  when one settings row exists; resend them after selecting a gateway when the
+  site has multiple rows.
 - **No URL hard-coding** — externally shared URLs go through
   `payrexx_integration.url_utils.get_public_url()`, which respects
   `host_name` without leaking the local bench port. The Playwright config is

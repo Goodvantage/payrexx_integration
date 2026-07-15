@@ -11,6 +11,7 @@ from frappe.model.document import Document
 from frappe.utils import call_hook_method, cint, cstr, flt
 from payments.utils import create_payment_gateway
 
+from payrexx_integration.gateway_selection import resolve_payrexx_settings
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import PayrexxClient, get_http_status
 from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
@@ -286,14 +287,7 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 		raise
 
 
-def _resolve_settings(gateway_name: str | None) -> "PayrexxSettings":
-	if gateway_name:
-		return frappe.get_cached_doc("Payrexx Settings", gateway_name)
-
-	rows = frappe.get_all("Payrexx Settings", pluck="name", limit=2)
-	if len(rows) == 1:
-		return frappe.get_cached_doc("Payrexx Settings", rows[0])
-	frappe.throw(_("Multiple Payrexx Settings exist — webhook URL must include ?gateway_name=..."))
+_resolve_settings = resolve_payrexx_settings
 
 
 def _gateway_name_from_request(gateway_name: str | None) -> str | None:

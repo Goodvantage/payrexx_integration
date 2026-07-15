@@ -39,6 +39,7 @@ on Payrexx's default API domain.
 | Module | Purpose |
 |---|---|
 | `api.py` | Signed pay-by-email URL generation and `pay_invoice` redirect endpoint. |
+| `gateway_selection.py` | Generic, strict Payrexx Settings resolver for this app and downstream consumers. |
 | `payrexx/payrexx_client.py` | Thin Payrexx REST client. |
 | `payrexx/webhook_validator.py` | HMAC webhook signature validation. |
 | `doctype/payrexx_settings/payrexx_settings.py` | Settings controller, gateway creation, callback endpoint. |
@@ -50,7 +51,7 @@ on Payrexx's default API domain.
 Pay-by-email endpoint:
 
 ```text
-GET /api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&token=<hmac>
+GET /api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&gateway_name=<Payrexx Settings name>&token=<hmac>
 ```
 
 Pay-by-email links are generated only for submitted Sales Invoices. Draft
@@ -61,6 +62,16 @@ instead of requesting a second checkout. If a legacy Payment Request has no URL,
 the app recovers the URL recorded in its active Integration Request. An active
 request with no recoverable URL raises a clean error rather than creating a
 potential duplicate checkout.
+
+Gateway selection is centralized in
+`payrexx_integration.gateway_selection.resolve_payrexx_settings()`. Resolution
+uses an explicit `gateway_name`, then an optional caller-owned `site_config_key`,
+then the only configured Payrexx Settings row. Zero or multiple rows fail
+clearly; names such as `Live` and `Sandbox` are never silently preferred.
+Current pay-by-email links include the resolved gateway in both the URL and its
+HMAC. Legacy links without `gateway_name` keep their original token contract and
+work when exactly one settings row exists, but intentionally fail when several
+rows make the old link ambiguous.
 
 Externally shared URLs are built from `host_name` exactly as configured. This
 avoids leaking a local bench `webserver_port` such as `:8000`, or a temporary
@@ -160,7 +171,14 @@ later duplicate confirmation cannot move the chargeback request back to
 
 ## Cross-App Integration
 
-`good_event` imports `payrexx_pay_url` for invoice and combined-bundle emails. Missing Payrexx configuration should degrade gracefully: invoice emails still send without the online-pay button.
+`good_event` imports `payrexx_pay_url` for invoice and combined-bundle emails.
+Missing or ambiguous Payrexx configuration should degrade gracefully: invoice
+emails still send without the online-pay button.
+
+Downstream apps can import `resolve_payrexx_settings` without creating a reverse
+dependency. A caller that owns a site setting can pass its key, for example
+`resolve_payrexx_settings(site_config_key="my_app_payrexx_gateway")`. This app
+does not import the downstream app or interpret its site-config keys.
 
 ## Testing
 
