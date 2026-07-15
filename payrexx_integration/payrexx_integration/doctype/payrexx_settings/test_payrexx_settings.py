@@ -52,6 +52,72 @@ def _ensure_settings(name: str = GATEWAY_NAME) -> str:
 	return doc.name
 
 
+def _test_company() -> str:
+	company = frappe.db.get_single_value("Global Defaults", "default_company")
+	return company or frappe.db.get_value("Company", {}, "name")
+
+
+def _ensure_test_customer() -> str:
+	customer_name = "Payrexx Integration Test Customer"
+	existing = frappe.db.get_value("Customer", {"customer_name": customer_name}, "name")
+	if existing:
+		return existing
+	return (
+		frappe.get_doc(
+			{
+				"doctype": "Customer",
+				"customer_name": customer_name,
+				"customer_type": "Company",
+			}
+		)
+		.insert(ignore_permissions=True)
+		.name
+	)
+
+
+def _ensure_test_item() -> str:
+	item_code = "PAYREXX-INTEGRATION-TEST"
+	if frappe.db.exists("Item", item_code):
+		return item_code
+	item_group = frappe.db.get_value("Item Group", {"is_group": 0}, "name")
+	return (
+		frappe.get_doc(
+			{
+				"doctype": "Item",
+				"item_code": item_code,
+				"item_name": "Payrexx Integration Test",
+				"item_group": item_group,
+				"stock_uom": "Nos",
+				"is_stock_item": 0,
+				"is_sales_item": 1,
+			}
+		)
+		.insert(ignore_permissions=True)
+		.name
+	)
+
+
+def _create_submitted_test_sales_invoice():
+	company = _test_company()
+	company_currency = frappe.db.get_value("Company", company, "default_currency")
+	sales_invoice = frappe.new_doc("Sales Invoice")
+	sales_invoice.company = company
+	sales_invoice.customer = _ensure_test_customer()
+	sales_invoice.currency = company_currency
+	sales_invoice.conversion_rate = 1
+	sales_invoice.append(
+		"items",
+		{
+			"item_code": _ensure_test_item(),
+			"qty": 1,
+			"rate": 100,
+		},
+	)
+	sales_invoice.insert(ignore_permissions=True)
+	sales_invoice.submit()
+	return sales_invoice
+
+
 class TestPayrexxSettings(IntegrationTestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -876,7 +942,6 @@ class TestPayrexxSettings(IntegrationTestCase):
 			PaymentRequest,
 			make_payment_request,
 		)
-		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
 
 		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
 			payrexx_settings as ps_module,
@@ -886,29 +951,50 @@ class TestPayrexxSettings(IntegrationTestCase):
 			frappe.get_doc({"doctype": "Payment Gateway", "gateway": "_Test Gateway"}).insert(
 				ignore_permissions=True
 			)
-		if not frappe.db.exists(
+		sales_invoice = _create_submitted_test_sales_invoice()
+		payment_account = frappe.db.get_value(
+			"Account",
+			{
+				"company": sales_invoice.company,
+				"account_type": ["in", ["Bank", "Cash"]],
+				"is_group": 0,
+				"disabled": 0,
+			},
+			"name",
+		)
+		self.assertTrue(payment_account)
+		gateway_account = frappe.db.get_value(
 			"Payment Gateway Account",
-			{"payment_gateway": "_Test Gateway", "currency": "INR", "company": "_Test Company"},
-		):
-			frappe.get_doc(
-				{
-					"doctype": "Payment Gateway Account",
-					"is_default": 1,
-					"payment_gateway": "_Test Gateway",
-					"payment_account": "_Test Bank - _TC",
-					"currency": "INR",
-					"company": "_Test Company",
-				}
-			).insert(ignore_permissions=True)
+			{
+				"payment_gateway": "_Test Gateway",
+				"currency": sales_invoice.currency,
+				"company": sales_invoice.company,
+			},
+			"name",
+		)
+		if not gateway_account:
+			gateway_account = (
+				frappe.get_doc(
+					{
+						"doctype": "Payment Gateway Account",
+						"is_default": 1,
+						"payment_gateway": "_Test Gateway",
+						"payment_account": payment_account,
+						"currency": sales_invoice.currency,
+						"company": sales_invoice.company,
+					}
+				)
+				.insert(ignore_permissions=True)
+				.name
+			)
 
-		sales_invoice = create_sales_invoice()
 		with patch.object(PaymentRequest, "get_payment_url", return_value="https://pay.example/checkout"):
 			payment_request = make_payment_request(
 				dt="Sales Invoice",
 				dn=sales_invoice.name,
 				recipient_id="payrexx-test@example.com",
 				mute_email=1,
-				payment_gateway_account="_Test Gateway - INR - _TC",
+				payment_gateway_account=gateway_account,
 				submit_doc=1,
 				return_doc=1,
 			)
