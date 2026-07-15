@@ -876,29 +876,30 @@ class TestPayrexxSettings(IntegrationTestCase):
 			PaymentRequest,
 			make_payment_request,
 		)
-		from erpnext.accounts.doctype.payment_request.test_payment_request import (
-			payment_gateways,
-			payment_method,
-		)
 		from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_sales_invoice
 
 		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
 			payrexx_settings as ps_module,
 		)
 
-		for payment_gateway in payment_gateways:
-			if not frappe.db.exists("Payment Gateway", payment_gateway["gateway"]):
-				frappe.get_doc(payment_gateway).insert(ignore_permissions=True)
-		for gateway_account in payment_method:
-			if not frappe.db.exists(
-				"Payment Gateway Account",
+		if not frappe.db.exists("Payment Gateway", "_Test Gateway"):
+			frappe.get_doc({"doctype": "Payment Gateway", "gateway": "_Test Gateway"}).insert(
+				ignore_permissions=True
+			)
+		if not frappe.db.exists(
+			"Payment Gateway Account",
+			{"payment_gateway": "_Test Gateway", "currency": "INR", "company": "_Test Company"},
+		):
+			frappe.get_doc(
 				{
-					"payment_gateway": gateway_account["payment_gateway"],
-					"currency": gateway_account["currency"],
-					"company": gateway_account["company"],
-				},
-			):
-				frappe.get_doc(gateway_account).insert(ignore_permissions=True)
+					"doctype": "Payment Gateway Account",
+					"is_default": 1,
+					"payment_gateway": "_Test Gateway",
+					"payment_account": "_Test Bank - _TC",
+					"currency": "INR",
+					"company": "_Test Company",
+				}
+			).insert(ignore_permissions=True)
 
 		sales_invoice = create_sales_invoice()
 		with patch.object(PaymentRequest, "get_payment_url", return_value="https://pay.example/checkout"):
