@@ -2,17 +2,14 @@ import { test, expect } from "@playwright/test";
 import { callMethod, getDoc } from "./helpers/frappe";
 
 /**
- * End-to-end: trigger ``create_sales_invoice`` on a pre-seeded Good Event Booking,
+ * End-to-end: trigger ``create_sales_invoice`` on an existing Good Event Booking,
  * then verify that the Email Queue has a row containing the Payrexx pay-by-
  * email URL.
  *
  * Skipped unless TEST_BOOKING_NAME is set in the environment, because the
  * booking has to exist (with attendees, customer, and a contact email) for
- * the assertions to hold. To bootstrap one for testing:
- *
- *   bench --site <site> console
- *   >>> from good_event.tests.fixtures import seed_pay_later_booking
- *   >>> seed_pay_later_booking()
+ * the assertions to hold. Create it through Good Event's own operator or
+ * test-fixture workflow; this integration does not seed cross-app event data.
  */
 
 const BOOKING = process.env.TEST_BOOKING_NAME;

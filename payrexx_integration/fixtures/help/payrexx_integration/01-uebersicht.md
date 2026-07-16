@@ -7,7 +7,7 @@ level: Beginner
 
 # Payrexx Integration
 
-Payrexx Integration verbindet ERPNext-Rechnungen mit dem Payrexx Hosted Checkout. Die App stellt pro Umgebung einen **Payrexx Settings** Datensatz bereit und erzeugt daraus den passenden Payment Gateway.
+Payrexx Integration verbindet ERPNext-Rechnungen mit dem Payrexx Hosted Checkout. Die App stellt pro Umgebung einen **Payrexx Settings** Datensatz bereit und erzeugt daraus den passenden Payment Gateway. Für die Buchhaltung muss danach zusätzlich ein **Payment Gateway Account** pro Firma/Währung eingerichtet werden.
 
 ![Payrexx Settings Liste im Desk](/assets/payrexx_integration/images/help/01-payrexx-settings-list.png)
 
@@ -20,11 +20,12 @@ Payrexx Integration verbindet ERPNext-Rechnungen mit dem Payrexx Hosted Checkout
 
 ## Grundprinzip
 
-1. Eine Rechnung wird erstellt.
-2. Das E-Mail enthält einen sicheren Zahlungslink.
-3. Beim Klick öffnet sich der Payrexx Checkout.
-4. Nach erfolgreicher Zahlung meldet Payrexx den Status zurück.
-5. ERPNext aktualisiert die Zahlungsinformationen.
+1. Payrexx Settings, Webhook und Payment Gateway Account werden eingerichtet.
+2. Eine Rechnung wird erstellt.
+3. Das E-Mail enthält einen sicheren Zahlungslink.
+4. Beim ersten Klick erstellt ERPNext den Payment Request und öffnet den Payrexx Checkout.
+5. Nach erfolgreicher Zahlung meldet Payrexx den Status zurück.
+6. ERPNext erstellt genau einen Payment Entry und aktualisiert Rechnung und Payment Request.
 
 ## Häufige Fragen
 

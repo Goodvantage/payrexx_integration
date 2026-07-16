@@ -44,8 +44,7 @@ Innermost package dir: `payrexx_integration/payrexx_integration/payrexx_integrat
 | `payrexx_integration/payrexx_integration/payrexx/webhook_validator.py` | HMAC-SHA256 verification of `X-Webhook-Signature`. Tries base64 first, falls back to hex. The signing key is **separate** from the API secret (configured per webhook in the Payrexx dashboard). |
 | `api.py::payrexx_pay_url(sales_invoice, gateway_name=None)` | Jinja helper (registered via `hooks.py.jinja`). Resolves the gateway and returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
 | `api.py::pay_invoice(si=None, token=None, gateway_name=None)` | Whitelisted redirect endpoint. Verifies the invoice-and-gateway-bound HMAC token, looks up the Sales Invoice, lazy-creates a Payment Request via ERPNext's `make_payment_request`, and 302s to the Payrexx hosted checkout. **All args remain optional kwargs** so missing-param requests return clean 403, not 500. |
-| `dev_e2e.py::run_event_to_invoice_email(email)` | Bench-execute helper that creates an event → ticket → booking → invoice → triggers the email queue. Used from the conversation runbook for one-shot smoke tests against the live sandbox. |
-| `playwright/` | Self-contained Playwright project (npm). Covers Payrexx Settings desk flow, pay_invoice endpoint auth, and optional Good Event Booking → email queue flows. |
+| `playwright/` | Self-contained Playwright project (npm). Covers the Payrexx Settings desk flow, `pay_invoice` endpoint auth, and an optional existing Good Event Booking → invoice email flow. Test data remains owned by Good Event; this app must not seed Buzz/Event records. |
 
 ---
 
@@ -134,10 +133,17 @@ when only the checkout/login surface uses a custom domain.
 | Payrexx `transaction.status` | `Integration Request.status` | Side effect |
 |---|---|---|
 | `confirmed` | `Completed` | Runs `on_payment_authorized` on the reference doc |
-| `authorized` | `Authorized` | Tokenisation — charge later via `/Transaction/{id}/` |
-| `reserved` | `Authorized` | Pre-auth hold — capture later |
+| `authorized` | `Authorized` | Records provider state only; this app does not implement later charging |
+| `reserved` | `Authorized` | Records provider state only; this app does not implement capture |
 | `waiting` | unchanged | In-progress; wait for next webhook |
-| `cancelled` / `declined` / `error` / `expired` / `chargeback` | `Failed` | Records error string |
+| `cancelled` / `declined` / `error` / `expired` | `Failed` | Records error string; no provider-side cancellation is initiated |
+| `chargeback` | `Failed` | Preserves submitted ledger rows and creates one accounting-review ToDo |
+| `refunded` or another unknown status | unchanged | Stores the transaction only; refund reconciliation is not implemented |
+
+The integration creates hosted Gateways and reads Gateway/Transaction state. It
+does not expose capture, later-charge, void/cancel, or refund operations. Those
+provider actions and their ERPNext accounting reversals are manual operational
+workflows until an explicit, tested contract is implemented.
 
 ---
 
@@ -148,16 +154,15 @@ when only the checkout/login surface uses a custom domain.
 bench --site <site> run-tests --app payrexx_integration \
   --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings
 
-# Playwright e2e (covers both this app + good_event correspondence flows)
+# Playwright e2e (core specs plus an optional existing-booking email check)
 cd playwright
 npm install && npx playwright install chromium
 TEST_BOOKING_NAME=<booking> npx playwright test
 ```
 
-`dev_e2e.run_event_to_invoice_email("benediktmathis@gmail.com")` is the
-canonical end-to-end smoke test — creates an event, books it, generates
-the SI, queues the invoice email. Returns a summary dict with the booking
-name (use it for `TEST_BOOKING_NAME` afterwards).
+`TEST_BOOKING_NAME` must identify an existing eligible Good Event Booking
+created through Good Event's own fixtures or operator workflow. Payrexx
+Integration does not create cross-app event test data.
 
 ---
 
@@ -188,11 +193,10 @@ name (use it for `TEST_BOOKING_NAME` afterwards).
 
 ## Cross-app integration
 
-- `good_event` imports `from payrexx_integration.api import payrexx_pay_url`
-  in `services/booking_confirmation.py` and `services/workflow.py`
-  (`combined_bundle` flow). Both wrap the import in try/except so missing
-  Payrexx config gracefully degrades — invoice email still ships, just
-  without the online-pay button.
+- Good Event's default invoice renderer imports
+  `payrexx_integration.api.payrexx_pay_url`. Missing or ambiguous Payrexx
+  configuration degrades gracefully: the invoice email still sends without
+  the online-pay button.
 
 ---
 

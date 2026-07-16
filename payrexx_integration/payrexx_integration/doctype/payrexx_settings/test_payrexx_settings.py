@@ -580,6 +580,20 @@ class TestPayrexxSettings(IntegrationTestCase):
 		with self.assertRaises(frappe.DoesNotExistError):
 			pay_invoice(si=fake_name, token=_sign(fake_name))
 
+	def test_gateway_account_filter_is_company_and_currency_specific(self):
+		from payrexx_integration.api import _gateway_account_filter
+
+		sales_invoice = frappe._dict(company="Test Company", currency="EUR")
+		expected = {
+			"payment_gateway": "Payrexx-Live",
+			"company": "Test Company",
+			"currency": "EUR",
+		}
+		with patch("payrexx_integration.api.frappe.db.exists", return_value=True) as exists:
+			self.assertEqual(_gateway_account_filter(sales_invoice, "Payrexx-Live"), expected)
+
+		exists.assert_called_once_with("Payment Gateway Account", expected)
+
 	def test_first_pay_invoice_click_creates_exactly_one_provider_checkout_and_request(self):
 		from payrexx_integration.api import pay_invoice
 		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (

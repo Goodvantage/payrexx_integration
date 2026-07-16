@@ -13,21 +13,39 @@ Der **Payrexx Settings** Datensatz enthält die Zugangsdaten und das Verhalten f
 
 ## Felder
 
-- **Instance Name**: Payrexx Instanzname.
+- **Gateway Name**: eindeutiger Name wie `Sandbox` oder `Live`; ein separates Environment-Feld gibt es nicht.
+- **Instance Name**: erster Teil der Payrexx Instanz, zum Beispiel `customer`.
+- **API Base Domain**: `payrexx.com` oder die Plattform-Domain, zum Beispiel `pay.goodvantage.ch`.
+- **API Version**: normalerweise `v1.14`.
 - **API Secret**: Schlüssel aus Payrexx für die API.
-- **API Version**: verwendete Payrexx API-Version.
-- **Webhook Signing Key**: Schlüssel zur Prüfung eingehender Webhooks.
-- **Supported Currencies**: Währungen, die dieser Gateway akzeptiert.
-- **Gateway Validity**: Gültigkeit des Checkout-Links, falls begrenzt.
+- **Webhook Signing Key**: separater Schlüssel zur Prüfung eingehender Webhooks.
+- **Supported Currencies**: kommagetrennte Währungen, die dieser Gateway akzeptiert.
+- **PSP Whitelist**: optionale kommagetrennte Payrexx-PSP-IDs.
+- **Gateway Validity**: optionale Gültigkeit des Checkout-Links in Minuten.
+- **Redirect Overrides**: optionale globale Ziel-URLs für Erfolg, Fehler und Abbruch.
 
-Nach dem Speichern zeigt das Formular die Webhook URL an, die in Payrexx hinterlegt werden muss.
+Sobald **Gateway Name** ausgefüllt ist, zeigt bereits das ungespeicherte Formular die Webhook URL an. Diese URL zuerst in Payrexx anlegen, den dort erzeugten Signing Key in **Webhook Signing Key** eintragen und erst danach speichern. Beim Speichern werden die API-Zugangsdaten geprüft und der Payment Gateway `Payrexx-<Gateway Name>` erzeugt.
+
+## Payment Gateway Account
+
+Der erzeugte Payment Gateway allein reicht für Zahlungen nicht aus:
+
+1. **Payment Gateway Account** öffnen und einen neuen Datensatz erstellen.
+2. Den erzeugten Gateway, zum Beispiel `Payrexx-Live`, auswählen.
+3. Zahlungskonto und Firma festlegen. ERPNext übernimmt die **Währung** aus dem
+   Zahlungskonto; dessen Kontowährung muss zu den Rechnungen passen.
+4. **Is Default** aktivieren, wenn diese Kombination als Standard dienen soll.
+5. Für jede verwendete Firma/Währung einen eindeutigen Datensatz anlegen.
+
+Fehlt dieser Datensatz, kann der erste Klick auf einen gültigen Rechnungslink keinen Payment Request erstellen.
 
 ## Vor Live-Schaltung prüfen
 
 1. Sandbox-Zahlung erfolgreich testen.
 2. Webhook in Payrexx mit der angezeigten URL hinterlegen.
-3. Prüfen, ob die Zahlung in ERPNext ankommt.
-4. Danach erst Live-Zugangsdaten hinterlegen.
+3. Payment Gateway Account für Testfirma und Testwährung anlegen.
+4. Prüfen, ob Integration Request, Payment Request, Payment Entry und Rechnung korrekt aktualisiert werden.
+5. Danach erst Live-Zugangsdaten und Live-Payment-Gateway-Account hinterlegen.
 
 ## Häufige Fragen
 

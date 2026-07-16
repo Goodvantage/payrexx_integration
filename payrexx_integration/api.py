@@ -255,9 +255,17 @@ def _get_payment_request_checkout_url(payment_request) -> str:
 
 
 def _gateway_account_filter(sales_invoice, gateway: str) -> dict:
-	filters = {"payment_gateway": gateway, "company": sales_invoice.company}
+	filters = {
+		"payment_gateway": gateway,
+		"company": sales_invoice.company,
+		"currency": sales_invoice.currency,
+	}
 	if not frappe.db.exists("Payment Gateway Account", filters):
-		frappe.throw(_("No Payment Gateway Account configured for {0}").format(gateway))
+		frappe.throw(
+			_("No Payment Gateway Account configured for {0}, company {1}, and currency {2}").format(
+				gateway, sales_invoice.company, sales_invoice.currency
+			)
+		)
 	return filters
 
 

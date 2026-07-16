@@ -20,6 +20,9 @@ The app metadata exposes `/assets/payrexx_integration/images/payrexx-integration
 | DocType | Purpose |
 |---|---|
 | `Payrexx Settings` | Per-environment Payrexx credentials and gateway settings. |
+| `Payment Gateway` | Upstream registry row `Payrexx-<gateway_name>`, created by the settings controller. |
+| `Payment Gateway Account` | Upstream ERPNext company/currency/payment-account bridge. Operators must create it after the gateway; it is not seeded by this app. |
+| `Integration Request` | Upstream provider-request audit and state record. |
 
 Saving Payrexx Settings creates/updates the matching `Payment Gateway` row through the standard payments utility.
 Normal Payrexx accounts use `api_base_domain = "payrexx.com"`, producing API
@@ -43,8 +46,7 @@ on Payrexx's default API domain.
 | `payrexx/payrexx_client.py` | Thin Payrexx REST client. |
 | `payrexx/webhook_validator.py` | HMAC webhook signature validation. |
 | `doctype/payrexx_settings/payrexx_settings.py` | Settings controller, gateway creation, callback endpoint. |
-| `dev_e2e.py` | Local smoke helper for event-to-invoice-email flows. |
-| `playwright/` | Browser tests for Payrexx and cross-app invoice email flows. |
+| `playwright/` | Browser tests for Payrexx plus an opt-in invoice-email check against an existing Good Event Booking. |
 
 ## URL Contracts
 
@@ -72,6 +74,12 @@ Current pay-by-email links include the resolved gateway in both the URL and its
 HMAC. Legacy links without `gateway_name` keep their original token contract and
 work when exactly one settings row exists, but intentionally fail when several
 rows make the old link ambiguous.
+
+The generated `Payment Gateway` is not sufficient for ERPNext posting. Before a
+first invoice-link click can create its Payment Request, an operator must create
+a `Payment Gateway Account` for that gateway and invoice company, with the
+appropriate currency and Bank/Cash payment account. Deployments using several
+companies or currencies need an unambiguous row for each combination.
 
 Externally shared URLs are built from `host_name` exactly as configured. This
 avoids leaking a local bench `webserver_port` such as `:8000`, or a temporary
@@ -161,6 +169,20 @@ appropriate reversal. Repeated chargeback callbacks reuse that exception, and a
 later duplicate confirmation cannot move the chargeback request back to
 `Completed`.
 
+## Supported Payment Operations
+
+The client creates hosted Gateways and retrieves Gateway/Transaction state.
+Webhook and success-return reconciliation settle only `confirmed` payments.
+`authorized` and `reserved` callbacks record the Integration Request as
+`Authorized`, but this app has no later-charge or capture operation.
+`cancelled`, `declined`, `error`, and `expired` callbacks mark the request
+failed; they do not call Payrexx to cancel or void anything. `chargeback` has
+the accounting-exception workflow above. Refund initiation and ERPNext refund
+reconciliation are not implemented: a `refunded` or otherwise unknown webhook
+is stored while the Integration Request status remains unchanged. Provider-side
+refund/capture/cancellation and the corresponding accounting reversal therefore
+remain explicit manual procedures.
+
 ## Security Model
 
 - Pay-by-email URLs are signed with an HMAC derived from the site's `encryption_key`.
@@ -171,9 +193,9 @@ later duplicate confirmation cannot move the chargeback request back to
 
 ## Cross-App Integration
 
-`good_event` imports `payrexx_pay_url` for invoice and combined-bundle emails.
-Missing or ambiguous Payrexx configuration should degrade gracefully: invoice
-emails still send without the online-pay button.
+Good Event's default invoice renderer imports `payrexx_pay_url`. Missing or
+ambiguous Payrexx configuration degrades gracefully: invoice emails still send
+without the online-pay button.
 
 Downstream apps can import `resolve_payrexx_settings` without creating a reverse
 dependency. A caller that owns a site setting can pass its key, for example
@@ -193,8 +215,10 @@ cd frappe-bench/apps/payrexx_integration/playwright
 npx playwright test
 ```
 
-The Playwright project covers the current Payrexx Settings, pay-by-email, and
-Good Event correspondence flows.
+The Playwright project covers current Payrexx Settings and pay-by-email endpoint
+behavior. Its optional booking-email spec accepts an existing eligible Good
+Event Booking through `TEST_BOOKING_NAME`; this app does not create cross-app
+event fixtures.
 
 ## Related Docs
 

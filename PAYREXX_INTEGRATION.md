@@ -50,7 +50,8 @@ Payrexx → POST callback URL (webhook)
         │  • update status → Completed / Authorized / Failed
         │  • run reference_doc.on_payment_authorized("Completed")
         ▼
-Customer redirected to redirect_to when present, otherwise /payment-success?doctype=...&docname=...
+Customer returns through server-side reconciliation; confirmed payments then
+redirect to the same-site redirect_to when present, otherwise /payment-success
 ```
 
 ---
@@ -155,20 +156,32 @@ The row does not need to be saved yet, so you can create the webhook in Payrexx
 first and then paste the generated signing key into **Webhook Signing Key**.
 
 Save. Two things happen automatically:
-1. `validate()` pings `GET /Gateway/?limit=1` — if your credentials are wrong
+1. `validate()` pings `GET /Gateway/0/` — if your credentials are wrong
    the save is rejected.
 2. `on_update()` calls `create_payment_gateway("Payrexx-Live", …)` — a new
    `Payment Gateway` row appears in the desk.
 
-### 4.2 Configure the webhook in Payrexx
+### 4.2 Create a `Payment Gateway Account`
+
+The generated Payment Gateway is a registry row, not an accounting setup. In
+ERPNext create a `Payment Gateway Account` with:
+
+- **Payment Gateway**: `Payrexx-Live` (or the generated Sandbox name)
+- **Payment Account**: the Bank/Cash account that receives Payrexx settlements;
+  its account currency must match the invoices because ERPNext derives the
+  gateway account's **Currency** from this account
+- **Company**: matching the invoices that use this gateway
+- **Is Default**: enabled when this is the default for that combination
+
+Repeat for each company/currency combination. Without this row, a valid signed
+invoice link fails before Payment Request creation with `No Payment Gateway
+Account configured for Payrexx-<name>`.
+
+### 4.3 Configure the webhook in Payrexx
 
 In the Payrexx merchant dashboard go to **Settings → Webhooks → Add**:
 
-- **URL** (single-row case):
-  ```
-  https://<your-site>/api/method/payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings.callback
-  ```
-- **URL** (multi-row, must include the `gateway_name`):
+- **URL** (use the generated URL, including `gateway_name`):
   ```
   https://<your-site>/api/method/payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
   ```
@@ -180,7 +193,7 @@ In the Payrexx merchant dashboard go to **Settings → Webhooks → Add**:
 The webhook URL is also displayed in the dashboard of the settings form for
 convenience (see `payrexx_settings.js`).
 
-### 4.3 Use it
+### 4.4 Use it
 
 In a `Payment Request` (or any flow that takes a Payment Gateway), pick
 `Payrexx-Live`. On submit, the customer gets a Payrexx hosted checkout URL.
@@ -198,30 +211,26 @@ In a `Payment Request` (or any flow that takes a Payment Gateway), pick
 | **Response envelope** | `{"status":"success", "data":[ … ]}` |
 | **Amount unit** | Smallest currency unit (CHF 2.00 → `200`) |
 
-### Endpoints used by this app
+### Client endpoints
 
 | Verb | Path | Purpose |
 |---|---|---|
 | `POST` | `/Gateway/` | Create a hosted checkout. Returns `{id, link, hash, status}`. |
 | `GET` | `/Gateway/{id}/` | Look up a gateway and its `invoices[].transactions[]`. |
-| `GET` | `/Transaction/{id}/` | Look up a single transaction (used for reconciliation). |
+| `GET` | `/Transaction/{id}/` | Read-only client helper; current settlement reconciles from Gateway/webhook data and does not call this method. |
 
-### Key `POST /Gateway/` parameters
+### `POST /Gateway/` parameters emitted by this app
 
 | Param | Required | Notes |
 |---|---|---|
 | `amount` | yes | Smallest currency unit |
 | `currency` | yes | ISO 4217 |
-| `referenceId` | recommended | We use the Integration Request name → echoed in webhook |
+| `referenceId` | yes | Integration Request name echoed in the webhook |
 | `purpose` | no | Shown on receipt |
-| `successRedirectUrl` / `failedRedirectUrl` / `cancelRedirectUrl` | no | URL-encode if they contain query params |
+| `successRedirectUrl` / `failedRedirectUrl` / `cancelRedirectUrl` | yes | Resolved defaults or configured/per-request overrides |
 | `psp[0]`, `psp[1]`, … | no | Restrict to specific PSP IDs |
-| `pm[0]`, `pm[1]`, … | no | Restrict to specific payment methods (`visa`, `twint`, …) |
 | `fields[email][value]` | no | Customer prefill |
 | `validity` | no | Gateway TTL in minutes |
-| `preAuthorization` | no | `1` → tokenisation flow (charge later) |
-| `reservation` | no | `1` → pre-auth flow (capture later) |
-| `subscriptionState` | no | `1` → recurring; pair with `subscriptionInterval` etc. |
 
 ### Webhook payload (JSON content type)
 
@@ -249,10 +258,16 @@ In a `Payment Request` (or any flow that takes a Payment Gateway), pick
 | Payrexx `transaction.status` | Integration Request status | Notes |
 |---|---|---|
 | `confirmed` | `Completed` | Runs `on_payment_authorized` on the reference doc |
-| `authorized` | `Authorized` | Tokenised — charge later via `/Transaction/{id}/` |
-| `reserved` | `Authorized` | Pre-auth hold — capture later |
+| `authorized` | `Authorized` | State is recorded; later charging is not implemented |
+| `reserved` | `Authorized` | State is recorded; capture is not implemented |
 | `waiting` | unchanged | In-progress; expect another webhook |
-| `cancelled`, `declined`, `error`, `expired`, `chargeback` | `Failed` | Records error string |
+| `cancelled`, `declined`, `error`, `expired` | `Failed` | Records error string; does not initiate provider cancellation |
+| `chargeback` | `Failed` | Preserves submitted ledger rows and creates one accounting-review ToDo |
+| `refunded` or unknown | unchanged | Stores transaction data; refund reconciliation is not implemented |
+
+The integration does not initiate capture, later-charge, void/cancel, or refund
+operations. Perform those provider actions in Payrexx and post the approved
+ERPNext accounting reversal manually.
 
 ### Webhook signature
 
@@ -271,6 +286,8 @@ strict.
       the DocType list.
 - [ ] Saving a settings row creates a `Payment Gateway` named
       `Payrexx-{gateway_name}` (visible in the desk).
+- [ ] A `Payment Gateway Account` exists for the generated gateway, test
+      company, currency, and receiving account.
 - [ ] In `bench console`:
       ```python
       frappe.get_doc("Payrexx Settings", "Live").get_payment_url(

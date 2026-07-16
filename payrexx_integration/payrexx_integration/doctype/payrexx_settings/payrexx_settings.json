@@ -115,7 +115,7 @@
    "label": "Redirect Overrides"
   },
   {
-   "description": "Optional override. By default the customer is sent back to '/payment-success?doctype=...&docname=...' on success.",
+   "description": "Optional override. By default the customer returns through server-side Payrexx reconciliation and is then sent to the payment success page.",
    "fieldname": "success_redirect_url",
    "fieldtype": "Data",
    "label": "Success Redirect URL"

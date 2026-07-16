@@ -5,8 +5,10 @@ Payrexx Integration adds Payrexx hosted checkout support as a standalone app on 
 ## 1. Create Payrexx Settings
 
 1. Open **Payrexx Settings**.
-2. Set `gateway_name`, environment, instance name, API base domain, API secret, and webhook signing key.
-3. Save.
+2. Set **Gateway Name**, **Instance Name**, **API Base Domain**, **API Version**, and **API Secret**. There is no separate Environment field; use distinct Gateway Names such as `Sandbox` and `Live`.
+3. Review **Supported Currencies**, the optional **PSP Whitelist**, **Gateway Validity**, and redirect overrides.
+4. As soon as **Gateway Name** is filled, copy the callback URL shown on the unsaved form and create that webhook in Payrexx.
+5. Paste Payrexx's per-webhook key into the required **Webhook Signing Key** field, then save.
 
 The form shows one callback URL as soon as `gateway_name` is filled, even before
 the row can be saved. The URL uses the site's configured public `host_name` when
@@ -15,7 +17,7 @@ or saving the form replaces that hint in place instead of appending duplicate
 lines. Use that URL to create the Payrexx webhook, then paste the generated
 signing key back into **Webhook Signing Key**.
 
-On save, the controller verifies credentials unless running in tests/install and creates the corresponding `Payment Gateway` row.
+On save, the controller verifies credentials unless running in tests/install and creates the corresponding `Payment Gateway` row named `Payrexx-<Gateway Name>`. Saving does not create the ERPNext Payment Gateway Account required for invoice payments.
 
 For normal Payrexx accounts, keep `api_base_domain` as `payrexx.com`. For
 Payrexx Platform / partner accounts, split the login domain into instance and
@@ -31,7 +33,21 @@ automatically retries on `api.payrexx.com`. This is useful when the checkout
 uses a partner/custom domain but Payrexx still authenticates API calls on the
 default API host.
 
-## 2. Configure The Webhook In Payrexx
+## 2. Create The Payment Gateway Account
+
+Create the accounting bridge after saving Payrexx Settings:
+
+1. Open **Payment Gateway Account** and create a new row.
+2. Select the generated **Payment Gateway**, for example `Payrexx-Live`.
+3. Select the ERPNext **Payment Account** where Payrexx receipts are posted. Its
+   account currency must match the invoices; ERPNext derives the gateway
+   account's **Currency** from this account.
+4. Set the matching **Company**.
+5. Enable **Is Default** when this should be the default gateway account for that company/currency, then save.
+
+Create a separate Payment Gateway Account for every company/currency combination that will use Payrexx. A signed invoice link can be generated without this row, but the first click cannot create its Payment Request and returns `No Payment Gateway Account configured for Payrexx-<name>`.
+
+## 3. Configure The Webhook In Payrexx
 
 Copy the callback URL from the settings form or build it with this shape:
 
@@ -41,7 +57,7 @@ POST https://<site>/api/method/payrexx_integration.payrexx_integration.doctype.p
 
 Use the Payrexx dashboard's webhook signing key as the app's webhook signing key. This is separate from the API secret.
 
-## 3. Use Pay-By-Email Links
+## 4. Use Pay-By-Email Links
 
 Invoice emails can call the Jinja helper:
 
@@ -74,10 +90,10 @@ If an older active Integration Request has no recoverable checkout URL, the app
 shows an error instead of creating a second potentially chargeable checkout;
 review that Integration Request in Desk.
 
-## 4. Success Redirect Fallback
+## 5. Success Redirect Fallback
 
-Payrexx webhooks should still be configured, but every generated Gateway also
-uses a success redirect back into:
+Payrexx webhooks should still be configured. Unless an explicit success redirect
+override is set, every generated Gateway returns through:
 
 ```text
 GET https://<site>/api/method/payrexx_integration.api.payment_success?ir=<Integration Request>&gateway_name=<Payrexx Settings name>
@@ -92,7 +108,7 @@ Gateway is not confirmed, the customer is sent to `/payment-failed`. Apps that
 need a branded failed-payment state can pass `failed_redirect_to` and
 `cancel_redirect_to` to `get_payment_url()` for that individual checkout.
 
-## 5. Set The Production Host URL
+## 6. Set The Production Host URL
 
 The app uses the configured public `host_name` for externally shared URLs,
 including pay links, redirects, and the webhook URL shown in Desk. Set it in
@@ -109,7 +125,7 @@ webhook was configured with an offline tunnel URL. Update the webhook in the
 Payrexx dashboard to the current public `host_name` URL from **Payrexx
 Settings**.
 
-## 6. Troubleshoot A Failed Save
+## 7. Troubleshoot A Failed Save
 
 If saving Payrexx Settings fails:
 
@@ -121,7 +137,7 @@ If saving Payrexx Settings fails:
 
 The app pings `GET /Gateway/0/`; a Payrexx JSON response with `status: error` can still mean credentials are accepted if the error is "gateway not found".
 
-## 7. Troubleshoot A Payment Link
+## 8. Troubleshoot A Payment Link
 
 If a pay link returns 403:
 
@@ -129,6 +145,8 @@ If a pay link returns 403:
 2. Check that the token was generated for the same invoice name.
 3. Confirm the site's `encryption_key` was not rotated after the email was sent.
 4. Confirm URL parameters were not stripped by an email client.
+
+If the first valid click reports that no Payment Gateway Account is configured, create or correct the ERPNext row described in Section 2 for the generated gateway, invoice company, and invoice currency.
 
 If the link opens but payment does not update, check **Integration Request**
 rows, Payrexx webhook delivery logs, and whether Payrexx can reach the success
@@ -150,7 +168,14 @@ outstanding amount is zero, and exactly one submitted Payment Entry references
 it. ERPNext updates the linked Sales Invoice outstanding amount through the
 normal Payment Entry submission path.
 
-## 8. Handle A Chargeback
+## 9. Reconcile Payments And Handle Chargebacks
+
+For a confirmed invoice payment, verify this chain rather than relying only on the browser success page:
+
+1. The Payrexx `Integration Request` is **Completed** and stores the confirmed transaction.
+2. The linked ERPNext `Payment Request` is **Paid** with zero outstanding.
+3. Exactly one submitted `Payment Entry` references that Payment Request.
+4. The Sales Invoice outstanding amount reflects the submitted Payment Entry.
 
 When Payrexx reports a chargeback:
 
@@ -162,7 +187,11 @@ When Payrexx reports a chargeback:
 The callback preserves submitted ledger records and never cancels them
 automatically. Repeated chargeback callbacks do not create additional ToDos.
 
-## 9. Run Tests
+### Unsupported Provider Operations
+
+This app does not initiate captures of `reserved` transactions, later charges of `authorized` transactions, checkout cancellation/voids, or refunds. It also does not reconcile a `refunded` webhook into ERPNext accounting; an unknown/refunded status is stored on the Integration Request without completing or reversing it. Perform the provider action in Payrexx and post the approved ERPNext reversal manually. Do not infer a refund from a failed/chargeback Integration Request or cancel submitted Payment Entries automatically.
+
+## 10. Run Tests
 
 ```bash
 cd frappe-bench
@@ -178,5 +207,4 @@ npm install
 npx playwright test
 ```
 
-The Playwright specs cover the current Payrexx Settings, pay-by-email, and Good
-Event correspondence flows.
+The core Playwright specs cover Payrexx Settings and pay-by-email endpoint errors. The optional `booking_email.spec.ts` uses `TEST_BOOKING_NAME` for an existing eligible Good Event Booking; Payrexx Integration no longer seeds cross-app event records.

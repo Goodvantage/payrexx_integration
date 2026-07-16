@@ -17,9 +17,3 @@
 - Rule: `frappe-setuser`
 - What it prevents: Unsafe privilege switching that can leave requests running under the wrong user.
 - Why this override is safe: `as_automation_user` is the single privilege-switch context manager for both guest payment paths. `pay_invoice` only reaches it after HMAC verification of the signed email link; the webhook path only after `X-Webhook-Signature` verification. It resolves the configured least-privilege `Non Profit Settings.creation_user` (falling back to Administrator), and restores the original Frappe session in `finally`.
-
-## `frappe-manual-commit` in `payrexx_integration/dev_e2e.py`
-
-- Rule: `frappe-manual-commit`
-- What it prevents: Manual commits inside request handlers or DocType hooks that can leave partial writes and bypass Frappe's transaction lifecycle.
-- Why this override is safe: `dev_e2e.run_event_to_invoice_email` is a standalone smoke helper for `bench execute` or console use. The commit persists the generated booking/invoice/email test fixture so the follow-up browser tests can inspect it outside the helper's process.
