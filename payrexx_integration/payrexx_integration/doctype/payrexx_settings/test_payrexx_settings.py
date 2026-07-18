@@ -193,7 +193,11 @@ class TestPayrexxSettings(IntegrationTestCase):
 	# ----------------------------------------------------- HMAC pay-link token
 
 	def test_pay_url_token_round_trip(self):
-		url = payrexx_pay_url("ACC-SINV-2026-00001", gateway_name=self.settings_name)
+		with (
+			patch("payrexx_integration.api.frappe.db.exists", return_value=True),
+			patch("payrexx_integration.api.frappe.db.get_value", return_value=1),
+		):
+			url = payrexx_pay_url("ACC-SINV-2026-00001", gateway_name=self.settings_name)
 		params = parse_qs(urlparse(url).query)
 		self.assertEqual(params.get("si"), ["ACC-SINV-2026-00001"])
 		self.assertEqual(params.get("gateway_name"), [self.settings_name])
@@ -376,7 +380,11 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 	def test_pay_url_explicit_gateway_name(self):
 		other_settings = _ensure_settings("OtherGateway")
-		url = payrexx_pay_url("ACC-SINV-2026-00001", gateway_name=other_settings)
+		with (
+			patch("payrexx_integration.api.frappe.db.exists", return_value=True),
+			patch("payrexx_integration.api.frappe.db.get_value", return_value=1),
+		):
+			url = payrexx_pay_url("ACC-SINV-2026-00001", gateway_name=other_settings)
 		params = parse_qs(urlparse(url).query)
 		self.assertEqual(params.get("gateway_name"), [other_settings])
 		self.assertEqual(params.get("token"), [_sign("ACC-SINV-2026-00001", other_settings)])
@@ -540,6 +548,12 @@ class TestPayrexxSettings(IntegrationTestCase):
 		self.assertEqual(payrexx_pay_url(None), "")
 		self.assertEqual(payrexx_pay_url(""), "")
 
+	def test_pay_url_missing_invoice_returns_blank_without_resolving_gateway(self):
+		with patch("payrexx_integration.api.resolve_payrexx_settings") as resolve_settings:
+			self.assertEqual(payrexx_pay_url("ACC-SINV-DOES-NOT-EXIST"), "")
+
+		resolve_settings.assert_not_called()
+
 	# ----------------------------------------------------- webhook signature
 
 	def test_webhook_signature_base64(self):
@@ -593,6 +607,46 @@ class TestPayrexxSettings(IntegrationTestCase):
 			self.assertEqual(_gateway_account_filter(sales_invoice, "Payrexx-Live"), expected)
 
 		exists.assert_called_once_with("Payment Gateway Account", expected)
+
+	def test_pay_link_flow_preserves_conflicting_staff_draft_payment_request(self):
+		from payrexx_integration.api import _get_or_create_payment_request
+
+		sales_invoice = _create_submitted_test_sales_invoice()
+		staff_gateway = "Payrexx-Staff-Draft"
+		draft = frappe.get_doc(
+			{
+				"doctype": "Payment Request",
+				"payment_request_type": "Inward",
+				"reference_doctype": "Sales Invoice",
+				"reference_name": sales_invoice.name,
+				"payment_gateway": staff_gateway,
+				"currency": sales_invoice.currency,
+				"company": sales_invoice.company,
+				"grand_total": sales_invoice.outstanding_amount,
+				"party_type": "Customer",
+				"party": sales_invoice.customer,
+				"party_name": sales_invoice.customer_name,
+				"email_to": "staff@example.com",
+				"subject": "Staff-created payment request",
+				"message": "Preserve this draft",
+				"mute_email": 1,
+			}
+		).insert(ignore_permissions=True)
+
+		with (
+			patch(
+				"erpnext.accounts.doctype.payment_request.payment_request.make_payment_request"
+			) as make_payment_request,
+			self.assertRaises(frappe.ValidationError),
+		):
+			_get_or_create_payment_request(sales_invoice, self.settings_name)
+
+		make_payment_request.assert_not_called()
+		self.assertTrue(frappe.db.exists("Payment Request", draft.name))
+		draft.reload()
+		self.assertEqual(draft.docstatus, 0)
+		self.assertEqual(draft.payment_gateway, staff_gateway)
+		self.assertEqual(draft.message, "Preserve this draft")
 
 	def test_first_pay_invoice_click_creates_exactly_one_provider_checkout_and_request(self):
 		from payrexx_integration.api import pay_invoice

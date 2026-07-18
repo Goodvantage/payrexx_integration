@@ -65,6 +65,14 @@ the app recovers the URL recorded in its active Integration Request. An active
 request with no recoverable URL raises a clean error rather than creating a
 potential duplicate checkout.
 
+ERPNext `make_payment_request` re-uses any existing draft Payment Request for
+the same invoice without first applying the requested gateway. The pay-link
+flow therefore never deletes drafts. It reuses a pending request for the
+resolved gateway, but if another draft exists it preserves that draft, logs
+the conflict and fails closed with an instruction to contact the accounts
+team. A failed current endpoint attempt is rolled back with the request
+transaction rather than cleaned up by deleting persisted records.
+
 Gateway selection is centralized in
 `payrexx_integration.gateway_selection.resolve_payrexx_settings()`. Resolution
 uses an explicit `gateway_name`, then an optional caller-owned `site_config_key`,

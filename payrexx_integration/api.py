@@ -89,9 +89,10 @@ def payrexx_pay_url(sales_invoice: str | None, gateway_name: str | None = None) 
 	"""
 	if not sales_invoice:
 		return ""
-	if frappe.db.exists("Sales Invoice", sales_invoice):
-		if frappe.db.get_value("Sales Invoice", sales_invoice, "docstatus") != 1:
-			return ""
+	if not frappe.db.exists("Sales Invoice", sales_invoice):
+		return ""
+	if frappe.db.get_value("Sales Invoice", sales_invoice, "docstatus") != 1:
+		return ""
 	try:
 		settings_name = resolve_payrexx_settings(gateway_name).name
 	except Exception:
@@ -199,7 +200,30 @@ def _get_or_create_payment_request(sales_invoice, settings_name: str):
 	if existing:
 		return frappe.get_doc("Payment Request", existing[0])
 
-	_delete_wrong_draft_payment_requests(sales_invoice.name, gateway)
+	conflicting_draft = frappe.db.get_value(
+		"Payment Request",
+		{
+			"reference_doctype": "Sales Invoice",
+			"reference_name": sales_invoice.name,
+			"docstatus": 0,
+		},
+		["name", "payment_gateway"],
+		as_dict=True,
+		for_update=True,
+	)
+	if conflicting_draft:
+		# ERPNext reuses any draft for the reference document, regardless of the
+		# requested gateway. Never delete or submit a pre-existing draft.
+		frappe.logger("payrexx_integration").warning(
+			f"Pay-link creation preserved conflicting draft Payment Request {conflicting_draft.name} "
+			f"for Sales Invoice {sales_invoice.name} (gateway {conflicting_draft.payment_gateway or 'unset'})"
+		)
+		frappe.throw(
+			_(
+				"A draft Payment Request already exists for this invoice and was preserved. "
+				"Please ask the accounts team to review it before retrying online payment."
+			)
+		)
 
 	from erpnext.accounts.doctype.payment_request.payment_request import make_payment_request
 
@@ -267,21 +291,6 @@ def _gateway_account_filter(sales_invoice, gateway: str) -> dict:
 			)
 		)
 	return filters
-
-
-def _delete_wrong_draft_payment_requests(sales_invoice_name: str, gateway: str) -> None:
-	wrong_drafts = frappe.get_all(
-		"Payment Request",
-		filters={
-			"reference_doctype": "Sales Invoice",
-			"reference_name": sales_invoice_name,
-			"docstatus": 0,
-			"payment_gateway": ["!=", gateway],
-		},
-		pluck="name",
-	)
-	for payment_request_name in wrong_drafts:
-		frappe.delete_doc("Payment Request", payment_request_name, ignore_permissions=True, force=True)
 
 
 def _payment_success_redirect_url(integration_request) -> str:

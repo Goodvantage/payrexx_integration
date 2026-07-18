@@ -32,6 +32,13 @@ Innermost package dir: `payrexx_integration/payrexx_integration/payrexx_integrat
   security assumptions, setup/migration behavior, or test commands change.
 - Keep `README.md` short; use these docs for runbooks and technical reference.
 
+## Documentation Contract
+
+This repo keeps four synchronized artifacts: `REQUIREMENTS.md` (what the app
+must do), `DOCUMENTATION.md` (how it works), `HOW_TO.md` (operator
+procedures), and the code. Record new or changed requirements in
+`REQUIREMENTS.md` and keep all four in sync with every change.
+
 ---
 
 ## Architecture

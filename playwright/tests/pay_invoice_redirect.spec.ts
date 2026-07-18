@@ -3,10 +3,10 @@ import { test, expect } from "@playwright/test";
 /**
  * Tests for /api/method/payrexx_integration.api.pay_invoice.
  *
- * No real Payrexx call is made — these specs exercise the auth and 404
- * paths. The "happy path" (302 to https://<instance>.payrexx.com/...) needs
- * a sandbox Payrexx instance and is covered by `booking_email.spec.ts`
- * (which itself is gated on TEST_BOOKING_NAME).
+ * No real Payrexx call is made. These specs exercise missing/invalid-token
+ * rejection paths only. The "happy path" 302 to Payrexx needs a separately
+ * guarded sandbox scenario; `booking_email.spec.ts` verifies only that a
+ * signed URL is rendered into an email when TEST_BOOKING_NAME is configured.
  *
  * The full URL+token round trip is exercised in the Python integration
  * tests at apps/payrexx_integration/payrexx_integration/payrexx_integration/

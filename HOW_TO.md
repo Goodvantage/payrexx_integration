@@ -148,6 +148,11 @@ If a pay link returns 403:
 
 If the first valid click reports that no Payment Gateway Account is configured, create or correct the ERPNext row described in Section 2 for the generated gateway, invoice company, and invoice currency.
 
+If the link reports that a draft Payment Request already exists, open the
+invoice's draft Payment Request in Desk and either complete, cancel or delete it
+after review. The pay-link endpoint preserves all pre-existing drafts because
+ERPNext would otherwise reuse one even when it belongs to another gateway.
+
 If the link opens but payment does not update, check **Integration Request**
 rows, Payrexx webhook delivery logs, and whether Payrexx can reach the success
 redirect URL on the public `host_name`.
