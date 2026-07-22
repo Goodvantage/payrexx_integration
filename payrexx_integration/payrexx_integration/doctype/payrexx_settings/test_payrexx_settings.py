@@ -1384,12 +1384,15 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 		original_host_name = frappe.conf.get("host_name")
 		original_response = getattr(frappe.local, "response", None)
+		original_commit = getattr(frappe.local.flags, "commit", False)
 		try:
 			frappe.conf.host_name = "https://demo.example.test"
 			frappe.local.response = {}
+			frappe.local.flags.commit = False
 			with patch.object(ps_module, "reconcile_integration_request", return_value=True):
 				payment_success(ir=ir.name, gateway_name=GATEWAY_NAME)
 			response = dict(frappe.local.response)
+			commit_requested = frappe.local.flags.commit
 		finally:
 			if original_host_name is None:
 				frappe.conf.pop("host_name", None)
@@ -1399,9 +1402,11 @@ class TestPayrexxSettings(IntegrationTestCase):
 				frappe.local.response = {}
 			else:
 				frappe.local.response = original_response
+			frappe.local.flags.commit = original_commit
 
 		self.assertEqual(response["type"], "redirect")
 		self.assertEqual(response["location"], return_url)
+		self.assertTrue(commit_requested)
 
 	def test_payment_success_redirects_to_failed_page_when_not_confirmed(self):
 		ir = frappe.get_doc(
@@ -1419,12 +1424,15 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 		original_host_name = frappe.conf.get("host_name")
 		original_response = getattr(frappe.local, "response", None)
+		original_commit = getattr(frappe.local.flags, "commit", False)
 		try:
 			frappe.conf.host_name = "https://demo.example.test"
 			frappe.local.response = {}
+			frappe.local.flags.commit = False
 			with patch.object(ps_module, "reconcile_integration_request", return_value=False):
 				payment_success(ir=ir.name, gateway_name=GATEWAY_NAME)
 			response = dict(frappe.local.response)
+			commit_requested = frappe.local.flags.commit
 		finally:
 			if original_host_name is None:
 				frappe.conf.pop("host_name", None)
@@ -1434,9 +1442,11 @@ class TestPayrexxSettings(IntegrationTestCase):
 				frappe.local.response = {}
 			else:
 				frappe.local.response = original_response
+			frappe.local.flags.commit = original_commit
 
 		self.assertEqual(response["type"], "redirect")
 		self.assertEqual(
 			response["location"],
 			"https://demo.example.test/payment-failed?doctype=Donation&docname=NPO-DTN-PENDING",
 		)
+		self.assertFalse(commit_requested)

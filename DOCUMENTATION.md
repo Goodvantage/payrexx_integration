@@ -168,6 +168,11 @@ Payrexx success redirects reconcile the Integration Request by fetching the
 Gateway from Payrexx server-side. Webhooks remain the primary completion path,
 but the success return is a safe fallback because payment side effects only run
 after Payrexx reports the Gateway or one of its transactions as `confirmed`.
+The return endpoint is an HTTP GET, so it requests Frappe's end-of-request
+commit only after server verification reaches a Completed or Failed terminal
+state. Waiting/non-terminal provider results remain non-committing. Without this
+flag, the browser could receive `/payment-success` while the Integration Request,
+Payment Request, Payment Entry, and invoice settlement all rolled back.
 The credentials used for that confirmation come from the Integration Request's
 own stored gateway (`payrexx_settings`, falling back to `payment_gateway`); the
 caller-supplied `gateway_name` parameter is only honoured for legacy requests

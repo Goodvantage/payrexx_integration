@@ -102,7 +102,9 @@ This endpoint is a fallback reconciliation path. It retrieves the Payrexx
 Gateway server-side and only completes the Integration Request when Payrexx
 reports a confirmed Gateway/transaction, then redirects directly to the
 Integration Request's same-site `redirect_to` when present, otherwise to the
-standard `/payment-success` page.
+standard `/payment-success` page. Because the provider return is a GET, it sets
+the end-of-request commit flag only after server verification reaches a
+Completed or Failed terminal state; waiting results remain non-committing.
 
 ### Host URL — IMPORTANT for production
 

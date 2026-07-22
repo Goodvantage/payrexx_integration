@@ -103,6 +103,10 @@ GET https://<site>/api/method/payrexx_integration.api.payment_success?ir=<Integr
 
 That endpoint asks Payrexx for the Gateway status server-side and only marks the
 Integration Request complete when Payrexx reports a confirmed payment.
+Because this return is an HTTP GET, terminal server-verified reconciliation
+requests Frappe's end-of-request commit before redirecting; waiting results do
+not. A success page with unchanged accounting records indicates an outdated
+deployment that still rolled back the GET transaction.
 When a payment creator stored `redirect_to` in the Integration Request, the
 endpoint sends the customer directly back to that same-site URL after
 reconciliation instead of showing the generic `/payment-success` page. If the

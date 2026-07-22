@@ -169,6 +169,10 @@ def payment_success(ir: str | None = None, gateway_name: str | None = None) -> N
 
 	reconciled = payrexx_settings.reconcile_integration_request(ir, gateway_name=gateway_name)
 	integration_request = frappe.get_doc("Integration Request", ir)
+	if integration_request.status in {"Completed", "Failed"}:
+		# Provider returns use GET, so Frappe would otherwise roll back the
+		# server-verified settlement or terminal provider status after redirecting.
+		frappe.local.flags.commit = True
 	if not reconciled and integration_request.status != "Completed":
 		frappe.local.response["type"] = "redirect"
 		frappe.local.response["location"] = _payment_failed_redirect_url(integration_request)
