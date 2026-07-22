@@ -198,12 +198,74 @@ automatically. Repeated chargeback callbacks do not create additional ToDos.
 
 This app does not initiate captures of `reserved` transactions, later charges of `authorized` transactions, checkout cancellation/voids, or refunds. It also does not reconcile a `refunded` webhook into ERPNext accounting; an unknown/refunded status is stored on the Integration Request without completing or reversing it. Perform the provider action in Payrexx and post the approved ERPNext reversal manually. Do not infer a refund from a failed/chargeback Integration Request or cancel submitted Payment Entries automatically.
 
-## 10. Run Tests
+## 10. Run Hosted Sandbox Settlement Acceptance
+
+Use only a dedicated developer QA site and a small, fully unpaid sandbox
+invoice. The runner never enters card data or invokes settlement itself.
+
+Enable and bind the read-only evidence surface to one exact target:
+
+```bash
+bench --site <qa-site> set-config payrexx_hosted_qa_enabled 1
+bench --site <qa-site> set-config payrexx_hosted_qa_gateway <Payrexx-Settings-name>
+bench --site <qa-site> set-config payrexx_hosted_qa_invoice <Sales-Invoice-name>
+bench --site <qa-site> clear-cache
+```
+
+Load credentials from the protected secret source, then export these non-secret
+target controls. Never put credentials, signed payment URLs, or card data in
+arguments, state files, screenshots, traces, or reports:
+
+```bash
+export PAYREXX_HOSTED_QA_BASE_URL=https://<qa-host>
+export PAYREXX_HOSTED_QA_ALLOWED_HOSTS=<qa-host>
+export PAYREXX_HOSTED_QA_USER=<protected-system-and-accounts-manager>
+export PAYREXX_HOSTED_QA_PASSWORD=<protected-password>
+export PAYREXX_HOSTED_QA_RUN_ID=PRX-SBX-E2E-YYYYMMDD-<8-hex>
+
+cd frappe-bench
+env/bin/python -m payrexx_integration.tests.hosted_settlement_qa --mode preflight
+```
+
+The first preflight returns `ready_for_checkout` when no checkout exists. Open
+the invoice's normal signed payment link and stop after the Payrexx sandbox page
+loads. Run preflight again; it must return `awaiting_payment` with exactly one
+Payment Request and Integration Request. Complete the payment manually only
+after the provider page visibly identifies the transaction as TEST. Abort on an
+unexpected provider, CAPTCHA, 3-D Secure, live-mode label, or amount.
+
+After Payrexx returns and its callback or normal success reconciliation has run,
+use the persisted exact record names for read-only proof:
+
+```bash
+env/bin/python -m payrexx_integration.tests.hosted_settlement_qa --mode settlement
+```
+
+Acceptance requires the confirmed TEST transaction, Completed Integration
+Request carrying the exact settlement-created Payment Entry name, Paid Payment
+Request and Sales Invoice, zero outstanding balances, and one exact submitted
+Payment Entry. Do not call reconciliation merely to make the test pass; a
+pending result is evidence that the normal external path did not complete.
+
+Disable the gate immediately afterward:
+
+```bash
+bench --site <qa-site> set-config payrexx_hosted_qa_enabled 0
+bench --site <qa-site> clear-cache
+```
+
+Payrexx test transactions cannot be deleted. Keep their run marker and exact
+ERPNext records as acceptance evidence; never add destructive provider cleanup.
+
+## 11. Run Tests
 
 ```bash
 cd frappe-bench
 bench --site development16.localhost run-tests --app payrexx_integration \
   --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_hosted_qa
 ```
 
 Browser tests live in the Playwright project:

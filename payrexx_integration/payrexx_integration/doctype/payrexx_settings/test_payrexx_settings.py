@@ -1188,7 +1188,12 @@ class TestPayrexxSettings(IntegrationTestCase):
 		self.assertEqual(payment_request.outstanding_amount, 0)
 		self.assertEqual(sales_invoice.outstanding_amount, 0)
 		self.assertEqual(len(payment_entries), 1)
-		self.assertEqual(frappe.db.get_value("Payment Entry", payment_entries.pop(), "docstatus"), 1)
+		payment_entry_name = payment_entries.pop()
+		self.assertEqual(frappe.db.get_value("Payment Entry", payment_entry_name, "docstatus"), 1)
+		self.assertEqual(
+			(frappe.parse_json(integration_request.data) or {})["payrexx_payment_entry"],
+			payment_entry_name,
+		)
 
 	def test_non_payment_request_keeps_authorization_hook(self):
 		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (

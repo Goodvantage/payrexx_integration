@@ -416,16 +416,19 @@ def _complete_locked_integration_request(
 	integration_request.status = "Completed"
 	integration_request.error = ""
 	integration_request.save(ignore_permissions=True)
-	_on_payment_authorized(integration_request, "Completed")
+	payment_entry_name = _on_payment_authorized(integration_request, "Completed")
+	if payment_entry_name:
+		ir_data["payrexx_payment_entry"] = payment_entry_name
+		integration_request.db_set("data", frappe.as_json(ir_data), update_modified=False)
 
 
-def _on_payment_authorized(integration_request, status):
+def _on_payment_authorized(integration_request, status) -> str | None:
 	if not (integration_request.reference_doctype and integration_request.reference_docname):
-		return
+		return None
 	try:
 		with _payment_authorization_user():
 			if integration_request.reference_doctype == "Payment Request":
-				_set_payment_request_as_paid(integration_request.reference_docname)
+				return _set_payment_request_as_paid(integration_request.reference_docname)
 			else:
 				frappe.get_doc(
 					integration_request.reference_doctype,
@@ -436,14 +439,16 @@ def _on_payment_authorized(integration_request, status):
 	except Exception:
 		frappe.log_error(frappe.get_traceback(), "Payrexx on_payment_authorized")
 		raise
+	return None
 
 
-def _set_payment_request_as_paid(payment_request_name: str) -> None:
+def _set_payment_request_as_paid(payment_request_name: str) -> str | None:
 	frappe.db.get_value("Payment Request", payment_request_name, "name", for_update=True)
 	payment_request = frappe.get_doc("Payment Request", payment_request_name)
 	if payment_request.status == "Paid" or flt(payment_request.outstanding_amount) <= 0:
-		return
-	payment_request.set_as_paid()
+		return None
+	payment_entry = payment_request.set_as_paid()
+	return payment_entry.name if payment_entry else None
 
 
 def _mark_chargeback(integration_request_name: str, transaction: dict | None = None) -> None:

@@ -51,6 +51,8 @@ procedures), and the code. Record new or changed requirements in
 | `payrexx_integration/payrexx_integration/payrexx/webhook_validator.py` | HMAC-SHA256 verification of `X-Webhook-Signature`. Tries base64 first, falls back to hex. The signing key is **separate** from the API secret (configured per webhook in the Payrexx dashboard). |
 | `api.py::payrexx_pay_url(sales_invoice, gateway_name=None)` | Jinja helper (registered via `hooks.py.jinja`). Resolves the gateway and returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
 | `api.py::pay_invoice(si=None, token=None, gateway_name=None)` | Whitelisted GET redirect endpoint. Verifies the invoice-and-gateway-bound HMAC token, looks up the Sales Invoice, lazy-creates a Payment Request via ERPNext's `make_payment_request`, and 302s to the Payrexx hosted checkout. Because Frappe otherwise rolls back GET transactions, it sets `frappe.local.flags.commit` only after successful local setup and checkout URL resolution. **All args remain optional kwargs** so missing-param requests return clean 403, not 500. |
+| `hosted_qa.py` | Explicitly gated, System-Manager-and-Accounts-Manager-only, read-only hosted sandbox preflight and settlement evidence. Exact invoice/gateway targets come from site config; never add checkout creation, callback replay, or reconciliation here. |
+| `tests/hosted_settlement_qa.py` | Protected hosted CLI. Credentials and target allowlists are environment-only; persisted state contains no signed/provider URLs or transaction identifiers. |
 | `playwright/` | Self-contained Playwright project (npm). Covers the Payrexx Settings desk flow, `pay_invoice` endpoint auth, and an optional existing Good Event Booking → invoice email flow. Test data remains owned by Good Event; this app must not seed Buzz/Event records. |
 
 ---
@@ -161,6 +163,9 @@ workflows until an explicit, tested contract is implemented.
 bench --site <site> run-tests --app payrexx_integration \
   --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings
 
+bench --site <site> run-tests \
+  --module payrexx_integration.tests.test_hosted_qa
+
 # Playwright e2e (core specs plus an optional existing-booking email check)
 cd playwright
 npm install && npx playwright install chromium
@@ -170,6 +175,10 @@ TEST_BOOKING_NAME=<booking> npx playwright test
 `TEST_BOOKING_NAME` must identify an existing eligible Good Event Booking
 created through Good Event's own fixtures or operator workflow. Payrexx
 Integration does not create cross-app event test data.
+
+Hosted sandbox settlement uses the separately documented protected CLI. Keep
+the provider page human-operated, require provider `TEST` evidence, and disable
+`payrexx_hosted_qa_enabled` after the run.
 
 ---
 

@@ -23,7 +23,9 @@ patched. It provides:
 - HMAC-signed pay-by-email URLs for ERPNext Sales Invoices with a guest
   redirect endpoint that lazy-creates the checkout,
 - the signed Payrexx webhook callback that settles confirmed payments, and a
-  server-side success-redirect reconciliation fallback.
+  server-side success-redirect reconciliation fallback,
+- an explicitly enabled, read-only hosted sandbox acceptance surface that
+  verifies one site-configured invoice's provider-to-ledger settlement chain.
 
 The app explicitly does **NOT**:
 
@@ -77,7 +79,7 @@ The app explicitly does **NOT**:
 
 ### 2.6 Confirmation and Settlement
 
-- REQ-PRX-SETL-01: Complete confirmed Integration Requests atomically: lock and reload the row, store the provider transaction, set Completed, and settle the reference in one transaction, retrying the whole locked unit up to 3 attempts on `QueryDeadlockError`; duplicate confirmed callbacks and already-Completed rows must return without settling twice. [Trace: `payrexx_settings.py::_complete_integration_request/_complete_locked_integration_request`; Tests: `test_confirmation_retries_whole_locked_unit_after_deadlock`, `test_deadlock_retry_completes_request_and_creates_exactly_one_payment_entry`]
+- REQ-PRX-SETL-01: Complete confirmed Integration Requests atomically: lock and reload the row, store the provider transaction, set Completed, settle the reference, and record the Payment Entry created by that settlement in one transaction, retrying the whole locked unit up to 3 attempts on `QueryDeadlockError`; duplicate confirmed callbacks and already-Completed rows must return without settling twice. [Trace: `payrexx_settings.py::_complete_integration_request/_complete_locked_integration_request`; Tests: `test_confirmation_retries_whole_locked_unit_after_deadlock`, `test_deadlock_retry_completes_request_and_creates_exactly_one_payment_entry`]
 - REQ-PRX-SETL-02: For Integration Requests referencing an ERPNext Payment Request, settle by calling the standard `set_as_paid()` under a Payment Request row lock, producing exactly one submitted Payment Entry and letting ERPNext update request and invoice outstanding amounts; other reference types keep receiving their existing `on_payment_authorized("Completed")` hook. [Trace: `payrexx_settings.py::_on_payment_authorized/_set_payment_request_as_paid`; Tests: `test_deadlock_retry_completes_request_and_creates_exactly_one_payment_entry`, `test_non_payment_request_keeps_authorization_hook`]
 - REQ-PRX-SETL-03: Run all payment side effects (webhook settlement and `pay_invoice` lazy creation) as the least-privilege automation user — the configured `Non Profit Settings.creation_user` when that DocType exists and names a valid user, else `Administrator` — via one context manager that always restores the original session. [Trace: `session_utils.py::as_automation_user/payment_authorization_user_name`; Tests: exercised through the settlement and first-click integration tests in `test_payrexx_settings`]
 - REQ-PRX-SETL-04: Log and re-raise non-deadlock settlement failures so Payrexx retries the webhook, committing the Integration Request and downstream payment side effects together through Frappe's request transaction (no mid-callback manual commit). [Trace: `payrexx_settings.py::callback/_on_payment_authorized`; Tests: `test_confirmation_retries_whole_locked_unit_after_deadlock`]
@@ -95,7 +97,13 @@ The app explicitly does **NOT**:
 
 - REQ-PRX-BND-01: Expose only hosted Gateway creation and Gateway/Transaction retrieval; capture of `reserved` transactions, later charging of `authorized` transactions, checkout cancellation/voids, and refund initiation or ERPNext refund reconciliation must not be implemented — provider-side actions and the corresponding accounting reversals stay documented manual procedures. [Trace: `payrexx_client.py` (client surface, `delete_gateway` stub), `DOCUMENTATION.md` "Supported Payment Operations", `HOW_TO.md` §9; Tests: none]
 
-### 2.10 Cross-App Surface
+### 2.10 Hosted Sandbox Acceptance
+
+- REQ-PRX-QA-01: Provide authenticated POST-only `preflight` and `inspect_settlement` methods for hosted sandbox acceptance. Both require System Manager plus Accounts Manager, developer mode, `payrexx_hosted_qa_enabled = 1`, a strict current-date run marker, and exact `payrexx_hosted_qa_gateway` / `payrexx_hosted_qa_invoice` site-config targets. They must never create a checkout, invoke reconciliation, replay a callback, or mutate accounting/provider state. [Trace: `hosted_qa.py`; Tests: `payrexx_integration.tests.test_hosted_qa`]
+- REQ-PRX-QA-02: Preflight must require a submitted, fully unpaid, non-return invoice no larger than 500 currency units, configured secrets, accepted currency, live API credential ping, HTTPS callback URL, and exactly one company/currency Gateway Account. It may resume exactly one submitted pending checkout with complete stored metadata, but must reject ambiguous or incomplete records and must never return a signed payment/provider URL. [Trace: `hosted_qa.py::preflight`; Tests: `test_preflight_*`]
+- REQ-PRX-QA-03: Settlement inspection must bind the supplied Payment Request and Integration Request to the configured gateway/invoice and pass only when the provider transaction is confirmed in `TEST` mode with exact amount/currency/reference, the Integration Request is Completed and records the exact settlement-created Payment Entry, the Payment Request and Sales Invoice are Paid with zero outstanding, and exactly one submitted Payment Entry allocates its full account-currency paid amount to that invoice. The protected CLI must accept credentials only through environment variables, require an exact allowlisted HTTPS origin, bind state to the current run marker, and persist only redacted owner-readable state. [Trace: `hosted_qa.py::inspect_settlement`, `tests/hosted_settlement_qa.py`; Tests: `test_inspector_*`, `TestHostedSettlementRunner`]
+
+### 2.11 Cross-App Surface
 
 - REQ-PRX-INT-01: Keep `payrexx_integration.api.payrexx_pay_url` importable and failing soft (empty string on missing/ambiguous configuration) so downstream renderers such as Good Event's default invoice email degrade gracefully and still send without the online-pay button. [Trace: `api.py::payrexx_pay_url`, `AGENTS.md` "Cross-app integration"; Tests: `test_pay_url_blank_invoice_returns_blank`]
 - REQ-PRX-INT-02: Ship German embedded-help content under `fixtures/help/payrexx_integration/` for the `good_help` Wiki sync (overview, settings, payment links and webhooks). [Trace: `payrexx_integration/fixtures/help/payrexx_integration/*.md`; Tests: none]
@@ -123,7 +131,7 @@ The app explicitly does **NOT**:
 
 - REQ-PRX-OPS-01: Build every externally shared URL (pay links, Payrexx return URLs, the Desk webhook hint) from the configured `host_name` exactly as set, never appending the local bench `webserver_port` or leaking a tunnel origin; production deployments must set `host_name`. [Trace: `url_utils.py::get_public_url`, `HOW_TO.md` §6; Tests: `test_pay_url_uses_configured_public_host_without_dev_port`, `test_webhook_url_uses_configured_public_host_without_dev_port`]
 - REQ-PRX-OPS-02: Leave creation of the ERPNext `Payment Gateway Account` (per company/currency using the gateway) to operators — the app must not seed it — and surface a clear error naming the missing combination when a pay link is clicked without it. [Trace: `api.py::_gateway_account_filter`, `HOW_TO.md` §2; Tests: `test_gateway_account_filter_is_company_and_currency_specific`]
-- REQ-PRX-OPS-03: Keep the two test surfaces runnable as documented: the Python integration module (`IntegrationTestCase`) and the self-contained Playwright project (`playwright/`, npm) covering the Desk settings flow and endpoint auth, with the optional booking-email spec driven by `TEST_BOOKING_NAME` against an existing Good Event Booking (this app must not seed cross-app event fixtures). [Trace: `test_payrexx_settings.py`, `playwright/`, `AGENTS.md` "Testing"; Tests: the suites themselves]
+- REQ-PRX-OPS-03: Keep all test surfaces runnable as documented: the Python integration module (`IntegrationTestCase`), the focused hosted-QA server/CLI tests, and the self-contained Playwright project (`playwright/`, npm) covering the Desk settings flow and endpoint auth, with the optional booking-email spec driven by `TEST_BOOKING_NAME` against an existing Good Event Booking (this app must not seed cross-app event fixtures). [Trace: `test_payrexx_settings.py`, `tests/test_hosted_qa.py`, `tests/hosted_settlement_qa.py`, `playwright/`, `AGENTS.md` "Testing"; Tests: the suites themselves]
 
 ## 4. Explicit Decisions and Constraints
 
@@ -141,11 +149,11 @@ Documented intentional behaviors a reader might otherwise mistake for bugs:
 - **Not a Single, single-per-environment by convention.** `Payrexx Settings` supports multiple rows; environment separation is by naming convention (`Sandbox`/`Live`), and webhooks must carry `?gateway_name=` once more than one row exists (`AGENTS.md` "Gotchas").
 - **Draft Payment Requests are never deleted by the pay-link flow (N11).** Ownership is not reliable provenance because the automation principal can also be used interactively and can fall back to `Administrator`. A pending request for the resolved gateway is reused; any other draft is preserved and blocks checkout creation until accounts staff resolve it. Failed current attempts roll back transactionally (`api.py::_get_or_create_payment_request`; `CUSTOM_APPS_AUDIT_2026-07-17.md` N11).
 - **No cross-app test seeding.** The Playwright booking-email spec consumes an existing Good Event Booking via `TEST_BOOKING_NAME`; this app must not create Buzz/Event records (`AGENTS.md` "Architecture", `HOW_TO.md` §10).
-- **Versioning.** App version tracks the Frappe major (`16.0.1` in `payrexx_integration/__init__.py`, `pyproject.toml` dynamic version), per the bench custom-app versioning policy.
+- **Versioning.** App version tracks the Frappe major (`16.1.0` in `payrexx_integration/__init__.py`, `pyproject.toml` dynamic version), per the bench custom-app versioning policy.
 
 ## 5. Sources
 
-- Code: `hooks.py`, `api.py`, `gateway_selection.py`, `session_utils.py`, `url_utils.py`, `payrexx/payrexx_client.py`, `payrexx/webhook_validator.py`, `doctype/payrexx_settings/` (`.json`, `.py`, `.js`, `test_payrexx_settings.py` — 49 test methods), `fixtures/help/payrexx_integration/`, `playwright/tests/` (3 specs).
+- Code: `hooks.py`, `api.py`, `gateway_selection.py`, `session_utils.py`, `url_utils.py`, `hosted_qa.py`, `tests/hosted_settlement_qa.py`, `tests/test_hosted_qa.py` (14 focused methods), `payrexx/payrexx_client.py`, `payrexx/webhook_validator.py`, `doctype/payrexx_settings/` (`.json`, `.py`, `.js`, `test_payrexx_settings.py` — 49 test methods), `fixtures/help/payrexx_integration/`, `playwright/tests/` (3 specs).
 - Repo docs: `AGENTS.md`, `DOCUMENTATION.md`, `HOW_TO.md`, `PAYREXX_INTEGRATION.md`, `SEMGREP_OVERRIDES.md`, `README.md`.
 - Bench docs/audits: `/workspace/development/AGENTS.md`; `CUSTOM_APPS_AUDIT_2026-07-17.md` (payrexx: C3, H12, H13, H14, B21 verified still fixed; N11 remediated 2026-07-18); `AUDIT_REMEDIATION_WORKLIST_2026-07-14.md` (wave-1 settlement/duplicate-checkout/deadlock/chargeback remediation, H13 chargeback decision, 35–46 passing tests recorded).
 - Session stores:

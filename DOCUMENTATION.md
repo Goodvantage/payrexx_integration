@@ -46,6 +46,8 @@ on Payrexx's default API domain.
 | `payrexx/payrexx_client.py` | Thin Payrexx REST client. |
 | `payrexx/webhook_validator.py` | HMAC webhook signature validation. |
 | `doctype/payrexx_settings/payrexx_settings.py` | Settings controller, gateway creation, callback endpoint. |
+| `hosted_qa.py` | Read-only, exact-target evidence endpoints for explicitly enabled sandbox acceptance. |
+| `tests/hosted_settlement_qa.py` | Protected external CLI for preflight and post-payment evidence. |
 | `playwright/` | Browser tests for Payrexx plus an opt-in invoice-email check against an existing Good Event Booking. |
 
 ## URL Contracts
@@ -128,6 +130,12 @@ update the Payment Request status/outstanding amount and the source invoice
 outstanding amount. Other reference types continue to receive their existing
 `on_payment_authorized("Completed")` hook.
 
+When settlement creates a Payment Entry, its exact name is stored in the
+Integration Request data as `payrexx_payment_entry` in the same transaction.
+Hosted acceptance uses that provenance to distinguish provider settlement from
+an unrelated manual Payment Entry that ERPNext may automatically match to an
+open Payment Request.
+
 Transient `QueryDeadlockError` failures retry the entire locked completion unit:
 the Integration Request is reloaded, transaction data and status are saved, and
 the downstream settlement runs again in one transaction. Duplicate confirmed
@@ -206,6 +214,38 @@ remain explicit manual procedures.
 - Webhook diagnostics avoid logging full payer/payment payloads.
 - Guest endpoints are intentionally whitelisted and documented in `SEMGREP_OVERRIDES.md`.
 
+## Hosted Sandbox Acceptance
+
+The hosted acceptance surface is disabled by default. It exposes only two
+authenticated POST methods in `payrexx_integration.hosted_qa`: `preflight` and
+`inspect_settlement`. Both require a user with System Manager and Accounts
+Manager on a developer site, a strict current-date
+`PRX-SBX-E2E-YYYYMMDD-<8 hex>` run marker, the explicit
+`payrexx_hosted_qa_enabled` gate, and exact gateway/invoice names from site
+config. The invoice amount may not exceed 500 currency units.
+
+Preflight performs the live Payrexx credential ping and validates the exact
+submitted, fully unpaid invoice, supported currency, webhook URL, secrets, and
+company/currency Payment Gateway Account. It accepts either no checkout or one
+submitted pending Payment Request with one complete Integration Request. It
+returns only document names, statuses, amount, and callback host/path; signed
+payment and provider checkout URLs are never returned.
+
+Settlement inspection is read-only. It does not call `payment_success`,
+`reconcile_integration_request`, the callback, or provider APIs. It requires a
+provider `confirmed` transaction in `TEST` mode with the exact amount, currency,
+and Integration Request reference; a Completed Integration Request carrying the
+exact settlement-created Payment Entry name; Paid and zero-outstanding Payment
+Request and Sales Invoice; and exactly one submitted Payment Entry allocating
+its full account-currency paid amount to the invoice. A locally settled record
+with missing provider evidence or `LIVE` mode fails acceptance.
+
+The external CLI validates an exact allowlisted HTTPS origin before sending
+credentials, accepts credentials only through environment variables, and writes
+owner-readable redacted state. A human must complete the provider sandbox page
+through the normal invoice payment link; the runner does not automate cards,
+CAPTCHA, 3-D Secure, callback replay, or reconciliation.
+
 ## Cross-App Integration
 
 Good Event's default invoice renderer imports `payrexx_pay_url`. Missing or
@@ -223,6 +263,9 @@ does not import the downstream app or interpret its site-config keys.
 cd frappe-bench
 bench --site development16.localhost run-tests --app payrexx_integration \
   --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_hosted_qa
 ```
 
 ```bash
