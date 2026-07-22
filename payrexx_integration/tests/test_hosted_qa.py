@@ -12,7 +12,12 @@ from frappe.tests import IntegrationTestCase, UnitTestCase
 from frappe.utils import nowdate
 
 from payrexx_integration.api import _sign, pay_invoice
-from payrexx_integration.hosted_qa import _validate_invoice, inspect_settlement, preflight
+from payrexx_integration.hosted_qa import (
+	_provider_transaction_currency,
+	_validate_invoice,
+	inspect_settlement,
+	preflight,
+)
 from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
 	payrexx_settings as payrexx_settings_module,
 )
@@ -264,6 +269,28 @@ class TestHostedPayrexxQA(IntegrationTestCase):
 
 
 class TestHostedSettlementRunner(UnitTestCase):
+	def test_provider_currency_uses_read_only_gateway_parent_invoice_fallback(self):
+		client = Mock()
+		client.retrieve_gateway.return_value = {
+			"invoices": [
+				{
+					"currency": "CHF",
+					"transactions": [{"id": 12345, "uuid": "txn-1", "status": "confirmed"}],
+				}
+			]
+		}
+		settings = Mock()
+		settings._client.return_value = client
+
+		currency = _provider_transaction_currency(
+			settings,
+			{"payrexx_gateway_id": 999},
+			{"id": 12345, "uuid": "txn-1", "status": "confirmed"},
+		)
+
+		self.assertEqual(currency, "CHF")
+		client.retrieve_gateway.assert_called_once_with(999)
+
 	def test_invoice_validation_uses_erpnext_rounded_payable_total(self):
 		invoice = frappe._dict(
 			docstatus=1,

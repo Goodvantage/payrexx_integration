@@ -174,7 +174,7 @@ def inspect_settlement(
 	transaction = request_data.get("payrexx_transaction") or {}
 	transaction_invoice = transaction.get("invoice") or {}
 	provider_reference = transaction_invoice.get("referenceId") or transaction.get("referenceId")
-	provider_currency = cstr(transaction_invoice.get("currency") or transaction.get("currency")).upper()
+	provider_currency = _provider_transaction_currency(settings, request_data, transaction)
 	provider_mode = cstr(transaction.get("mode")).upper()
 	expected_amount_cents = cint(round(flt(payment_request.grand_total, 2) * 100))
 
@@ -303,3 +303,26 @@ def _validate_invoice(invoice, settings) -> None:
 		"webhook_signing_key", raise_exception=False
 	):
 		frappe.throw(_("Hosted Payrexx QA requires both Payrexx secrets."), frappe.ValidationError)
+
+
+def _provider_transaction_currency(settings, request_data: dict, transaction: dict) -> str:
+	if not transaction:
+		return ""
+	transaction_invoice = transaction.get("invoice") or {}
+	stored_currency = cstr(transaction_invoice.get("currency") or transaction.get("currency")).upper()
+	if stored_currency:
+		return stored_currency
+
+	gateway_id = request_data.get("payrexx_gateway_id")
+	if not gateway_id:
+		return ""
+	gateway = settings._client().retrieve_gateway(cint(gateway_id))
+	transaction_id = transaction.get("id")
+	transaction_uuid = transaction.get("uuid")
+	for provider_invoice in gateway.get("invoices") or []:
+		for candidate in provider_invoice.get("transactions") or []:
+			matches_id = transaction_id and candidate.get("id") == transaction_id
+			matches_uuid = transaction_uuid and candidate.get("uuid") == transaction_uuid
+			if matches_id or matches_uuid:
+				return cstr(provider_invoice.get("currency") or candidate.get("currency")).upper()
+	return ""

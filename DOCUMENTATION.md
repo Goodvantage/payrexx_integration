@@ -237,13 +237,18 @@ returns only document names, statuses, amount, and callback host/path; signed
 payment and provider checkout URLs are never returned.
 
 Settlement inspection is read-only. It does not call `payment_success`,
-`reconcile_integration_request`, the callback, or provider APIs. It requires a
+`reconcile_integration_request`, the callback, or provider mutations. It requires a
 provider `confirmed` transaction in `TEST` mode with the exact amount, currency,
 and Integration Request reference; a Completed Integration Request carrying the
 exact settlement-created Payment Entry name; Paid and zero-outstanding Payment
 Request and Sales Invoice; and exactly one submitted Payment Entry allocating
 its full account-currency paid amount to the invoice. A locally settled record
 with missing provider evidence or `LIVE` mode fails acceptance.
+Callback payloads store currency inside the transaction's invoice object. The
+success fallback receives the same transaction separately from its parent
+Gateway invoice; when stored currency is absent, inspection performs one
+read-only Gateway retrieval and matches the exact transaction ID/UUID before
+using that parent invoice currency. It never persists the retrieved payload.
 
 The external CLI validates an exact allowlisted HTTPS origin before sending
 credentials, accepts credentials only through environment variables, and writes
