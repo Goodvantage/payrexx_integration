@@ -65,6 +65,13 @@ the app recovers the URL recorded in its active Integration Request. An active
 request with no recoverable URL raises a clean error rather than creating a
 potential duplicate checkout.
 
+The pay-by-email endpoint is necessarily an HTTP GET. Frappe normally rolls
+back GET transactions, so `pay_invoice` sets the framework end-of-request commit
+flag only after Payment Request creation and checkout URL resolution both
+succeed. Exceptions retain Frappe's normal rollback behavior. Without that flag,
+the external Gateway can be created while the submitted Payment Request and the
+stored checkout metadata are rolled back locally.
+
 ERPNext `make_payment_request` re-uses any existing draft Payment Request for
 the same invoice without first applying the requested gateway. The pay-link
 flow therefore never deletes drafts. It reuses a pending request for the

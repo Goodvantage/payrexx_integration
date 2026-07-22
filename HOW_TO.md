@@ -81,6 +81,8 @@ GET /api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&gateway_n
 When clicked, the endpoint verifies the token, lazy-creates and submits a Payment
 Request through ERPNext, and redirects to the checkout URL created during that
 submission. Repeated clicks reuse the same Payment Request and Payrexx checkout.
+The GET endpoint commits its lazy-created local records only after Payrexx has
+returned a valid checkout URL; a failed click rolls back the current attempt.
 Links generated before gateway binding was introduced did not include
 `gateway_name`. They continue to work when exactly one settings row exists, but
 are rejected as ambiguous when multiple rows exist; resend the invoice email to

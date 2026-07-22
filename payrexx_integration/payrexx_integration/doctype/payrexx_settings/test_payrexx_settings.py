@@ -672,8 +672,10 @@ class TestPayrexxSettings(IntegrationTestCase):
 			"link": checkout_url,
 		}
 		original_response = getattr(frappe.local, "response", None)
+		original_commit = getattr(frappe.local.flags, "commit", False)
 		try:
 			frappe.local.response = {}
+			frappe.local.flags.commit = False
 			with patch.object(ps_module.PayrexxSettings, "_client", return_value=client):
 				pay_invoice(
 					si=sales_invoice.name,
@@ -681,8 +683,10 @@ class TestPayrexxSettings(IntegrationTestCase):
 					gateway_name=self.settings_name,
 				)
 			response = dict(frappe.local.response)
+			commit_requested = frappe.local.flags.commit
 		finally:
 			frappe.local.response = original_response or {}
+			frappe.local.flags.commit = original_commit
 
 		client.create_gateway.assert_called_once()
 		payment_request_names = frappe.get_all(
@@ -710,6 +714,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 		self.assertEqual(request_data["payrexx_checkout_url"], checkout_url)
 		self.assertEqual(response["type"], "redirect")
 		self.assertEqual(response["location"], checkout_url)
+		self.assertTrue(commit_requested)
 
 	def test_payment_request_checkout_reuses_url_created_on_submission(self):
 		payment_request = Mock()

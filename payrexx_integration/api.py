@@ -149,6 +149,10 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 		payment_request = _get_or_create_payment_request(sales_invoice, settings_name)
 		checkout_url = _get_payment_request_checkout_url(payment_request)
 
+	# Email links must remain GET requests, but successful first-click setup writes
+	# the Payment Request and Integration Request. Frappe rolls back GET requests
+	# unless this framework flag is set; set it only after the checkout is valid.
+	frappe.local.flags.commit = True
 	frappe.local.response["type"] = "redirect"
 	frappe.local.response["location"] = checkout_url
 
