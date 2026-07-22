@@ -290,8 +290,8 @@ def _validate_invoice(invoice, settings) -> None:
 	if invoice.docstatus != 1 or invoice.get("is_return"):
 		frappe.throw(_("Hosted Payrexx QA requires a submitted non-return invoice."), frappe.ValidationError)
 	outstanding = flt(invoice.outstanding_amount, 2)
-	grand_total = flt(invoice.grand_total, 2)
-	if outstanding <= 0 or abs(outstanding - grand_total) >= 0.005:
+	payable_total = flt(invoice.rounded_total or invoice.grand_total, 2)
+	if outstanding <= 0 or abs(outstanding - payable_total) >= 0.005:
 		frappe.throw(_("Hosted Payrexx QA requires a fully unpaid invoice."), frappe.ValidationError)
 	if outstanding > MAX_ACCEPTANCE_AMOUNT:
 		frappe.throw(

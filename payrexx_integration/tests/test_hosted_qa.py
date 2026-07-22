@@ -12,7 +12,7 @@ from frappe.tests import IntegrationTestCase, UnitTestCase
 from frappe.utils import nowdate
 
 from payrexx_integration.api import _sign, pay_invoice
-from payrexx_integration.hosted_qa import inspect_settlement, preflight
+from payrexx_integration.hosted_qa import _validate_invoice, inspect_settlement, preflight
 from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
 	payrexx_settings as payrexx_settings_module,
 )
@@ -264,6 +264,22 @@ class TestHostedPayrexxQA(IntegrationTestCase):
 
 
 class TestHostedSettlementRunner(UnitTestCase):
+	def test_invoice_validation_uses_erpnext_rounded_payable_total(self):
+		invoice = frappe._dict(
+			docstatus=1,
+			is_return=0,
+			outstanding_amount=356.75,
+			grand_total=356.73,
+			rounded_total=356.75,
+			currency="CHF",
+		)
+		settings = Mock()
+		settings.get_password.return_value = "configured"
+
+		_validate_invoice(invoice, settings)
+
+		settings.validate_transaction_currency.assert_called_once_with("CHF")
+
 	def test_base_url_requires_exact_allowlisted_https_origin(self):
 		self.assertEqual(
 			_validated_base_url("https://qa.example.test", "qa.example.test"),
