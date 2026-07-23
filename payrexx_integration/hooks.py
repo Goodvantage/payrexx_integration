@@ -11,6 +11,9 @@ app_license = "unlicense"
 
 required_apps = ["payments"]
 
+# With no extension provider, only Sales Invoice-backed Payment Requests are supported.
+payrexx_settlement_source_providers = []
+
 # Each item in the list will be shown as an app in the apps page
 # add_to_apps_screen = [
 # 	{

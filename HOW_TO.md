@@ -96,10 +96,12 @@ Links generated before gateway binding was introduced did not include
 are rejected as ambiguous when multiple rows exist; resend the invoice email to
 issue a gateway-bound link.
 
-Payrexx supports only Payment Requests sourced from Sales Invoices. Do not
-select a Payrexx gateway on a Sales Order or another source doctype: the app
-rejects it before creating a provider checkout because Sales Order advance
-payable/idempotency behavior is not implemented.
+Payrexx supports Payment Requests sourced from Sales Invoices. Do not select a
+Payrexx gateway on a Sales Order or another source doctype: the app rejects it
+before creating a provider checkout because Sales Order advance
+payable/idempotency behavior is not implemented. Installed apps may register an
+explicit direct-source provider; Good NPO uses that extension for submitted,
+unpaid Donations and revalidates their amount and company currency at settlement.
 
 If an older active Integration Request has no recoverable checkout URL, the app
 shows an error instead of creating a second potentially chargeable checkout;
@@ -220,6 +222,18 @@ For a confirmed invoice payment, verify this chain rather than relying only on t
 2. The linked ERPNext `Payment Request` is **Paid** with zero outstanding.
 3. Exactly one submitted `Payment Entry` references that Payment Request.
 4. The Sales Invoice outstanding amount reflects the submitted Payment Entry.
+
+A Completed Integration Request is terminal for normal webhook delivery. If
+Payrexx later replays `authorized`, `reserved`, `waiting`, a failure status, or
+`refunded`, the request remains Completed and keeps its original confirmed
+transaction evidence. `chargeback` is the intentional exception and starts the
+manual accounting-reversal procedure below.
+
+After that chargeback is recorded, the Integration Request remains **Failed**
+with its original chargeback transaction and error. Later webhook replays,
+including `confirmed`, and browser-return reconciliation cannot replace that
+evidence. A duplicate chargeback only reuses the existing accounting-review
+task.
 
 If the Integration Request is **Failed** with a high-priority **Payrexx
 settlement conflict** ToDo, Payrexx confirmed funds after the Payment Request or

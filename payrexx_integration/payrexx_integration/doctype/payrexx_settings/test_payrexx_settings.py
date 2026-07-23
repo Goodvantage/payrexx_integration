@@ -892,6 +892,118 @@ class TestPayrexxSettings(IntegrationTestCase):
 		ir.reload()
 		self.assertEqual(ir.status, "Completed")
 
+	def test_completed_and_chargeback_request_ignore_non_chargeback_webhook_replays(self):
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		confirmed = {"id": 12345, "status": "confirmed", "amount": 10000, "currency": "CHF"}
+		integration_request = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Completed",
+				"data": frappe.as_json({"payrexx_transaction": confirmed}),
+			}
+		).insert(ignore_permissions=True)
+
+		def send_webhook(status):
+			body = frappe.as_json(
+				{
+					"transaction": {
+						"id": 12345,
+						"status": status,
+						"referenceId": integration_request.name,
+						"invoice": {"referenceId": integration_request.name},
+					}
+				}
+			).encode()
+			signature = base64.b64encode(hmac.new(b"whk_test_dummy", body, hashlib.sha256).digest()).decode(
+				"ascii"
+			)
+
+			class _FakeRequest:
+				def __init__(self):
+					self.args = {}
+					self.form = {}
+
+				def get_data(self):
+					return body
+
+			original_request = getattr(frappe.local, "request", None)
+			frappe.local.request = _FakeRequest()
+			try:
+				with patch.object(
+					frappe,
+					"get_request_header",
+					return_value=signature,
+				):
+					self.assertEqual(ps_module.callback(gateway_name=GATEWAY_NAME), {"ok": True})
+			finally:
+				if original_request is None:
+					delattr(frappe.local, "request")
+				else:
+					frappe.local.request = original_request
+
+		for status in (
+			"authorized",
+			"reserved",
+			"waiting",
+			"cancelled",
+			"declined",
+			"error",
+			"expired",
+			"refunded",
+		):
+			with self.subTest(status=status):
+				send_webhook(status)
+				integration_request.reload()
+				self.assertEqual(integration_request.status, "Completed")
+				self.assertEqual(
+					(frappe.parse_json(integration_request.data) or {})["payrexx_transaction"],
+					confirmed,
+				)
+
+		send_webhook("chargeback")
+		integration_request.reload()
+		self.assertEqual(integration_request.status, "Failed")
+		chargeback_data = frappe.parse_json(integration_request.data) or {}
+		chargeback_transaction = chargeback_data["payrexx_transaction"]
+		self.assertEqual(chargeback_transaction["status"], "chargeback")
+		self.assertEqual(integration_request.error, ps_module.CHARGEBACK_ERROR)
+
+		for status in (
+			"confirmed",
+			"authorized",
+			"reserved",
+			"waiting",
+			"cancelled",
+			"declined",
+			"error",
+			"expired",
+			"refunded",
+		):
+			with self.subTest(replay_after_chargeback=status):
+				send_webhook(status)
+				integration_request.reload()
+				self.assertEqual(integration_request.status, "Failed")
+				self.assertEqual(integration_request.error, ps_module.CHARGEBACK_ERROR)
+				self.assertEqual(
+					(frappe.parse_json(integration_request.data) or {})["payrexx_transaction"],
+					chargeback_transaction,
+				)
+
+		# A duplicate chargeback is idempotent and keeps the first evidence.
+		send_webhook("chargeback")
+		integration_request.reload()
+		self.assertEqual(
+			(frappe.parse_json(integration_request.data) or {})["payrexx_transaction"],
+			chargeback_transaction,
+		)
+		with patch.object(ps_module, "_resolve_settings") as resolve_settings:
+			self.assertFalse(ps_module.reconcile_integration_request(integration_request.name))
+		resolve_settings.assert_not_called()
+
 	def test_callback_ignores_non_payrexx_integration_request(self):
 		ir = frappe.get_doc(
 			{
@@ -1014,8 +1126,8 @@ class TestPayrexxSettings(IntegrationTestCase):
 			settings.get_payment_url(
 				amount=10,
 				currency="CHF",
-				reference_doctype="Donation",
-				reference_docname="DONATION-TEST",
+				reference_doctype="Customer",
+				reference_docname="CUSTOMER-TEST",
 			)
 
 		client.create_gateway.assert_not_called()
@@ -1451,6 +1563,11 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 		integration_request.reload()
 		self.assertEqual(integration_request.status, "Failed")
+		self.assertEqual(integration_request.error, ps_module.CHARGEBACK_ERROR)
+		self.assertEqual(
+			(frappe.parse_json(integration_request.data) or {})["payrexx_transaction"],
+			chargeback,
+		)
 		self.assertEqual(frappe.db.get_value("Payment Entry", payment_entries[0], "docstatus"), 1)
 		chargeback_todos = frappe.get_all(
 			"ToDo",

@@ -12,6 +12,8 @@ payments
 ```
 
 Do not modify `apps/payments` directly for Payrexx behavior.
+The CI environment installs upstream `payments` from `version-16`, matching the
+supported Frappe major instead of testing against the moving development branch.
 
 The app metadata exposes `/assets/payrexx_integration/images/payrexx-integration-app-logo.svg`, following the shared Goodvantage navy tile pattern with a centered white credit-card line symbol and small bottom-right white Goodvantage `g` mark. Payrexx Integration does not add a Desk app tile by default; the logo is available for metadata or future app-surface use.
 
@@ -67,14 +69,16 @@ the app recovers the URL recorded in its active Integration Request. An active
 request with no recoverable URL raises a clean error rather than creating a
 potential duplicate checkout.
 
-Payrexx checkout and automatic settlement support only Payment Requests whose
-source is a Sales Invoice. The controller checks the Payment Request source
-before creating an Integration Request or calling Payrexx. Sales Orders and
-other source doctypes are rejected because this app does not implement their
+Payrexx checkout and automatic settlement support Payment Requests whose source
+is a Sales Invoice. The controller checks the Payment Request source before
+creating an Integration Request or calling Payrexx. Direct references are
+rejected by default; an installed app may explicitly own one through
+`payrexx_settlement_source_providers`, which must validate it at checkout and
+again under its own row lock during settlement. Sales Orders and other unowned
+source doctypes remain rejected because this app does not implement their
 advance-payment payable and idempotency semantics. If an unsupported checkout
 predates this guard, confirmation records a terminal settlement conflict and
-does not call `set_as_paid()`, preventing a Sales Order from receiving a second
-advance.
+does not authorize the source.
 
 The pay-by-email endpoint is necessarily an HTTP GET. Frappe normally rolls
 back GET transactions, so `pay_invoice` sets the framework end-of-request commit
@@ -136,9 +140,10 @@ when an automation user is configured. A confirmed Integration Request that
 references a supported ERPNext Payment Request calls the standard
 `set_as_paid()` method under a row lock. This creates and submits one Payment
 Entry and lets ERPNext update the Payment Request status/outstanding amount and
-the Sales Invoice outstanding amount. Confirmed Payrexx settlement validation
-requires this Payment Request/Sales Invoice chain; generic references and other
-Payment Request source doctypes cannot reach the authorization side effect.
+the Sales Invoice outstanding amount. An explicitly registered direct-source
+provider can instead revalidate and authorize only the source it owns; Good NPO
+uses this for submitted, unpaid Donations. Generic references and other Payment
+Request source doctypes cannot reach the authorization side effect.
 
 Before that side effect, confirmation fails closed unless the Integration
 Request references an existing inward Payment Request that is submitted and
@@ -182,6 +187,17 @@ the Integration Request is reloaded, transaction data and status are saved, and
 the downstream settlement runs again in one transaction. Duplicate confirmed
 callbacks return after observing the locked completed row, while separate
 requests for the same Payment Request are serialized on that Payment Request.
+Once an Integration Request is Completed, delayed or replayed webhook statuses
+such as `authorized`, `reserved`, `waiting`, provider failures, or `refunded`
+are ignored and cannot replace its confirmed transaction evidence. A verified
+`chargeback` is the only webhook status allowed to move a Completed request to
+Failed so the accounting-exception workflow still runs. Callback mapping is
+serialized on the Integration Request row. Once chargeback evidence exists,
+all later non-chargeback statuses, including `confirmed`, are ignored and the
+Failed status, chargeback error, and first chargeback transaction remain
+unchanged. Duplicate chargebacks only repair/reuse the same review ToDo.
+Browser-return reconciliation applies the same terminal guard before calling
+Payrexx.
 Non-deadlock failures are logged and re-raised so Payrexx can retry the webhook;
 the Integration Request and downstream payment side effects are committed
 together by Frappe's request transaction instead of a mid-callback manual
@@ -248,8 +264,9 @@ later duplicate confirmation cannot move the chargeback request back to
 ## Supported Payment Operations
 
 The client creates hosted Gateways and retrieves Gateway/Transaction state for
-Sales-Invoice-backed Payment Requests. Webhook and success-return reconciliation
-settle only actual `confirmed` transactions; Gateway status alone cannot settle.
+Sales-Invoice-backed Payment Requests and explicitly owned extension sources.
+Webhook and success-return reconciliation settle only actual `confirmed`
+transactions; Gateway status alone cannot settle.
 `authorized` and `reserved` callbacks record the Integration Request as
 `Authorized`, but this app has no later-charge or capture operation.
 `cancelled`, `declined`, `error`, and `expired` callbacks mark the request
@@ -259,6 +276,10 @@ reconciliation are not implemented: a `refunded` or otherwise unknown webhook
 is stored while the Integration Request status remains unchanged. Provider-side
 refund/capture/cancellation and the corresponding accounting reversal therefore
 remain explicit manual procedures.
+These ordinary mappings apply only before completion. A Completed request keeps
+its confirmed state and evidence when any non-chargeback webhook is delayed or
+replayed. After a chargeback, every non-chargeback replay keeps the request
+Failed and preserves the first chargeback evidence.
 
 ## Security Model
 

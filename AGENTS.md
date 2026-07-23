@@ -144,13 +144,22 @@ when only the checkout/login surface uses a custom domain.
 
 | Payrexx `transaction.status` | `Integration Request.status` | Side effect |
 |---|---|---|
-| `confirmed` | `Completed` or terminal `Failed` conflict | Settles only an active submitted inward Payment Request backed by a submitted Sales Invoice with exact canonical amount/currency evidence |
+| `confirmed` | `Completed` or terminal `Failed` conflict | Settles an active submitted inward Payment Request backed by a submitted Sales Invoice, or an explicitly registered extension source, with exact canonical amount/currency evidence |
 | `authorized` | `Authorized` | Records provider state only; this app does not implement later charging |
 | `reserved` | `Authorized` | Records provider state only; this app does not implement capture |
 | `waiting` | unchanged | In-progress; wait for next webhook |
 | `cancelled` / `declined` / `error` / `expired` | `Failed` | Records error string; no provider-side cancellation is initiated |
 | `chargeback` | `Failed` | Preserves submitted ledger rows and creates one accounting-review ToDo |
 | `refunded` or another unknown status | unchanged | Stores the transaction only; refund reconciliation is not implemented |
+
+These mappings apply to requests that have not completed. Once Completed, all
+delayed or replayed non-chargeback statuses are ignored so neither the status nor
+the confirmed transaction evidence can be downgraded. A verified `chargeback`
+remains allowed and moves the request to Failed for accounting review.
+After chargeback evidence exists, all non-chargeback statuses, including
+`confirmed`, are terminally ignored; preserve Failed status, the chargeback
+error, and the first chargeback transaction. Only duplicate chargeback delivery
+may re-enter the idempotent review-ToDo path.
 
 The integration creates hosted Gateways and reads Gateway/Transaction state. It
 does not expose capture, later-charge, void/cancel, or refund operations. Those

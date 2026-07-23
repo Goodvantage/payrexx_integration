@@ -269,6 +269,14 @@ not be used to create order advances.
 | `chargeback` | `Failed` | Preserves submitted ledger rows and creates one accounting-review ToDo |
 | `refunded` or unknown | unchanged | Stores transaction data; refund reconciliation is not implemented |
 
+The ordinary mappings apply only before completion. A Completed request ignores
+all delayed or replayed non-chargeback statuses and preserves its confirmed
+transaction evidence. A verified `chargeback` remains allowed to move it to
+Failed for manual accounting review. After chargeback evidence is stored, every
+non-chargeback replay, including `confirmed`, preserves Failed status, the
+chargeback error, and the first chargeback transaction. Duplicate chargeback
+delivery is idempotent.
+
 The integration does not initiate capture, later-charge, void/cancel, or refund
 operations. Perform those provider actions in Payrexx and post the approved
 ERPNext accounting reversal manually.

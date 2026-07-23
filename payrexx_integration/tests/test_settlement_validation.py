@@ -1,15 +1,62 @@
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import frappe
 from frappe.tests import UnitTestCase
 
 from payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings import (
+	CHARGEBACK_ERROR,
+	_is_chargeback_recorded,
+	_mark_reconciliation_failure,
 	_settlement_conflict,
 	reconcile_integration_request,
 )
 
 
 class TestSettlementValidation(UnitTestCase):
+	def test_chargeback_terminal_evidence_accepts_transaction_or_error_marker(self):
+		self.assertTrue(
+			_is_chargeback_recorded(
+				frappe._dict(data="{}", error=""),
+				{"payrexx_transaction": {"status": "chargeback"}},
+			)
+		)
+
+	def test_reconciliation_failure_rechecks_chargeback_under_row_lock(self):
+		integration_request = frappe._dict(
+			name="IR-CHARGEBACK",
+			status="Failed",
+			error=CHARGEBACK_ERROR,
+			data=frappe.as_json({"payrexx_transaction": {"status": "chargeback"}}),
+			save=Mock(),
+		)
+		with (
+			patch(
+				"payrexx_integration.payrexx_integration.doctype.payrexx_settings."
+				"payrexx_settings.frappe.db.get_value"
+			) as lock_request,
+			patch(
+				"payrexx_integration.payrexx_integration.doctype.payrexx_settings."
+				"payrexx_settings.frappe.get_doc",
+				return_value=integration_request,
+			),
+		):
+			_mark_reconciliation_failure(integration_request.name, "declined")
+
+		lock_request.assert_called_once_with(
+			"Integration Request",
+			integration_request.name,
+			"name",
+			for_update=True,
+		)
+		integration_request.save.assert_not_called()
+		self.assertTrue(_is_chargeback_recorded(frappe._dict(data="{}", error=CHARGEBACK_ERROR), {}))
+		self.assertFalse(
+			_is_chargeback_recorded(
+				frappe._dict(data="{}", error="Payrexx status: declined"),
+				{"payrexx_transaction": {"status": "confirmed"}},
+			)
+		)
+
 	def test_confirmation_requires_provider_and_requested_amount_currency(self):
 		integration_request = frappe._dict(reference_doctype=None)
 		self.assertEqual(

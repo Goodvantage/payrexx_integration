@@ -21,9 +21,11 @@ from payrexx_integration.url_utils import get_public_url, safe_return_url
 
 PAYMENT_AUTHORIZED_MAX_ATTEMPTS = 3
 CHARGEBACK_TODO_MARKER = "[Payrexx chargeback]"
+CHARGEBACK_ERROR = "Payrexx status: chargeback"
 SETTLEMENT_CONFLICT_TODO_MARKER = "[Payrexx settlement conflict]"
 SETTLEMENT_CONFLICT_DATA_KEY = "payrexx_settlement_conflict"
 SETTLEMENT_CONFLICT_VERSION = 1
+SETTLEMENT_SOURCE_PROVIDER_HOOK = "payrexx_settlement_source_providers"
 
 
 class PayrexxSettings(Document):
@@ -126,6 +128,8 @@ class PayrexxSettings(Document):
 
 	def _validate_payment_request_source(self, kwargs: dict) -> None:
 		if kwargs.get("reference_doctype") != "Payment Request":
+			if _extension_source_validation(phase="checkout", settings=self, kwargs=kwargs) is True:
+				return
 			frappe.throw(_("Payrexx supports only Payment Requests for Sales Invoices."))
 
 		payment_request = frappe.db.get_value(
@@ -261,6 +265,7 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 			)
 			return {"ok": True}
 
+		frappe.db.get_value("Integration Request", ref_id, "name", for_update=True)
 		ir = frappe.get_doc("Integration Request", ref_id)
 		if ir.integration_request_service != "Payrexx":
 			frappe.log_error(
@@ -285,11 +290,23 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 			)
 			return {"ok": True}
 
+		# Chargeback evidence is terminal. Only an authentic duplicate chargeback
+		# may re-enter its idempotent ToDo repair path.
+		if _is_chargeback_recorded(ir, ir_data):
+			if status == "chargeback":
+				_mark_chargeback(ir.name, txn)
+			return {"ok": True}
+
 		# A confirmed settlement conflict is an accounting terminal state. Keep
 		# authenticating replays, but never let a later status silently reopen it.
 		if ir_data.get(SETTLEMENT_CONFLICT_DATA_KEY):
 			if status == "chargeback":
 				_mark_chargeback(ir.name, txn)
+			return {"ok": True}
+
+		# Confirmation is terminal except for a later chargeback. Ignore delayed
+		# provider states without replacing the confirmed transaction evidence.
+		if ir.status == "Completed" and status != "chargeback":
 			return {"ok": True}
 
 		if status == "confirmed":
@@ -375,6 +392,8 @@ def reconcile_integration_request(
 	if ir.integration_request_service != "Payrexx":
 		return False
 	ir_data = frappe.parse_json(ir.data) or {}
+	if _is_chargeback_recorded(ir, ir_data):
+		return False
 	if ir_data.get(SETTLEMENT_CONFLICT_DATA_KEY):
 		return False
 	if ir.status == "Completed":
@@ -400,9 +419,7 @@ def reconcile_integration_request(
 	if status == "chargeback":
 		_mark_chargeback(ir.name, gateway)
 	elif status in ("cancelled", "declined", "error", "expired"):
-		ir.status = "Failed"
-		ir.error = f"Payrexx status: {status}"
-		ir.save(ignore_permissions=True)
+		_mark_reconciliation_failure(ir.name, status)
 	return False
 
 
@@ -430,6 +447,21 @@ def _confirmed_transaction_from_gateway(gateway: dict) -> dict:
 	return {}
 
 
+def _mark_reconciliation_failure(integration_request_name: str, status: str) -> None:
+	frappe.db.get_value("Integration Request", integration_request_name, "name", for_update=True)
+	integration_request = frappe.get_doc("Integration Request", integration_request_name)
+	ir_data = frappe.parse_json(integration_request.data) or {}
+	if (
+		_is_chargeback_recorded(integration_request, ir_data)
+		or ir_data.get(SETTLEMENT_CONFLICT_DATA_KEY)
+		or integration_request.status == "Completed"
+	):
+		return
+	integration_request.status = "Failed"
+	integration_request.error = f"Payrexx status: {status}"
+	integration_request.save(ignore_permissions=True)
+
+
 def _complete_integration_request(integration_request_name: str, transaction: dict | None = None) -> None:
 	"""Atomically record confirmation and settle its reference, retrying the whole unit."""
 	for attempt in range(1, PAYMENT_AUTHORIZED_MAX_ATTEMPTS + 1):
@@ -449,8 +481,7 @@ def _complete_locked_integration_request(
 	frappe.db.get_value("Integration Request", integration_request_name, "name", for_update=True)
 	integration_request = frappe.get_doc("Integration Request", integration_request_name)
 	ir_data = frappe.parse_json(integration_request.data) or {}
-	previous_transaction = ir_data.get("payrexx_transaction") or {}
-	if (previous_transaction.get("status") or "").lower() == "chargeback":
+	if _is_chargeback_recorded(integration_request, ir_data):
 		return
 	if ir_data.get(SETTLEMENT_CONFLICT_DATA_KEY):
 		return
@@ -590,6 +621,18 @@ def _settlement_conflict(integration_request, ir_data: dict, transaction: dict) 
 			_("Provider currency does not match the requested currency."),
 			evidence,
 		)
+
+	if integration_request.reference_doctype != "Payment Request":
+		extension_validation = _extension_source_validation(
+			phase="settlement",
+			integration_request=integration_request,
+			ir_data=ir_data,
+			transaction=transaction,
+		)
+		if extension_validation is True:
+			return None
+		if isinstance(extension_validation, dict):
+			return extension_validation
 
 	if (
 		integration_request.reference_doctype != "Payment Request"
@@ -736,6 +779,15 @@ def _settlement_conflict(integration_request, ir_data: dict, transaction: dict) 
 	return None
 
 
+def _extension_source_validation(*, phase: str, **context) -> bool | dict | None:
+	"""Delegate explicitly supported non-standard sources; no provider means fail closed."""
+	for provider in frappe.get_hooks(SETTLEMENT_SOURCE_PROVIDER_HOOK):
+		result = frappe.get_attr(provider)(phase=phase, **context)
+		if result is not None:
+			return result
+	return None
+
+
 def _mark_settlement_conflict(integration_request, ir_data: dict, conflict: dict) -> None:
 	if ir_data.get(SETTLEMENT_CONFLICT_DATA_KEY):
 		return
@@ -778,15 +830,13 @@ def _mark_chargeback(integration_request_name: str, transaction: dict | None = N
 	frappe.db.get_value("Integration Request", integration_request_name, "name", for_update=True)
 	integration_request = frappe.get_doc("Integration Request", integration_request_name)
 	ir_data = frappe.parse_json(integration_request.data) or {}
-	if transaction:
+	chargeback_recorded = _is_chargeback_recorded(integration_request, ir_data)
+	if transaction and not chargeback_recorded:
 		ir_data["payrexx_transaction"] = transaction
-	integration_request.db_set(
-		{
-			"data": frappe.as_json(ir_data),
-			"status": "Failed",
-			"error": "Payrexx status: chargeback",
-		}
-	)
+	updates = {"status": "Failed", "error": CHARGEBACK_ERROR}
+	if not chargeback_recorded:
+		updates["data"] = frappe.as_json(ir_data)
+	integration_request.db_set(updates)
 
 	with _payment_authorization_user():
 		if frappe.db.exists(
@@ -814,6 +864,14 @@ def _mark_chargeback(integration_request_name: str, transaction: dict | None = N
 				),
 			}
 		).insert(ignore_permissions=True)
+
+
+def _is_chargeback_recorded(integration_request, ir_data: dict | None = None) -> bool:
+	ir_data = ir_data if ir_data is not None else frappe.parse_json(integration_request.data) or {}
+	transaction = ir_data.get("payrexx_transaction") or {}
+	return (transaction.get("status") or "").lower() == "chargeback" or cstr(
+		integration_request.get("error")
+	) == CHARGEBACK_ERROR
 
 
 def _payment_authorization_user():
