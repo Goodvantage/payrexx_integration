@@ -57,6 +57,14 @@ POST https://<site>/api/method/payrexx_integration.payrexx_integration.doctype.p
 
 Use the Payrexx dashboard's webhook signing key as the app's webhook signing key. This is separate from the API secret.
 
+The `gateway_name` query value must be the exact **Payrexx Settings document
+name**, not a generic environment label. For example, a settings row named
+`spendedirekt` requires `?gateway_name=spendedirekt`; a stale
+`?gateway_name=Sandbox` callback is rejected with HTTP 417 before any accounting
+mutation. After correcting an existing webhook URI, retry its failed delivery
+when Payrexx provides that action. Do not create or pay a second checkout merely
+because the first webhook failed.
+
 ## 4. Use Pay-By-Email Links
 
 Invoice emails can call the Jinja helper:
@@ -107,6 +115,18 @@ Because this return is an HTTP GET, terminal server-verified reconciliation
 requests Frappe's end-of-request commit before redirecting; waiting results do
 not. A success page with unchanged accounting records indicates an outdated
 deployment that still rolled back the GET transaction.
+If Payrexx already reports the transaction as confirmed but the original webhook
+cannot be retried, open this normal fallback for the existing Integration
+Request instead of paying again:
+
+```text
+https://<site>/api/method/payrexx_integration.api.payment_success?ir=<Integration-Request>&gateway_name=<Payrexx-Settings-name>
+```
+
+This is not a second payment. It retrieves the existing Gateway server-side and
+settles only after provider confirmation. Reopening the payment URL or creating
+a new checkout can produce a duplicate provider transaction and is not a
+recovery procedure.
 When a payment creator stored `redirect_to` in the Integration Request, the
 endpoint sends the customer directly back to that same-site URL after
 reconciliation instead of showing the generic `/payment-success` page. If the
@@ -162,6 +182,11 @@ ERPNext would otherwise reuse one even when it belongs to another gateway.
 If the link opens but payment does not update, check **Integration Request**
 rows, Payrexx webhook delivery logs, and whether Payrexx can reach the success
 redirect URL on the public `host_name`.
+If Payrexx shows a confirmed transaction while the Integration Request remains
+Queued and unmodified, compare the failed webhook's `gateway_name` query value
+with the exact Payrexx Settings document name. Correct the webhook first; retry
+the delivery or use the existing transaction's success fallback. Never retry the
+payment itself.
 The webhook only updates Integration Requests whose service is `Payrexx`; if a
 Payrexx reference ID points at a row owned by another gateway, the callback logs
 the mismatch and ignores it.
@@ -216,6 +241,14 @@ bench --site <qa-site> set-config payrexx_hosted_qa_invoice <Sales-Invoice-name>
 bench --site <qa-site> clear-cache
 ```
 
+`clear-cache` does not reliably reload `site_config.json` in long-lived web
+workers. On Docker deployments, restart the backend container after changing
+these keys before trusting preflight:
+
+```bash
+docker restart <project>-backend-1
+```
+
 Load credentials from the protected secret source, then export these non-secret
 target controls. Never put credentials, signed payment URLs, or card data in
 arguments, state files, screenshots, traces, or reports:
@@ -257,6 +290,9 @@ Disable the gate immediately afterward:
 bench --site <qa-site> set-config payrexx_hosted_qa_enabled 0
 bench --site <qa-site> clear-cache
 ```
+
+Restart the backend workers after disabling the gate, then call preflight once
+and require HTTP 403 before closing the acceptance run.
 
 Payrexx test transactions cannot be deleted. Keep their run marker and exact
 ERPNext records as acceptance evidence; never add destructive provider cleanup.
