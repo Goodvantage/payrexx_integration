@@ -160,6 +160,32 @@ def _ensure_test_payment_gateway_account(payment_gateway: str, sales_invoice) ->
 	)
 
 
+def _create_submitted_test_payment_request():
+	from erpnext.accounts.doctype.payment_request.payment_request import (
+		PaymentRequest,
+		make_payment_request,
+	)
+
+	payment_gateway = "_Test Gateway"
+	if not frappe.db.exists("Payment Gateway", payment_gateway):
+		frappe.get_doc({"doctype": "Payment Gateway", "gateway": payment_gateway}).insert(
+			ignore_permissions=True
+		)
+	sales_invoice = _create_submitted_test_sales_invoice()
+	gateway_account = _ensure_test_payment_gateway_account(payment_gateway, sales_invoice)
+	with patch.object(PaymentRequest, "get_payment_url", return_value="https://pay.example/checkout"):
+		payment_request = make_payment_request(
+			dt="Sales Invoice",
+			dn=sales_invoice.name,
+			recipient_id="payrexx-test@example.com",
+			mute_email=1,
+			payment_gateway_account=gateway_account,
+			submit_doc=1,
+			return_doc=1,
+		)
+	return sales_invoice, payment_request
+
+
 class TestPayrexxSettings(IntegrationTestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -377,6 +403,36 @@ class TestPayrexxSettings(IntegrationTestCase):
 			"https://demo.example.test/demo?donation_status=failed&donation=NPO-DTN-TEST",
 		)
 		self.assertEqual(payload["cancelRedirectUrl"], payload["failedRedirectUrl"])
+
+	def test_gateway_payload_rejects_sub_cent_and_non_two_decimal_amounts(self):
+		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
+		self.assertEqual(
+			doc._build_create_gateway_payload(
+				{"amount": "10.10", "currency": "CHF"},
+				"PAYREXX-IR-TEST",
+			)["amount"],
+			1010,
+		)
+		with self.assertRaisesRegex(ValueError, "precision smaller"):
+			doc._build_create_gateway_payload(
+				{"amount": "10.001", "currency": "CHF"},
+				"PAYREXX-IR-TEST",
+			)
+
+		currency = frappe.get_doc(
+			{
+				"doctype": "Currency",
+				"currency_name": "TST3",
+				"enabled": 1,
+				"fraction_units": 1000,
+			}
+		).insert(ignore_if_duplicate=True)
+		self.assertEqual(currency.fraction_units, 1000)
+		with self.assertRaisesRegex(ValueError, "two-decimal"):
+			doc._build_create_gateway_payload(
+				{"amount": "10.100", "currency": "TST3"},
+				"PAYREXX-IR-TEST",
+			)
 
 	def test_pay_url_explicit_gateway_name(self):
 		other_settings = _ensure_settings("OtherGateway")
@@ -712,6 +768,8 @@ class TestPayrexxSettings(IntegrationTestCase):
 		request_data = frappe.parse_json(integration_requests[0].data) or {}
 		self.assertEqual(request_data["payrexx_gateway_id"], 424242)
 		self.assertEqual(request_data["payrexx_checkout_url"], checkout_url)
+		self.assertEqual(request_data["payrexx_gateway_amount"], 10000)
+		self.assertEqual(request_data["payrexx_gateway_currency"], sales_invoice.currency)
 		self.assertEqual(response["type"], "redirect")
 		self.assertEqual(response["location"], checkout_url)
 		self.assertTrue(commit_requested)
@@ -770,13 +828,22 @@ class TestPayrexxSettings(IntegrationTestCase):
 	# ---------------------------------------------------- callback (full path)
 
 	def test_callback_marks_integration_request_completed(self):
+		_sales_invoice, payment_request = _create_submitted_test_payment_request()
 		# Set up an Integration Request the callback should resolve to
 		ir = frappe.get_doc(
 			{
 				"doctype": "Integration Request",
 				"integration_request_service": "Payrexx",
 				"status": "Queued",
-				"data": json.dumps({"payrexx_gateway_id": 999}),
+				"reference_doctype": "Payment Request",
+				"reference_docname": payment_request.name,
+				"data": json.dumps(
+					{
+						"payrexx_gateway_id": 999,
+						"payrexx_gateway_amount": int(payment_request.grand_total * 100),
+						"payrexx_gateway_currency": payment_request.currency,
+					}
+				),
 			}
 		).insert(ignore_permissions=True)
 
@@ -785,6 +852,8 @@ class TestPayrexxSettings(IntegrationTestCase):
 				"transaction": {
 					"id": 12345,
 					"status": "confirmed",
+					"amount": int(payment_request.grand_total * 100),
+					"currency": payment_request.currency,
 					"referenceId": ir.name,
 					"invoice": {"referenceId": ir.name},
 				}
@@ -881,18 +950,19 @@ class TestPayrexxSettings(IntegrationTestCase):
 		"""The settings row that creates a checkout is recorded on the IR —
 		the webhook binding depends on this."""
 		settings = frappe.get_doc("Payrexx Settings", self.settings_name)
+		_sales_invoice, payment_request = _create_submitted_test_payment_request()
 
 		class _FakeClient:
 			def create_gateway(self, payload):
 				return {"id": 4242, "hash": "h", "link": "https://pay.example/checkout"}
 
 		with patch.object(type(settings), "_client", return_value=_FakeClient()):
-			# No reference document: create_request_log link-validates it,
-			# and the recording behavior under test is independent of it.
 			link = settings.get_payment_url(
 				amount=10,
 				currency="CHF",
 				payment_gateway="Payrexx-" + self.settings_name,
+				reference_doctype="Payment Request",
+				reference_docname=payment_request.name,
 			)
 		self.assertEqual(link, "https://pay.example/checkout")
 
@@ -907,6 +977,48 @@ class TestPayrexxSettings(IntegrationTestCase):
 		self.assertEqual(data.get("payrexx_settings"), self.settings_name)
 		self.assertEqual(data.get("payrexx_gateway_id"), 4242)
 		self.assertEqual(data.get("payrexx_checkout_url"), "https://pay.example/checkout")
+		self.assertEqual(data.get("payrexx_gateway_amount"), 1000)
+		self.assertEqual(data.get("payrexx_gateway_currency"), "CHF")
+
+	def test_get_payment_url_rejects_sales_order_payment_request_before_gateway_creation(self):
+		settings = frappe.get_doc("Payrexx Settings", self.settings_name)
+		client = Mock()
+		with (
+			patch.object(
+				frappe.db,
+				"get_value",
+				return_value=frappe._dict(
+					reference_doctype="Sales Order",
+					reference_name="SO-TEST",
+				),
+			),
+			patch.object(type(settings), "_client", return_value=client),
+			self.assertRaisesRegex(frappe.ValidationError, "Sales Invoices"),
+		):
+			settings.get_payment_url(
+				amount=10,
+				currency="CHF",
+				reference_doctype="Payment Request",
+				reference_docname="PR-SALES-ORDER",
+			)
+
+		client.create_gateway.assert_not_called()
+
+	def test_get_payment_url_rejects_direct_non_payment_request_reference(self):
+		settings = frappe.get_doc("Payrexx Settings", self.settings_name)
+		client = Mock()
+		with (
+			patch.object(type(settings), "_client", return_value=client),
+			self.assertRaisesRegex(frappe.ValidationError, "Sales Invoices"),
+		):
+			settings.get_payment_url(
+				amount=10,
+				currency="CHF",
+				reference_doctype="Donation",
+				reference_docname="DONATION-TEST",
+			)
+
+		client.create_gateway.assert_not_called()
 
 	def test_reconcile_prefers_integration_requests_own_gateway(self):
 		"""The caller-supplied gateway_name must not pick the credentials —
@@ -1004,12 +1116,21 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 	def test_callback_reads_gateway_name_from_query_args_for_json_webhook(self):
 		_ensure_settings("OtherGateway")
+		_sales_invoice, payment_request = _create_submitted_test_payment_request()
 		ir = frappe.get_doc(
 			{
 				"doctype": "Integration Request",
 				"integration_request_service": "Payrexx",
 				"status": "Queued",
-				"data": json.dumps({"payrexx_gateway_id": 999}),
+				"reference_doctype": "Payment Request",
+				"reference_docname": payment_request.name,
+				"data": json.dumps(
+					{
+						"payrexx_gateway_id": 999,
+						"payrexx_gateway_amount": int(payment_request.grand_total * 100),
+						"payrexx_gateway_currency": payment_request.currency,
+					}
+				),
 			}
 		).insert(ignore_permissions=True)
 
@@ -1018,6 +1139,8 @@ class TestPayrexxSettings(IntegrationTestCase):
 				"transaction": {
 					"id": 12345,
 					"status": "confirmed",
+					"amount": int(payment_request.grand_total * 100),
+					"currency": payment_request.currency,
 					"referenceId": ir.name,
 					"invoice": {"referenceId": ir.name},
 				}
@@ -1061,7 +1184,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 				"doctype": "Integration Request",
 				"integration_request_service": "Payrexx",
 				"status": "Queued",
-				"data": "{}",
+				"data": json.dumps({"amount": 100, "currency": "CHF"}),
 			}
 		).insert(ignore_permissions=True)
 
@@ -1069,7 +1192,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 			payrexx_settings as ps_module,
 		)
 
-		transaction = {"id": 12345, "status": "confirmed"}
+		transaction = {"id": 12345, "status": "confirmed", "amount": 10000, "currency": "CHF"}
 		calls = []
 		complete_locked = ps_module._complete_locked_integration_request
 
@@ -1094,8 +1217,12 @@ class TestPayrexxSettings(IntegrationTestCase):
 		rollback.assert_called_once()
 		sleep.assert_called_once_with(0.25)
 		ir.reload()
-		self.assertEqual(ir.status, "Completed")
+		self.assertEqual(ir.status, "Failed")
 		self.assertEqual((frappe.parse_json(ir.data) or {})["payrexx_transaction"], transaction)
+		self.assertEqual(
+			(frappe.parse_json(ir.data) or {})["payrexx_settlement_conflict"]["code"],
+			"payment_request_reference_required",
+		)
 
 	def test_deadlock_retry_completes_request_and_creates_exactly_one_payment_entry(self):
 		from erpnext.accounts.doctype.payment_request.payment_request import (
@@ -1132,10 +1259,17 @@ class TestPayrexxSettings(IntegrationTestCase):
 				"status": "Queued",
 				"reference_doctype": "Payment Request",
 				"reference_docname": payment_request.name,
-				"data": "{}",
+				"data": json.dumps(
+					{"amount": payment_request.grand_total, "currency": payment_request.currency}
+				),
 			}
 		).insert(ignore_permissions=True)
-		confirmed = {"id": 54321, "status": "confirmed"}
+		confirmed = {
+			"id": 54321,
+			"status": "confirmed",
+			"amount": round(payment_request.grand_total * 100),
+			"currency": payment_request.currency,
+		}
 		savepoint = "payrexx_deadlock_retry"
 		frappe.db.savepoint(savepoint)
 		real_rollback = frappe.db.rollback
@@ -1282,10 +1416,17 @@ class TestPayrexxSettings(IntegrationTestCase):
 				"status": "Queued",
 				"reference_doctype": "Payment Request",
 				"reference_docname": payment_request.name,
-				"data": "{}",
+				"data": json.dumps(
+					{"amount": payment_request.grand_total, "currency": payment_request.currency}
+				),
 			}
 		).insert(ignore_permissions=True)
-		confirmed = {"id": 12345, "status": "confirmed"}
+		confirmed = {
+			"id": 12345,
+			"status": "confirmed",
+			"amount": round(payment_request.grand_total * 100),
+			"currency": payment_request.currency,
+		}
 
 		ps_module._complete_integration_request(integration_request.name, confirmed)
 		ps_module._complete_integration_request(integration_request.name, confirmed)
@@ -1322,16 +1463,284 @@ class TestPayrexxSettings(IntegrationTestCase):
 		)
 		self.assertEqual(chargeback_todos, [{"priority": "High", "status": "Open"}])
 
+	def test_settlement_conflict_is_structured_terminal_and_idempotent(self):
+		_sales_invoice, payment_request = _create_submitted_test_payment_request()
+		expected_amount = int(payment_request.grand_total * 100)
+		integration_request = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Queued",
+				"reference_doctype": "Payment Request",
+				"reference_docname": payment_request.name,
+				"data": json.dumps(
+					{
+						"payrexx_gateway_amount": expected_amount,
+						"payrexx_gateway_currency": payment_request.currency,
+					}
+				),
+			}
+		).insert(ignore_permissions=True)
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		conflicting_transaction = {
+			"id": 80001,
+			"status": "confirmed",
+			"amount": expected_amount + 1,
+			"currency": payment_request.currency,
+		}
+		ps_module._complete_integration_request(integration_request.name, conflicting_transaction)
+		integration_request.reload()
+		first_data = frappe.parse_json(integration_request.data) or {}
+		marker = first_data[ps_module.SETTLEMENT_CONFLICT_DATA_KEY]
+		self.assertEqual(integration_request.status, "Failed")
+		self.assertTrue(marker["terminal"])
+		self.assertEqual(marker["version"], 1)
+		self.assertEqual(marker["code"], "amount_mismatch")
+		self.assertEqual(marker["evidence"]["provider_amount"], expected_amount + 1)
+
+		# Even matching evidence on a later authentic replay cannot reopen a
+		# conflict after accounting review has become necessary.
+		ps_module._complete_integration_request(
+			integration_request.name,
+			{
+				"id": 80002,
+				"status": "confirmed",
+				"amount": expected_amount,
+				"currency": payment_request.currency,
+			},
+		)
+		integration_request.reload()
+		second_data = frappe.parse_json(integration_request.data) or {}
+		self.assertEqual(second_data[ps_module.SETTLEMENT_CONFLICT_DATA_KEY], marker)
+		self.assertEqual(second_data["payrexx_transaction"], conflicting_transaction)
+
+		# The public callback still authenticates a replay, then preserves the
+		# terminal marker instead of moving the request back to Authorized.
+		replay_body = json.dumps(
+			{
+				"transaction": {
+					"id": 80003,
+					"status": "authorized",
+					"referenceId": integration_request.name,
+				}
+			}
+		).encode("utf-8")
+		replay_signature = base64.b64encode(
+			hmac.new(b"whk_test_dummy", replay_body, hashlib.sha256).digest()
+		).decode("ascii")
+
+		class _ReplayRequest:
+			def __init__(self):
+				self.args = {}
+				self.form = {}
+
+			def get_data(self):
+				return replay_body
+
+		original_request = getattr(frappe.local, "request", None)
+		original_header = frappe.get_request_header
+		frappe.local.request = _ReplayRequest()
+		frappe.get_request_header = lambda name, default="": (  # type: ignore[assignment]
+			replay_signature if name == "X-Webhook-Signature" else default
+		)
+		try:
+			self.assertEqual(ps_module.callback(gateway_name=GATEWAY_NAME), {"ok": True})
+		finally:
+			frappe.get_request_header = original_header  # type: ignore[assignment]
+			if original_request is None:
+				delattr(frappe.local, "request")
+			else:
+				frappe.local.request = original_request
+		integration_request.reload()
+		replayed_data = frappe.parse_json(integration_request.data) or {}
+		self.assertEqual(integration_request.status, "Failed")
+		self.assertEqual(replayed_data[ps_module.SETTLEMENT_CONFLICT_DATA_KEY], marker)
+		self.assertEqual(replayed_data["payrexx_transaction"], conflicting_transaction)
+		self.assertEqual(
+			len(
+				frappe.get_all(
+					"ToDo",
+					filters={
+						"reference_type": "Integration Request",
+						"reference_name": integration_request.name,
+						"description": [
+							"like",
+							f"{ps_module.SETTLEMENT_CONFLICT_TODO_MARKER}%",
+						],
+					},
+					pluck="name",
+				)
+			),
+			1,
+		)
+		self.assertFalse(
+			frappe.db.exists(
+				"Payment Entry Reference",
+				{"payment_request": payment_request.name, "docstatus": 1},
+			)
+		)
+
+	def test_confirmation_requires_submitted_payment_request_and_source_document(self):
+		sales_invoice = _create_submitted_test_sales_invoice()
+		draft_request = frappe.get_doc(
+			{
+				"doctype": "Payment Request",
+				"payment_request_type": "Inward",
+				"reference_doctype": "Sales Invoice",
+				"reference_name": sales_invoice.name,
+				"payment_gateway": "_Test Gateway",
+				"currency": sales_invoice.currency,
+				"company": sales_invoice.company,
+				"grand_total": sales_invoice.outstanding_amount,
+				"party_type": "Customer",
+				"party": sales_invoice.customer,
+				"party_name": sales_invoice.customer_name,
+				"email_to": "payrexx-test@example.com",
+				"mute_email": 1,
+			}
+		).insert(ignore_permissions=True)
+		integration_request = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Queued",
+				"reference_doctype": "Payment Request",
+				"reference_docname": draft_request.name,
+				"data": json.dumps(
+					{
+						"payrexx_gateway_amount": int(draft_request.grand_total * 100),
+						"payrexx_gateway_currency": draft_request.currency,
+					}
+				),
+			}
+		).insert(ignore_permissions=True)
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		ps_module._complete_integration_request(
+			integration_request.name,
+			{
+				"id": 81001,
+				"status": "confirmed",
+				"amount": int(draft_request.grand_total * 100),
+				"currency": draft_request.currency,
+			},
+		)
+		integration_request.reload()
+		self.assertEqual(
+			(frappe.parse_json(integration_request.data) or {})[ps_module.SETTLEMENT_CONFLICT_DATA_KEY][
+				"code"
+			],
+			"payment_request_not_active",
+		)
+
+		_source_invoice, submitted_request = _create_submitted_test_payment_request()
+		frappe.db.set_value("Sales Invoice", submitted_request.reference_name, "docstatus", 0)
+		source_request = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Queued",
+				"reference_doctype": "Payment Request",
+				"reference_docname": submitted_request.name,
+				"data": json.dumps(
+					{
+						"payrexx_gateway_amount": int(submitted_request.grand_total * 100),
+						"payrexx_gateway_currency": submitted_request.currency,
+					}
+				),
+			}
+		).insert(ignore_permissions=True)
+		ps_module._complete_integration_request(
+			source_request.name,
+			{
+				"id": 81002,
+				"status": "confirmed",
+				"amount": int(submitted_request.grand_total * 100),
+				"currency": submitted_request.currency,
+			},
+		)
+		source_request.reload()
+		self.assertEqual(
+			(frappe.parse_json(source_request.data) or {})[ps_module.SETTLEMENT_CONFLICT_DATA_KEY]["code"],
+			"source_document_not_submitted",
+		)
+
+	def test_confirmation_rejects_ambiguous_foreign_currency_accounting_path(self):
+		_sales_invoice, payment_request = _create_submitted_test_payment_request()
+		foreign_currency = "EUR" if payment_request.currency != "EUR" else "CHF"
+		frappe.db.set_value(
+			"Payment Request",
+			payment_request.name,
+			"party_account_currency",
+			foreign_currency,
+		)
+		payment_request.reload()
+		expected_amount = int(payment_request.grand_total * 100)
+		integration_request = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Queued",
+				"reference_doctype": "Payment Request",
+				"reference_docname": payment_request.name,
+				"data": json.dumps(
+					{
+						"payrexx_gateway_amount": expected_amount,
+						"payrexx_gateway_currency": payment_request.currency,
+					}
+				),
+			}
+		).insert(ignore_permissions=True)
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		ps_module._complete_integration_request(
+			integration_request.name,
+			{
+				"id": 82001,
+				"status": "confirmed",
+				"amount": expected_amount,
+				"currency": payment_request.currency,
+			},
+		)
+		integration_request.reload()
+		marker = (frappe.parse_json(integration_request.data) or {})[ps_module.SETTLEMENT_CONFLICT_DATA_KEY]
+		self.assertEqual(marker["code"], "unsupported_currency_context")
+		self.assertEqual(
+			marker["evidence"]["payment_request"]["party_account_currency"],
+			foreign_currency,
+		)
+		self.assertFalse(
+			frappe.db.exists(
+				"Payment Entry Reference",
+				{"payment_request": payment_request.name, "docstatus": 1},
+			)
+		)
+
 	def test_success_reconciliation_marks_integration_request_completed(self):
+		_sales_invoice, payment_request = _create_submitted_test_payment_request()
 		ir = frappe.get_doc(
 			{
 				"doctype": "Integration Request",
 				"integration_request_service": "Payrexx",
 				"status": "Queued",
+				"reference_doctype": "Payment Request",
+				"reference_docname": payment_request.name,
 				"data": json.dumps(
 					{
 						"payrexx_gateway_id": 999,
 						"payment_gateway": "Payrexx-" + GATEWAY_NAME,
+						"payrexx_gateway_amount": int(payment_request.grand_total * 100),
+						"payrexx_gateway_currency": payment_request.currency,
 					}
 				),
 			}
@@ -1342,11 +1751,13 @@ class TestPayrexxSettings(IntegrationTestCase):
 				self.gateway_id = gateway_id
 				return {
 					"id": gateway_id,
-					"status": "confirmed",
+					"status": "waiting",
 					"invoices": [
 						{
 							"transactions": [
 								{
+									"amount": int(payment_request.grand_total * 100),
+									"currency": payment_request.currency,
 									"id": 12345,
 									"status": "confirmed",
 									"referenceId": ir.name,

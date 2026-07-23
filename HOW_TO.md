@@ -96,6 +96,11 @@ Links generated before gateway binding was introduced did not include
 are rejected as ambiguous when multiple rows exist; resend the invoice email to
 issue a gateway-bound link.
 
+Payrexx supports only Payment Requests sourced from Sales Invoices. Do not
+select a Payrexx gateway on a Sales Order or another source doctype: the app
+rejects it before creating a provider checkout because Sales Order advance
+payable/idempotency behavior is not implemented.
+
 If an older active Integration Request has no recoverable checkout URL, the app
 shows an error instead of creating a second potentially chargeable checkout;
 review that Integration Request in Desk.
@@ -109,8 +114,10 @@ override is set, every generated Gateway returns through:
 GET https://<site>/api/method/payrexx_integration.api.payment_success?ir=<Integration Request>&gateway_name=<Payrexx Settings name>
 ```
 
-That endpoint asks Payrexx for the Gateway status server-side and only marks the
-Integration Request complete when Payrexx reports a confirmed payment.
+That endpoint retrieves the Payrexx Gateway server-side and only marks the
+Integration Request complete when its invoices contain an actual confirmed
+transaction. A Gateway-level `confirmed` status without a confirmed transaction
+does not settle or return success.
 Because this return is an HTTP GET, terminal server-verified reconciliation
 requests Frappe's end-of-request commit before redirecting; waiting results do
 not. A success page with unchanged accounting records indicates an outdated
@@ -130,7 +137,8 @@ recovery procedure.
 When a payment creator stored `redirect_to` in the Integration Request, the
 endpoint sends the customer directly back to that same-site URL after
 reconciliation instead of showing the generic `/payment-success` page. If the
-Gateway is not confirmed, the customer is sent to `/payment-failed`. Apps that
+Gateway contains no confirmed transaction, the customer is sent to
+`/payment-failed`. Apps that
 need a branded failed-payment state can pass `failed_redirect_to` and
 `cancel_redirect_to` to `get_payment_url()` for that individual checkout.
 
@@ -212,6 +220,28 @@ For a confirmed invoice payment, verify this chain rather than relying only on t
 2. The linked ERPNext `Payment Request` is **Paid** with zero outstanding.
 3. Exactly one submitted `Payment Entry` references that Payment Request.
 4. The Sales Invoice outstanding amount reflects the submitted Payment Entry.
+
+If the Integration Request is **Failed** with a high-priority **Payrexx
+settlement conflict** ToDo, Payrexx confirmed funds after the Payment Request or
+invoice had already changed through another channel, or the provider amount /
+currency evidence did not match. Do not retry the checkout or manually mark the
+request Paid. Compare the confirmed Payrexx transaction, Payment Request,
+invoice outstanding amount, and any bank/manual Payment Entries; then refund or
+allocate the provider funds under the normal accounting approval process and
+close the ToDo. The conflict is terminal: webhook retries, the browser success
+URL, and manual edits to the Integration Request status do not constitute a
+resolution and must not create a Payment Entry. There is currently no automated
+reopen action. If an automated resolution path is added later, use it only after
+its separate accounting approval and idempotency contract is documented and
+deployed.
+
+Payrexx checkout creation supports only Currency masters with 100 fraction
+units and amounts exactly representable to two decimal places. It also settles
+only same-currency accounting paths where the Payment Request, Sales Invoice,
+party account, and payment account currencies agree. For a rejected
+foreign-currency or non-two-decimal case, use an approved manual payment method
+or configure a same-currency bank/payment account; never round the invoice or
+edit stored provider evidence to force reconciliation.
 
 When Payrexx reports a chargeback:
 
@@ -301,7 +331,10 @@ ERPNext records as acceptance evidence; never add destructive provider cleanup.
 
 ```bash
 cd frappe-bench
-bench --site development16.localhost run-tests --app payrexx_integration \
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_settlement_validation
+
+bench --site development16.localhost run-tests \
   --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings
 
 bench --site development16.localhost run-tests \

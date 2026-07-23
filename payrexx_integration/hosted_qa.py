@@ -12,6 +12,8 @@ from frappe import _
 from frappe.utils import cint, cstr, flt, getdate, nowdate
 
 from payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings import (
+	_canonical_gateway_amount,
+	_provider_gateway_amount,
 	get_webhook_url,
 )
 
@@ -52,7 +54,15 @@ def preflight(run_id: str) -> dict[str, Any]:
 			"reference_name": invoice.name,
 			"docstatus": ["<", 2],
 		},
-		fields=["name", "docstatus", "status", "payment_gateway", "payment_url"],
+		fields=[
+			"name",
+			"docstatus",
+			"status",
+			"payment_gateway",
+			"payment_url",
+			"grand_total",
+			"currency",
+		],
 		order_by="creation asc",
 	)
 	if len(payment_requests) > 1:
@@ -107,11 +117,17 @@ def preflight(run_id: str) -> dict[str, Any]:
 				_("The Integration Request is not bound to the configured Payrexx gateway."),
 				frappe.ValidationError,
 			)
+		canonical_amount = _canonical_gateway_amount(
+			payment_request.grand_total,
+			payment_request.currency,
+		)
 		checkout_present = bool(
 			payment_request.payment_url
 			and request_data.get("payrexx_gateway_id")
 			and request_data.get("payrexx_gateway_hash")
 			and request_data.get("payrexx_checkout_url")
+			and request_data.get("payrexx_gateway_amount") == canonical_amount
+			and request_data.get("payrexx_gateway_currency") == payment_request.currency
 		)
 		if not checkout_present:
 			frappe.throw(
@@ -176,7 +192,13 @@ def inspect_settlement(
 	provider_reference = transaction_invoice.get("referenceId") or transaction.get("referenceId")
 	provider_currency = _provider_transaction_currency(settings, request_data, transaction)
 	provider_mode = cstr(transaction.get("mode")).upper()
-	expected_amount_cents = cint(round(flt(payment_request.grand_total, 2) * 100))
+	canonical_request_amount = request_data.get("payrexx_gateway_amount")
+	canonical_request_currency = cstr(request_data.get("payrexx_gateway_currency")).upper()
+	expected_amount_cents = _canonical_gateway_amount(payment_request.grand_total, payment_request.currency)
+	try:
+		provider_amount = _provider_gateway_amount(transaction.get("amount"))
+	except ValueError:
+		provider_amount = None
 
 	payment_reference_rows = frappe.get_all(
 		"Payment Entry Reference",
@@ -206,10 +228,12 @@ def inspect_settlement(
 		"integration_request_completed": integration_request.status == "Completed",
 		"integration_request_error_empty": not integration_request.error,
 		"integration_request_gateway_bound": request_data.get("payrexx_settings") == settings.name,
+		"integration_request_amount_bound": canonical_request_amount == expected_amount_cents,
+		"integration_request_currency_bound": canonical_request_currency == payment_request.currency,
 		"provider_transaction_confirmed": cstr(transaction.get("status")).lower() == "confirmed",
 		"provider_transaction_test_mode": provider_mode == "TEST",
-		"provider_transaction_amount_exact": cint(transaction.get("amount")) == expected_amount_cents,
-		"provider_transaction_currency_exact": provider_currency == payment_request.currency,
+		"provider_transaction_amount_exact": provider_amount == canonical_request_amount,
+		"provider_transaction_currency_exact": provider_currency == canonical_request_currency,
 		"provider_transaction_reference_exact": provider_reference == integration_request.name,
 		"provider_transaction_identifier_present": bool(transaction.get("id") or transaction.get("uuid")),
 		"payment_request_submitted": payment_request.docstatus == 1,

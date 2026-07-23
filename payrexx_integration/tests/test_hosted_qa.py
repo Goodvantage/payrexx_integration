@@ -162,6 +162,20 @@ class TestHostedPayrexxQA(IntegrationTestCase):
 		self.assertNotIn("payment_url", serialized)
 		self.assertNotIn("checkout_url", serialized)
 
+	def test_preflight_rejects_checkout_without_canonical_amount_evidence(self):
+		_payment_request, integration_request_name = self.create_checkout()
+		integration_request = frappe.get_doc("Integration Request", integration_request_name)
+		request_data = frappe.parse_json(integration_request.data) or {}
+		request_data.pop("payrexx_gateway_amount")
+		integration_request.db_set("data", frappe.as_json(request_data), update_modified=False)
+
+		with (
+			self.configured(),
+			patch.object(payrexx_settings_module.PayrexxSettings, "_ping"),
+			self.assertRaises(frappe.ValidationError),
+		):
+			preflight(RUN_ID)
+
 	def test_preflight_rejects_failed_integration_request(self):
 		_payment_request, integration_request = self.create_checkout()
 		frappe.db.set_value("Integration Request", integration_request, "status", "Failed")

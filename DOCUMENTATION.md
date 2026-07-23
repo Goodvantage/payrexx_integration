@@ -67,6 +67,15 @@ the app recovers the URL recorded in its active Integration Request. An active
 request with no recoverable URL raises a clean error rather than creating a
 potential duplicate checkout.
 
+Payrexx checkout and automatic settlement support only Payment Requests whose
+source is a Sales Invoice. The controller checks the Payment Request source
+before creating an Integration Request or calling Payrexx. Sales Orders and
+other source doctypes are rejected because this app does not implement their
+advance-payment payable and idempotency semantics. If an unsupported checkout
+predates this guard, confirmation records a terminal settlement conflict and
+does not call `set_as_paid()`, preventing a Sales Order from receiving a second
+advance.
+
 The pay-by-email endpoint is necessarily an HTTP GET. Frappe normally rolls
 back GET transactions, so `pay_invoice` sets the framework end-of-request commit
 flag only after Payment Request creation and checkout URL resolution both
@@ -124,11 +133,43 @@ as `Administrator`. The `pay_invoice` redirect endpoint uses the same
 least-privilege resolution (`session_utils.as_automation_user`) for its lazy
 Payment Request creation — no guest path runs as a hardcoded Administrator
 when an automation user is configured. A confirmed Integration Request that
-references an ERPNext Payment Request calls the standard `set_as_paid()` method
-under a row lock. This creates and submits one Payment Entry and lets ERPNext
-update the Payment Request status/outstanding amount and the source invoice
-outstanding amount. Other reference types continue to receive their existing
-`on_payment_authorized("Completed")` hook.
+references a supported ERPNext Payment Request calls the standard
+`set_as_paid()` method under a row lock. This creates and submits one Payment
+Entry and lets ERPNext update the Payment Request status/outstanding amount and
+the Sales Invoice outstanding amount. Confirmed Payrexx settlement validation
+requires this Payment Request/Sales Invoice chain; generic references and other
+Payment Request source doctypes cannot reach the authorization side effect.
+
+Before that side effect, confirmation fails closed unless the Integration
+Request references an existing inward Payment Request that is submitted and
+still `Requested`, and that request references an existing submitted source
+document. The locked Payment Request must remain fully unpaid and unchanged,
+and the source must still have enough outstanding value for the checkout.
+
+New checkout requests persist `payrexx_gateway_amount` as the exact integer sent
+to Payrexx and `payrexx_gateway_currency` as its normalized currency. Settlement
+compares provider evidence directly with those canonical values. Legacy
+in-flight requests without those keys are accepted only when their original
+amount converts exactly to the same two-decimal integer. Gateway creation
+rejects sub-cent values and Currency masters whose `fraction_units` is not 100;
+it never rounds an unsupported value into a different charge.
+
+Settlement also requires the checkout, Payment Request, Sales Invoice, party
+account, and payment account currencies to agree. This supports the unambiguous
+same-currency path and conservatively rejects foreign-currency accounting paths
+whose ERPNext outstanding and gateway amounts use different units. A
+bank/manual partial or full payment therefore cannot be followed by a second
+automatic Payrexx ledger entry.
+
+The Integration Request becomes `Failed`, keeps the confirmed provider
+transaction, and stores a versioned `payrexx_settlement_conflict` object with a
+terminal flag, stable reason code, timestamp, and non-PII evidence snapshot. It
+also receives one high-priority settlement-conflict ToDo. Later authentic
+webhook and success-return replays preserve the first marker/evidence and cannot
+settle or reopen the request. No automated conflict-resolution endpoint exists;
+the supported path is accounting review followed by an approved refund or
+allocation and ToDo closure. Any future automated reopen flow requires a new
+explicit, tested contract.
 
 When settlement creates a Payment Entry, its exact name is stored in the
 Integration Request data as `payrexx_payment_entry` in the same transaction.
@@ -166,13 +207,20 @@ GET /api/method/payrexx_integration.api.payment_success?ir=<Integration Request>
 
 Payrexx success redirects reconcile the Integration Request by fetching the
 Gateway from Payrexx server-side. Webhooks remain the primary completion path,
-but the success return is a safe fallback because payment side effects only run
-after Payrexx reports the Gateway or one of its transactions as `confirmed`.
+but the success return is a safe fallback because payment side effects run only
+when `invoices[].transactions[]` contains an actual `confirmed` transaction. A
+Gateway-level `confirmed` status without such a transaction is not settlement
+evidence and follows the failed-payment route. An already-Completed Integration
+Request likewise returns success only when its stored `payrexx_transaction` is
+confirmed.
 The return endpoint is an HTTP GET, so it requests Frappe's end-of-request
 commit only after server verification reaches a Completed or Failed terminal
 state. Waiting/non-terminal provider results remain non-committing. Without this
 flag, the browser could receive `/payment-success` while the Integration Request,
 Payment Request, Payment Entry, and invoice settlement all rolled back.
+If provider confirmation is genuine but the pre-settlement checks record an
+amount/currency or second-channel conflict, reconciliation returns false and the
+browser follows the failed-payment route rather than displaying a false success.
 The credentials used for that confirmation come from the Integration Request's
 own stored gateway (`payrexx_settings`, falling back to `payment_gateway`); the
 caller-supplied `gateway_name` parameter is only honoured for legacy requests
@@ -199,8 +247,9 @@ later duplicate confirmation cannot move the chargeback request back to
 
 ## Supported Payment Operations
 
-The client creates hosted Gateways and retrieves Gateway/Transaction state.
-Webhook and success-return reconciliation settle only `confirmed` payments.
+The client creates hosted Gateways and retrieves Gateway/Transaction state for
+Sales-Invoice-backed Payment Requests. Webhook and success-return reconciliation
+settle only actual `confirmed` transactions; Gateway status alone cannot settle.
 `authorized` and `reserved` callbacks record the Integration Request as
 `Authorized`, but this app has no later-charge or capture operation.
 `cancelled`, `declined`, `error`, and `expired` callbacks mark the request
@@ -232,14 +281,16 @@ config. The invoice amount may not exceed 500 currency units.
 Preflight performs the live Payrexx credential ping and validates the exact
 submitted, fully unpaid invoice, supported currency, webhook URL, secrets, and
 company/currency Payment Gateway Account. It accepts either no checkout or one
-submitted pending Payment Request with one complete Integration Request. It
+submitted pending Payment Request with one complete Integration Request whose
+stored canonical gateway amount/currency exactly match that request. It
 returns only document names, statuses, amount, and callback host/path; signed
 payment and provider checkout URLs are never returned.
 
 Settlement inspection is read-only. It does not call `payment_success`,
 `reconcile_integration_request`, the callback, or provider mutations. It requires a
-provider `confirmed` transaction in `TEST` mode with the exact amount, currency,
-and Integration Request reference; a Completed Integration Request carrying the
+provider `confirmed` transaction in `TEST` mode whose amount/currency match the
+Integration Request's persisted canonical gateway values and Payment Request,
+plus the exact Integration Request reference; a Completed request carrying the
 exact settlement-created Payment Entry name; Paid and zero-outstanding Payment
 Request and Sales Invoice; and exactly one submitted Payment Entry allocating
 its full account-currency paid amount to the invoice. A locally settled record
@@ -271,7 +322,10 @@ does not import the downstream app or interpret its site-config keys.
 
 ```bash
 cd frappe-bench
-bench --site development16.localhost run-tests --app payrexx_integration \
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_settlement_validation
+
+bench --site development16.localhost run-tests \
   --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings
 
 bench --site development16.localhost run-tests \

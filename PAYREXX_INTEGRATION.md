@@ -32,7 +32,7 @@ automatically the first time you save `Payrexx Settings` — no fixture needed.
 End-to-end flow:
 
 ```
-Reference doc (Sales Invoice / Payment Request / Web Form)
+Sales Invoice-backed Payment Request
         │
         │ get_payment_url()        ← controller method on Payrexx Settings
         ▼
@@ -48,9 +48,9 @@ Payrexx → POST callback URL (webhook)
         │  • verify X-Webhook-Signature (HMAC-SHA256 of raw body)
         │  • lookup Integration Request by referenceId
         │  • update status → Completed / Authorized / Failed
-        │  • run reference_doc.on_payment_authorized("Completed")
+        │  • settle the Payment Request through set_as_paid()
         ▼
-Customer returns through server-side reconciliation; confirmed payments then
+Customer returns through server-side reconciliation; a confirmed transaction then
 redirect to the same-site redirect_to when present, otherwise /payment-success
 ```
 
@@ -195,8 +195,12 @@ convenience (see `payrexx_settings.js`).
 
 ### 4.4 Use it
 
-In a `Payment Request` (or any flow that takes a Payment Gateway), pick
+In a `Payment Request` sourced from a submitted Sales Invoice, pick
 `Payrexx-Live`. On submit, the customer gets a Payrexx hosted checkout URL.
+Payment Requests sourced from Sales Orders or any other doctype are rejected
+before an Integration Request or provider Gateway is created. This integration
+does not implement Sales Order advance-payable/idempotency semantics and must
+not be used to create order advances.
 
 ---
 
@@ -257,7 +261,7 @@ In a `Payment Request` (or any flow that takes a Payment Gateway), pick
 
 | Payrexx `transaction.status` | Integration Request status | Notes |
 |---|---|---|
-| `confirmed` | `Completed` | Runs `on_payment_authorized` on the reference doc |
+| `confirmed` | `Completed` or terminal `Failed` conflict | Settles only a supported Sales Invoice-backed Payment Request after exact provider evidence validation |
 | `authorized` | `Authorized` | State is recorded; later charging is not implemented |
 | `reserved` | `Authorized` | State is recorded; capture is not implemented |
 | `waiting` | unchanged | In-progress; expect another webhook |
@@ -268,6 +272,12 @@ In a `Payment Request` (or any flow that takes a Payment Gateway), pick
 The integration does not initiate capture, later-charge, void/cancel, or refund
 operations. Perform those provider actions in Payrexx and post the approved
 ERPNext accounting reversal manually.
+
+Success-return reconciliation requires a confirmed transaction inside the
+retrieved Gateway's `invoices[].transactions[]`. A Gateway-level `confirmed`
+status by itself never settles the Payment Request or produces a success return.
+Unsupported legacy/in-flight Payment Requests become terminal settlement
+conflicts without calling `set_as_paid()`.
 
 ### Webhook signature
 
@@ -282,6 +292,18 @@ strict.
 
 ## 6. Testing checklist
 
+Run the app-owned Python suites with separate module commands:
+
+```bash
+cd /workspace/development/frappe-bench
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_settlement_validation
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_hosted_qa
+```
+
 - [ ] `bench --site <site> migrate` runs cleanly; `Payrexx Settings` appears in
       the DocType list.
 - [ ] Saving a settings row creates a `Payment Gateway` named
@@ -290,20 +312,15 @@ strict.
       company, currency, and receiving account.
 - [ ] In `bench console`:
       ```python
-      frappe.get_doc("Payrexx Settings", "Live").get_payment_url(
-          amount=10, currency="CHF",
-          reference_doctype="Sales Invoice", reference_docname="ACC-SINV-...",
-          payer_name="Test User", payer_email="test@example.com",
-          description="Smoke test",
-      )
+      frappe.get_doc("Payment Request", "ACC-PRQ-...").get_payment_url()
       # → returns a https://<instance>.payrexx.com/...?... URL
       ```
 - [ ] Completing a sandbox payment fires the webhook; the matching
       `Integration Request` flips to `Completed`.
 - [ ] Forging a request with a wrong `X-Webhook-Signature` is rejected
       (check `Error Log`).
-- [ ] The reference doc's `on_payment_authorized` method fires (e.g. Payment
-      Request → Status = Paid for an ERPNext flow).
+- [ ] The Sales Invoice-backed Payment Request becomes Paid through
+      `set_as_paid()`, with exactly one submitted Payment Entry.
 - [ ] A `cancel` from the Payrexx checkout returns the user to
       `/payment-failed` and the Integration Request stays `Queued` (no webhook
       until status actually changes) or transitions to `Failed`.

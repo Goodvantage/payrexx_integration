@@ -2,13 +2,14 @@
 # For license information, please see license.txt
 
 import time
+from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 
 import frappe
 from frappe import _
 from frappe.integrations.utils import create_request_log
 from frappe.model.document import Document
-from frappe.utils import call_hook_method, cint, cstr, flt
+from frappe.utils import call_hook_method, cint, cstr, flt, now_datetime
 from payments.utils import create_payment_gateway
 
 from payrexx_integration.gateway_selection import resolve_payrexx_settings
@@ -20,6 +21,9 @@ from payrexx_integration.url_utils import get_public_url, safe_return_url
 
 PAYMENT_AUTHORIZED_MAX_ATTEMPTS = 3
 CHARGEBACK_TODO_MARKER = "[Payrexx chargeback]"
+SETTLEMENT_CONFLICT_TODO_MARKER = "[Payrexx settlement conflict]"
+SETTLEMENT_CONFLICT_DATA_KEY = "payrexx_settlement_conflict"
+SETTLEMENT_CONFLICT_VERSION = 1
 
 
 class PayrexxSettings(Document):
@@ -37,19 +41,25 @@ class PayrexxSettings(Document):
 		call_hook_method("payment_gateway_enabled", gateway="Payrexx-" + self.gateway_name)
 
 	def validate_transaction_currency(self, currency):
+		currency = cstr(currency).strip().upper()
 		if currency not in self._supported_currencies():
 			frappe.throw(
 				_("Currency {0} is not supported by Payrexx gateway {1}.").format(currency, self.gateway_name)
 			)
+		try:
+			_validate_gateway_currency(currency)
+		except ValueError as exc:
+			frappe.throw(cstr(exc))
 
 	def get_payment_url(self, **kwargs):
 		"""
 		Create a Payrexx Gateway and return the hosted checkout URL.
 
-		kwargs originate from Payment Request / Subscription / Web Form and include:
+		kwargs originate from a Sales Invoice-backed Payment Request and include:
 		  amount, currency, reference_doctype, reference_docname,
 		  payer_name, payer_email, description, redirect_to, title
 		"""
+		self._validate_payment_request_source(kwargs)
 		try:
 			integration_request = create_request_log(kwargs, service_name="Payrexx")
 
@@ -60,6 +70,8 @@ class PayrexxSettings(Document):
 			data["payrexx_gateway_id"] = gateway.get("id")
 			data["payrexx_gateway_hash"] = gateway.get("hash")
 			data["payrexx_checkout_url"] = gateway.get("link")
+			data["payrexx_gateway_amount"] = payload["amount"]
+			data["payrexx_gateway_currency"] = payload["currency"]
 			# Authoritative record of which settings row created this request —
 			# the webhook only accepts callbacks verified with this row's key.
 			data["payrexx_settings"] = self.name
@@ -112,11 +124,26 @@ class PayrexxSettings(Document):
 		raw = self.supported_currencies or "CHF"
 		return {c.strip().upper() for c in raw.split(",") if c.strip()}
 
+	def _validate_payment_request_source(self, kwargs: dict) -> None:
+		if kwargs.get("reference_doctype") != "Payment Request":
+			frappe.throw(_("Payrexx supports only Payment Requests for Sales Invoices."))
+
+		payment_request = frappe.db.get_value(
+			"Payment Request",
+			kwargs.get("reference_docname"),
+			["reference_doctype", "reference_name"],
+			as_dict=True,
+		)
+		if not payment_request:
+			frappe.throw(_("Referenced Payment Request was not found."))
+		if payment_request.reference_doctype != "Sales Invoice":
+			frappe.throw(_("Payrexx supports only Payment Requests for Sales Invoices."))
+		if not payment_request.reference_name:
+			frappe.throw(_("The Payment Request does not identify a Sales Invoice."))
+
 	def _build_create_gateway_payload(self, kwargs: dict, integration_request_name: str) -> dict:
-		# Payrexx wants the amount in the smallest currency unit (e.g. cents).
-		# Round to 2 decimals first so float artifacts cannot shift a cent.
-		amount_cents = cint(round(flt(kwargs.get("amount"), 2) * 100))
-		currency = (kwargs.get("currency") or "CHF").upper()
+		currency = cstr(kwargs.get("currency") or "CHF").strip().upper()
+		amount_cents = _canonical_gateway_amount(kwargs.get("amount"), currency)
 		payer_name = (kwargs.get("payer_name") or "").strip()
 		first, last = [*payer_name.split(" ", 1), ""][:2] if payer_name else ("", "")
 
@@ -258,6 +285,13 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 			)
 			return {"ok": True}
 
+		# A confirmed settlement conflict is an accounting terminal state. Keep
+		# authenticating replays, but never let a later status silently reopen it.
+		if ir_data.get(SETTLEMENT_CONFLICT_DATA_KEY):
+			if status == "chargeback":
+				_mark_chargeback(ir.name, txn)
+			return {"ok": True}
+
 		if status == "confirmed":
 			_complete_integration_request(ir.name, txn)
 		elif status in ("authorized", "reserved"):
@@ -340,10 +374,12 @@ def reconcile_integration_request(
 	ir = frappe.get_doc("Integration Request", integration_request_name)
 	if ir.integration_request_service != "Payrexx":
 		return False
-	if ir.status == "Completed":
-		return True
-
 	ir_data = frappe.parse_json(ir.data) or {}
+	if ir_data.get(SETTLEMENT_CONFLICT_DATA_KEY):
+		return False
+	if ir.status == "Completed":
+		stored_transaction = ir_data.get("payrexx_transaction") or {}
+		return (stored_transaction.get("status") or "").lower() == "confirmed"
 	gateway_id = ir_data.get("payrexx_gateway_id")
 	if not gateway_id:
 		return False
@@ -355,14 +391,14 @@ def reconcile_integration_request(
 		ir_data.get("payrexx_settings") or _settings_name_from_request_data(ir_data) or gateway_name
 	)
 	gateway = settings._client().retrieve_gateway(int(gateway_id))
-	status = (gateway.get("status") or "").lower()
 	transaction = _confirmed_transaction_from_gateway(gateway)
 
-	if status == "confirmed" or (transaction and (transaction.get("status") or "").lower() == "confirmed"):
-		_complete_integration_request(ir.name, transaction or gateway)
-		return True
+	if transaction:
+		_complete_integration_request(ir.name, transaction)
+		return frappe.db.get_value("Integration Request", ir.name, "status") == "Completed"
+	status = (gateway.get("status") or "").lower()
 	if status == "chargeback":
-		_mark_chargeback(ir.name, transaction or gateway)
+		_mark_chargeback(ir.name, gateway)
 	elif status in ("cancelled", "declined", "error", "expired"):
 		ir.status = "Failed"
 		ir.error = f"Payrexx status: {status}"
@@ -381,7 +417,16 @@ def _confirmed_transaction_from_gateway(gateway: dict) -> dict:
 	for invoice in gateway.get("invoices") or []:
 		for transaction in invoice.get("transactions") or []:
 			if (transaction.get("status") or "").lower() == "confirmed":
-				return transaction
+				amount = transaction.get("amount")
+				if amount is None:
+					amount = invoice.get("amount", gateway.get("amount"))
+				return {
+					**transaction,
+					"amount": amount,
+					"currency": transaction.get("currency")
+					or invoice.get("currency")
+					or gateway.get("currency"),
+				}
 	return {}
 
 
@@ -407,11 +452,16 @@ def _complete_locked_integration_request(
 	previous_transaction = ir_data.get("payrexx_transaction") or {}
 	if (previous_transaction.get("status") or "").lower() == "chargeback":
 		return
+	if ir_data.get(SETTLEMENT_CONFLICT_DATA_KEY):
+		return
 	if integration_request.status == "Completed":
 		return
 
 	if transaction:
 		ir_data["payrexx_transaction"] = transaction
+	if conflict := _settlement_conflict(integration_request, ir_data, transaction or {}):
+		_mark_settlement_conflict(integration_request, ir_data, conflict)
+		return
 	integration_request.data = frappe.as_json(ir_data)
 	integration_request.status = "Completed"
 	integration_request.error = ""
@@ -449,6 +499,279 @@ def _set_payment_request_as_paid(payment_request_name: str) -> str | None:
 		return None
 	payment_entry = payment_request.set_as_paid()
 	return payment_entry.name if payment_entry else None
+
+
+def _canonical_gateway_amount(amount, currency: str) -> int:
+	"""Convert a two-decimal checkout amount to Payrexx's canonical integer unit."""
+	currency = cstr(currency).strip().upper()
+	_validate_gateway_currency(currency)
+	try:
+		decimal_amount = Decimal(str(amount))
+	except (InvalidOperation, TypeError, ValueError):
+		raise ValueError(_("Payment amount is invalid."))
+	if not decimal_amount.is_finite() or decimal_amount <= 0:
+		raise ValueError(_("Payment amount must be a positive finite number."))
+	scaled_amount = decimal_amount * 100
+	if scaled_amount != scaled_amount.to_integral_value():
+		raise ValueError(_("Payment amount has precision smaller than the supported currency unit."))
+	return int(scaled_amount)
+
+
+def _validate_gateway_currency(currency: str) -> None:
+	fraction_units = frappe.db.get_value("Currency", currency, "fraction_units")
+	if cint(fraction_units) != 100:
+		raise ValueError(
+			_("Currency {0} does not have a supported two-decimal fraction unit.").format(currency or "?")
+		)
+
+
+def _provider_gateway_amount(amount) -> int:
+	try:
+		decimal_amount = Decimal(str(amount))
+	except (InvalidOperation, TypeError, ValueError):
+		raise ValueError(_("Provider amount is invalid."))
+	if not decimal_amount.is_finite() or decimal_amount != decimal_amount.to_integral_value():
+		raise ValueError(_("Provider amount must be an integer in the smallest currency unit."))
+	return int(decimal_amount)
+
+
+def _conflict(code: str, reason: str, evidence: dict | None = None) -> dict:
+	return {"code": code, "reason": reason, "evidence": evidence or {}}
+
+
+def _settlement_conflict(integration_request, ir_data: dict, transaction: dict) -> dict | None:
+	provider_amount = transaction.get("amount")
+	provider_currency = transaction.get("currency")
+	provider_invoice = transaction.get("invoice") or {}
+	if provider_amount is None:
+		provider_amount = provider_invoice.get("amount")
+	if not provider_currency:
+		provider_currency = provider_invoice.get("currency")
+
+	expected_amount = ir_data.get("payrexx_gateway_amount")
+	expected_currency = ir_data.get("payrexx_gateway_currency") or ir_data.get("currency")
+	evidence = {
+		"expected_gateway_amount": expected_amount,
+		"expected_currency": cstr(expected_currency).strip().upper() or None,
+		"provider_amount": provider_amount,
+		"provider_currency": cstr(provider_currency).strip().upper() or None,
+	}
+	if provider_amount is None or not provider_currency:
+		return _conflict(
+			"provider_evidence_missing",
+			_("Provider confirmation does not contain an amount and currency."),
+			evidence,
+		)
+	if not expected_currency:
+		return _conflict(
+			"checkout_evidence_missing",
+			_("The original payment request does not contain an amount and currency."),
+			evidence,
+		)
+	try:
+		provider_integer = _provider_gateway_amount(provider_amount)
+		if expected_amount is None:
+			expected_integer = _canonical_gateway_amount(ir_data.get("amount"), expected_currency)
+		else:
+			expected_integer = _provider_gateway_amount(expected_amount)
+	except ValueError as exc:
+		return _conflict("invalid_amount_or_currency", cstr(exc), evidence)
+	evidence["expected_gateway_amount"] = expected_integer
+	evidence["provider_amount"] = provider_integer
+	if provider_integer != expected_integer:
+		return _conflict(
+			"amount_mismatch",
+			_("Provider amount does not match the requested amount."),
+			evidence,
+		)
+	if cstr(provider_currency).upper() != cstr(expected_currency).upper():
+		return _conflict(
+			"currency_mismatch",
+			_("Provider currency does not match the requested currency."),
+			evidence,
+		)
+
+	if (
+		integration_request.reference_doctype != "Payment Request"
+		or not integration_request.reference_docname
+	):
+		return _conflict(
+			"payment_request_reference_required",
+			_("A confirmed Payrexx checkout must reference a Payment Request."),
+			evidence,
+		)
+	if not frappe.db.exists("Payment Request", integration_request.reference_docname):
+		return _conflict(
+			"payment_request_missing",
+			_("The referenced Payment Request no longer exists."),
+			evidence,
+		)
+	frappe.db.get_value("Payment Request", integration_request.reference_docname, "name", for_update=True)
+	payment_request = frappe.get_doc("Payment Request", integration_request.reference_docname)
+	evidence["payment_request"] = {
+		"name": payment_request.name,
+		"docstatus": payment_request.docstatus,
+		"status": payment_request.status,
+		"payment_request_type": payment_request.payment_request_type,
+		"grand_total": payment_request.grand_total,
+		"outstanding_amount": payment_request.outstanding_amount,
+		"currency": payment_request.currency,
+		"reference_doctype": payment_request.reference_doctype,
+		"reference_name": payment_request.reference_name,
+	}
+	if payment_request.docstatus != 1 or payment_request.status != "Requested":
+		return _conflict(
+			"payment_request_not_active",
+			_("The referenced Payment Request is not active and submitted."),
+			evidence,
+		)
+	if payment_request.payment_request_type != "Inward":
+		return _conflict(
+			"payment_request_not_inward",
+			_("Only an inward Payment Request can be settled by Payrexx."),
+			evidence,
+		)
+	if not payment_request.reference_doctype or not payment_request.reference_name:
+		return _conflict(
+			"source_reference_missing",
+			_("The Payment Request does not identify a source document."),
+			evidence,
+		)
+	if payment_request.reference_doctype != "Sales Invoice":
+		return _conflict(
+			"unsupported_source_doctype",
+			_("Payrexx supports only Payment Requests for Sales Invoices."),
+			evidence,
+		)
+	if not frappe.db.exists(payment_request.reference_doctype, payment_request.reference_name):
+		return _conflict(
+			"source_document_missing",
+			_("The Payment Request source document no longer exists."),
+			evidence,
+		)
+	frappe.db.get_value(
+		payment_request.reference_doctype,
+		payment_request.reference_name,
+		"name",
+		for_update=True,
+	)
+	reference_document = frappe.get_doc(
+		payment_request.reference_doctype,
+		payment_request.reference_name,
+	)
+	reference_currency = cstr(reference_document.get("currency")).strip().upper()
+	reference_outstanding = reference_document.get("outstanding_amount")
+	evidence["reference_document"] = {
+		"doctype": reference_document.doctype,
+		"name": reference_document.name,
+		"docstatus": reference_document.docstatus,
+		"currency": reference_currency or None,
+		"outstanding_amount": reference_outstanding,
+	}
+	if reference_document.docstatus != 1:
+		return _conflict(
+			"source_document_not_submitted",
+			_("The Payment Request source document is not submitted."),
+			evidence,
+		)
+
+	payment_currency = cstr(payment_request.currency).strip().upper()
+	party_account_currency = cstr(payment_request.get("party_account_currency")).strip().upper()
+	payment_account_currency = ""
+	if payment_request.payment_account:
+		payment_account_currency = (
+			cstr(frappe.get_cached_value("Account", payment_request.payment_account, "account_currency"))
+			.strip()
+			.upper()
+		)
+	evidence["payment_request"]["party_account_currency"] = party_account_currency or None
+	evidence["payment_request"]["payment_account_currency"] = payment_account_currency or None
+	if (
+		payment_currency != cstr(expected_currency).strip().upper()
+		or not reference_currency
+		or reference_currency != payment_currency
+		or (party_account_currency and party_account_currency != payment_currency)
+		or (payment_account_currency and payment_account_currency != payment_currency)
+	):
+		return _conflict(
+			"unsupported_currency_context",
+			_("The Payment Request uses a foreign-currency settlement path that Payrexx cannot safely post."),
+			evidence,
+		)
+	try:
+		payment_request_gateway_amount = _canonical_gateway_amount(
+			payment_request.grand_total,
+			payment_currency,
+		)
+	except ValueError as exc:
+		return _conflict("invalid_payment_request_amount", cstr(exc), evidence)
+	if payment_request_gateway_amount != expected_integer:
+		return _conflict(
+			"payment_request_amount_changed",
+			_("The Payment Request amount changed after the Payrexx checkout was created."),
+			evidence,
+		)
+
+	precision = payment_request.precision("outstanding_amount")
+	if flt(payment_request.outstanding_amount, precision) != flt(payment_request.grand_total, precision):
+		return _conflict(
+			"payment_request_already_changed",
+			_("The payment request was already settled or changed through another payment channel."),
+			evidence,
+		)
+	if reference_outstanding is not None and flt(reference_outstanding, precision) <= 0:
+		return _conflict(
+			"source_document_already_settled",
+			_("The receivable was already settled through another payment channel."),
+			evidence,
+		)
+	if reference_outstanding is not None and flt(reference_outstanding, precision) < flt(
+		payment_request.grand_total, precision
+	):
+		return _conflict(
+			"source_document_partly_settled",
+			_("The receivable was partly settled through another payment channel."),
+			evidence,
+		)
+	return None
+
+
+def _mark_settlement_conflict(integration_request, ir_data: dict, conflict: dict) -> None:
+	if ir_data.get(SETTLEMENT_CONFLICT_DATA_KEY):
+		return
+	marker = {
+		"version": SETTLEMENT_CONFLICT_VERSION,
+		"terminal": True,
+		"detected_at": now_datetime(),
+		**conflict,
+	}
+	ir_data[SETTLEMENT_CONFLICT_DATA_KEY] = marker
+	integration_request.data = frappe.as_json(ir_data)
+	integration_request.status = "Failed"
+	integration_request.error = conflict["reason"]
+	integration_request.save(ignore_permissions=True)
+	with _payment_authorization_user():
+		if frappe.db.exists(
+			"ToDo",
+			{
+				"reference_type": "Integration Request",
+				"reference_name": integration_request.name,
+				"description": ["like", f"{SETTLEMENT_CONFLICT_TODO_MARKER}%"],
+			},
+		):
+			return
+		frappe.get_doc(
+			{
+				"doctype": "ToDo",
+				"status": "Open",
+				"priority": "High",
+				"allocated_to": frappe.session.user,
+				"assigned_by": frappe.session.user,
+				"reference_type": "Integration Request",
+				"reference_name": integration_request.name,
+				"description": f"{SETTLEMENT_CONFLICT_TODO_MARKER} {conflict['reason']}",
+			}
+		).insert(ignore_permissions=True)
 
 
 def _mark_chargeback(integration_request_name: str, transaction: dict | None = None) -> None:

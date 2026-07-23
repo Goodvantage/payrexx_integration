@@ -99,8 +99,9 @@ retried.
 ```
 
 This endpoint is a fallback reconciliation path. It retrieves the Payrexx
-Gateway server-side and only completes the Integration Request when Payrexx
-reports a confirmed Gateway/transaction, then redirects directly to the
+Gateway server-side and only completes the Integration Request when the Gateway
+contains an actual confirmed transaction; Gateway status alone is insufficient.
+It then redirects directly to the
 Integration Request's same-site `redirect_to` when present, otherwise to the
 standard `/payment-success` page. Because the provider return is a GET, it sets
 the end-of-request commit flag only after server verification reaches a
@@ -126,7 +127,7 @@ URLs resolve correctly.
 | Required query param | `?instance=<instance_name>` on every call |
 | POST body format | `application/x-www-form-urlencoded` |
 | Response envelope | `{"status":"success", "data":[ … ]}` |
-| Amount unit | Smallest currency unit (CHF 2.00 → `200`) |
+| Amount unit | Canonical integer hundredths for supported two-decimal currencies (CHF 2.00 → `200`); other fraction units and sub-cent amounts are rejected |
 | Webhook signature header | `X-Webhook-Signature` — HMAC-SHA256 of raw body, signed with the per-webhook signing key (NOT the API secret) |
 
 A "no gateway found" GET against `/Gateway/0/` is the cheap auth-check used
@@ -143,7 +144,7 @@ when only the checkout/login surface uses a custom domain.
 
 | Payrexx `transaction.status` | `Integration Request.status` | Side effect |
 |---|---|---|
-| `confirmed` | `Completed` | Runs `on_payment_authorized` on the reference doc |
+| `confirmed` | `Completed` or terminal `Failed` conflict | Settles only an active submitted inward Payment Request backed by a submitted Sales Invoice with exact canonical amount/currency evidence |
 | `authorized` | `Authorized` | Records provider state only; this app does not implement later charging |
 | `reserved` | `Authorized` | Records provider state only; this app does not implement capture |
 | `waiting` | unchanged | In-progress; wait for next webhook |
@@ -161,8 +162,11 @@ workflows until an explicit, tested contract is implemented.
 ## Testing
 
 ```bash
-# Python integration tests
-bench --site <site> run-tests --app payrexx_integration \
+# Focused Python tests
+bench --site <site> run-tests \
+  --module payrexx_integration.tests.test_settlement_validation
+
+bench --site <site> run-tests \
   --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings
 
 bench --site <site> run-tests \
