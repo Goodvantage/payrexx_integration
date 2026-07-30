@@ -28,6 +28,23 @@ Instance Name: customer
 API Base Domain: pay.goodvantage.ch
 ```
 
+Canonical Payrexx-owned API hosts under `payrexx.com` are trusted by default.
+Before saving a custom platform domain, explicitly allow the exact final API
+host in site config. The value is a JSON list of hostnames, without schemes,
+paths, wildcards, or non-HTTPS ports:
+
+```bash
+cd frappe-bench
+bench --site <site> set-config --parse payrexx_allowed_api_hosts '["api.pay.goodvantage.ch"]'
+bench --site <site> clear-cache
+```
+
+Restart long-lived web and worker processes after changing site config. The
+settings field still contains the base domain (`pay.goodvantage.ch`); the
+allowlist contains the final host the client contacts
+(`api.pay.goodvantage.ch`). IP addresses and URL-like values such as
+`https://...`, credentials, paths, queries, and fragments are never accepted.
+
 If that custom API domain rejects an otherwise valid instance key, the client
 automatically retries on `api.payrexx.com`. This is useful when the checkout
 uses a partner/custom domain but Payrexx still authenticates API calls on the
@@ -88,9 +105,24 @@ GET /api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&gateway_n
 
 When clicked, the endpoint verifies the token, lazy-creates and submits a Payment
 Request through ERPNext, and redirects to the checkout URL created during that
-submission. Repeated clicks reuse the same Payment Request and Payrexx checkout.
+submission. Repeated clicks reuse the same Payment Request and Payrexx checkout
+only while current locking reads prove that the invoice remains wholly unpaid,
+the Payment Request remains submitted, `Requested`, and fully outstanding, and
+its amount, currency, source, gateway, and stored provider metadata all still
+match exactly. A partial/manual payment or another change stops before any
+Payrexx request; accounts staff must review the receivable rather than sending
+the customer to the original full-value checkout.
+Before a new Gateway is created, the app also checks every submitted active
+Payrexx Payment Request for the invoice, across all Payrexx settings rows. If
+another one exists, the new/manual submission is preserved but rejected before
+provider contact. Paid, failed, cancelled, and docstatus-cancelled history does
+not block a legitimate new checkout. Concurrent first clicks and lock waits are
+retried at most three times only before a Payrexx Gateway POST; provider creation
+is never replayed after contact has started.
 The GET endpoint commits its lazy-created local records only after Payrexx has
-returned a valid checkout URL; a failed click rolls back the current attempt.
+returned a valid checkout URL and complete provider metadata. Integration
+Request creation itself does not commit. A failed provider call therefore rolls
+back the Payment Request and Integration Request together.
 Links generated before gateway binding was introduced did not include
 `gateway_name`. They continue to work when exactly one settings row exists, but
 are rejected as ambiguous when multiple rows exist; resend the invoice email to
@@ -118,8 +150,9 @@ GET https://<site>/api/method/payrexx_integration.api.payment_success?ir=<Integr
 
 That endpoint retrieves the Payrexx Gateway server-side and only marks the
 Integration Request complete when its invoices contain an actual confirmed
-transaction. A Gateway-level `confirmed` status without a confirmed transaction
-does not settle or return success.
+transaction whose provider `referenceId` belongs to that Integration Request. A
+Gateway-level `confirmed` status, missing reference, or transaction belonging to
+another request does not settle or return success.
 Because this return is an HTTP GET, terminal server-verified reconciliation
 requests Frappe's end-of-request commit before redirecting; waiting results do
 not. A success page with unchanged accounting records indicates an outdated
@@ -166,10 +199,11 @@ Settings**.
 If saving Payrexx Settings fails:
 
 1. Confirm the instance name matches the first subdomain of the checkout/login domain.
-2. Confirm the API base domain is correct (`payrexx.com` for normal accounts, e.g. `pay.goodvantage.ch` for GoodVantage partner accounts). A 401/403/404 from a custom API domain is retried once on `api.payrexx.com`.
-3. Confirm the API secret is current.
-4. Confirm outbound network access from the bench.
-5. Try saving in Sandbox first.
+2. Confirm the API base domain is correct (`payrexx.com` for normal accounts, e.g. `pay.goodvantage.ch` for GoodVantage partner accounts).
+3. For a custom domain, confirm its exact final host is present in the `payrexx_allowed_api_hosts` JSON list, e.g. `api.pay.goodvantage.ch`. A 401/403/404 from an allowed custom API domain is retried once on `api.payrexx.com`.
+4. Confirm the API secret is current.
+5. Confirm outbound network access from the bench.
+6. Try saving in Sandbox first.
 
 The app pings `GET /Gateway/0/`; a Payrexx JSON response with `status: error` can still mean credentials are accepted if the error is "gateway not found".
 
@@ -189,6 +223,18 @@ invoice's draft Payment Request in Desk and either complete, cancel or delete it
 after review. The pay-link endpoint preserves all pre-existing drafts because
 ERPNext would otherwise reuse one even when it belongs to another gateway.
 
+If the link reports that the invoice, Payment Request, or checkout no longer
+matches, do not reopen the provider URL. Review manual/partial Payment Entries,
+the invoice outstanding amount, and the linked Integration Request. The old
+full-value checkout is deliberately blocked before provider contact.
+
+If submission reports that another active Payrexx Payment Request exists, list
+all submitted Payment Requests for the Sales Invoice and all `Payrexx-*`
+gateways. Keep the one with the active matching Integration Request; review and
+cancel only genuinely duplicate requests under the normal accounting workflow.
+Do not delete historical Paid/Failed/Cancelled rows and do not submit another
+full-value draft to bypass the guard.
+
 If the link opens but payment does not update, check **Integration Request**
 rows, Payrexx webhook delivery logs, and whether Payrexx can reach the success
 redirect URL on the public `host_name`.
@@ -200,19 +246,45 @@ payment itself.
 The webhook only updates Integration Requests whose service is `Payrexx`; if a
 Payrexx reference ID points at a row owned by another gateway, the callback logs
 the mismatch and ignores it.
-If Payrexx reports a transient `tabSeries` / `QueryDeadlockError`, retry the
-webhook after the latest app code is loaded. The callback retries those
-deadlocks from the locked Integration Request update through downstream
-settlement before returning an error to Payrexx.
+Transient `tabSeries` / `QueryDeadlockError` failures, including MariaDB error
+1020, are retried automatically up to three times. Each retry rolls back the
+failed transaction and replays the complete callback, reconciliation,
+chargeback, or settlement unit from fresh state. Retry webhook delivery manually
+only if all bounded attempts fail and Payrexx receives an error response; never
+retry the payment itself.
 Other downstream payment-hook failures are logged and returned as webhook
 errors so Payrexx can retry; the app no longer marks the Integration Request
 complete in a separate manual commit before the referenced document accepts the
 payment.
 
+If checkout creation fails around a provider timeout, local rollback, or SQL
+commit, inspect `sites/<site>/logs/payrexx_integration.log` for
+`[Payrexx Gateway recovery]` and `[Payrexx possible orphan Gateway]` before
+retrying. A provider response first writes `state=local_commit_pending`; normal
+commit adds `state=local_commit_confirmed`, and ordinary rollback adds
+`state=local_rollback_confirmed`. Pair records by Integration Request reference
+and Gateway id. An unpaired `local_commit_pending` record is intentionally
+conservative: Frappe clears rollback callbacks before SQL commit, so a commit
+failure in that interval has no reliable callback outcome. Entries contain only
+the Integration Request reference, settings name, linked document type/name,
+and Gateway id; they never contain the API key, checkout hash, checkout URL, or
+payer data. Search both local state and Payrexx by `referenceId` and Gateway id:
+
+1. If `local_commit_confirmed` exists and the complete local Integration Request exists, use that checkout; do not create another.
+2. If no Gateway exists, retry the original signed invoice link after the local issue is fixed.
+3. If an unused Gateway exists and has no transaction and no complete local request owns it, delete that Gateway in the Payrexx dashboard, then retry.
+4. If a transaction exists or commit outcome remains ambiguous, do not delete or pay again; reconcile that existing transaction through the normal webhook/success path and accounting review.
+5. Never manually commit/recreate incomplete local state or automate provider deletion to close an unpaired pending record.
+
 For a confirmed Payment Request, verify that its status is **Paid**, its
 outstanding amount is zero, and exactly one submitted Payment Entry references
 it. ERPNext updates the linked Sales Invoice outstanding amount through the
 normal Payment Entry submission path.
+Concurrent callbacks and manual Payment Entries are rechecked from current
+row-locking reads. A delayed provider status cannot overwrite an already
+Completed request, and a Payment Entry that wins the race prevents a second
+automatic settlement; follow the settlement-conflict procedure below rather
+than replaying the payment.
 
 ## 9. Reconcile Payments And Handle Chargebacks
 
@@ -347,6 +419,9 @@ ERPNext records as acceptance evidence; never add destructive provider cleanup.
 cd frappe-bench
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_settlement_validation
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_checkout_security
 
 bench --site development16.localhost run-tests \
   --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings

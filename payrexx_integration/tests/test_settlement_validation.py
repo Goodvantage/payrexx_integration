@@ -29,23 +29,16 @@ class TestSettlementValidation(UnitTestCase):
 			data=frappe.as_json({"payrexx_transaction": {"status": "chargeback"}}),
 			save=Mock(),
 		)
-		with (
-			patch(
-				"payrexx_integration.payrexx_integration.doctype.payrexx_settings."
-				"payrexx_settings.frappe.db.get_value"
-			) as lock_request,
-			patch(
-				"payrexx_integration.payrexx_integration.doctype.payrexx_settings."
-				"payrexx_settings.frappe.get_doc",
-				return_value=integration_request,
-			),
-		):
+		with patch(
+			"payrexx_integration.payrexx_integration.doctype.payrexx_settings."
+			"payrexx_settings.frappe.get_doc",
+			return_value=integration_request,
+		) as get_current_request:
 			_mark_reconciliation_failure(integration_request.name, "declined")
 
-		lock_request.assert_called_once_with(
+		get_current_request.assert_called_once_with(
 			"Integration Request",
 			integration_request.name,
-			"name",
 			for_update=True,
 		)
 		integration_request.save.assert_not_called()

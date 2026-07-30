@@ -5,7 +5,9 @@ import base64
 import hashlib
 import hmac
 import json
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from threading import Barrier
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -186,6 +188,61 @@ def _create_submitted_test_payment_request():
 	return sales_invoice, payment_request
 
 
+def _run_concurrent_manual_payrexx_checkout(
+	site: str,
+	sites_path: str,
+	settings_name: str,
+	payment_request_name: str,
+	barrier: Barrier,
+) -> str:
+	frappe.init(site=site, sites_path=sites_path)
+	frappe.connect()
+	frappe.set_user("Administrator")
+	frappe.flags.in_test = True
+	try:
+		# Document.submit() already owns its draft row before before_submit calls
+		# the gateway controller. Reproduce that boundary without invoking
+		# unrelated ERPNext submission behavior in this focused race test.
+		payment_request = frappe.get_doc("Payment Request", payment_request_name, for_update=True)
+		payment_request.docstatus = 1
+		payment_request.status = "Requested"
+		payment_request.outstanding_amount = payment_request.grand_total
+		barrier.wait(timeout=30)
+
+		settings = frappe.get_doc("Payrexx Settings", settings_name)
+		checkout_url = settings.get_payment_url(
+			amount=payment_request.grand_total,
+			currency=payment_request.currency,
+			payment_gateway=payment_request.payment_gateway,
+			reference_doctype="Payment Request",
+			reference_docname=payment_request.name,
+		)
+		frappe.db.set_value(
+			"Payment Request",
+			payment_request.name,
+			{
+				"docstatus": 1,
+				"status": "Requested",
+				"outstanding_amount": payment_request.grand_total,
+				"payment_url": checkout_url,
+			},
+			update_modified=False,
+		)
+		frappe.db.commit()
+		return "created"
+	except frappe.QueryDeadlockError:
+		frappe.db.rollback()
+		return "rejected"
+	except frappe.ValidationError:
+		frappe.db.rollback()
+		return "rejected"
+	except Exception:
+		frappe.db.rollback()
+		raise
+	finally:
+		frappe.destroy()
+
+
 class TestPayrexxSettings(IntegrationTestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -279,28 +336,36 @@ class TestPayrexxSettings(IntegrationTestCase):
 		)
 
 	def test_payrexx_client_uses_platform_api_domain(self):
-		client = PayrexxClient(
-			instance="customer",
-			api_secret="sk_test_dummy",
-			api_version="v1.14",
-			api_base_domain="pay.goodvantage.ch",
-		)
-		self.assertEqual(
-			client._url("Gateway/"),
-			"https://api.pay.goodvantage.ch/v1.14/Gateway/?instance=customer",
-		)
+		with patch(
+			"payrexx_integration.payrexx_integration.payrexx.payrexx_client.frappe.conf",
+			{"payrexx_allowed_api_hosts": ["api.pay.goodvantage.ch"]},
+		):
+			client = PayrexxClient(
+				instance="customer",
+				api_secret="sk_test_dummy",
+				api_version="v1.14",
+				api_base_domain="pay.goodvantage.ch",
+			)
+			self.assertEqual(
+				client._url("Gateway/"),
+				"https://api.pay.goodvantage.ch/v1.14/Gateway/?instance=customer",
+			)
 
 	def test_settings_client_passes_platform_api_domain(self):
 		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
 		doc.instance_name = "customer"
 		doc.api_base_domain = "pay.goodvantage.ch"
-		client = doc._client()
-		self.assertEqual(client.instance, "customer")
-		self.assertEqual(client.api_base_domain, "pay.goodvantage.ch")
-		self.assertEqual(
-			client._url("Gateway/0/"),
-			"https://api.pay.goodvantage.ch/v1.14/Gateway/0/?instance=customer",
-		)
+		with patch(
+			"payrexx_integration.payrexx_integration.payrexx.payrexx_client.frappe.conf",
+			{"payrexx_allowed_api_hosts": ["api.pay.goodvantage.ch"]},
+		):
+			client = doc._client()
+			self.assertEqual(client.instance, "customer")
+			self.assertEqual(client.api_base_domain, "pay.goodvantage.ch")
+			self.assertEqual(
+				client._url("Gateway/0/"),
+				"https://api.pay.goodvantage.ch/v1.14/Gateway/0/?instance=customer",
+			)
 
 	def test_settings_ping_uses_client(self):
 		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
@@ -343,12 +408,6 @@ class TestPayrexxSettings(IntegrationTestCase):
 		self.assertIn("Payrexx rejected the API Secret", str(exc.exception))
 
 	def test_payrexx_client_falls_back_to_default_api_domain_on_custom_auth_reject(self):
-		client = PayrexxClient(
-			instance="customer",
-			api_secret="sk_test_dummy",
-			api_version="v1.14",
-			api_base_domain="pay.goodvantage.ch",
-		)
 		called_urls = []
 
 		def fake_post_request(url, **kwargs):
@@ -360,10 +419,22 @@ class TestPayrexxSettings(IntegrationTestCase):
 				raise HTTPError(response=response)
 			return {"status": "success", "data": [{"id": 123, "link": "https://pay.example"}]}
 
-		with patch(
-			"payrexx_integration.payrexx_integration.payrexx.payrexx_client.make_post_request",
-			side_effect=fake_post_request,
+		with (
+			patch(
+				"payrexx_integration.payrexx_integration.payrexx.payrexx_client.frappe.conf",
+				{"payrexx_allowed_api_hosts": ["api.pay.goodvantage.ch"]},
+			),
+			patch(
+				"payrexx_integration.payrexx_integration.payrexx.payrexx_client.make_post_request",
+				side_effect=fake_post_request,
+			),
 		):
+			client = PayrexxClient(
+				instance="customer",
+				api_secret="sk_test_dummy",
+				api_version="v1.14",
+				api_base_domain="pay.goodvantage.ch",
+			)
 			gateway = client.create_gateway({"amount": 100})
 
 		self.assertEqual(gateway["link"], "https://pay.example")
@@ -775,33 +846,106 @@ class TestPayrexxSettings(IntegrationTestCase):
 		self.assertTrue(commit_requested)
 
 	def test_payment_request_checkout_reuses_url_created_on_submission(self):
+		sales_invoice = Mock()
+		sales_invoice.name = "SINV-TEST"
 		payment_request = Mock()
 		payment_request.name = "PAY-REQ-TEST"
 		payment_request.docstatus = 1
 		payment_request.payment_url = "https://pay.example/only-checkout"
+		active_request = frappe._dict(
+			name="PAYREXX-IR-TEST",
+			status="Queued",
+			reference_doctype="Payment Request",
+			reference_docname=payment_request.name,
+			data=frappe.as_json(
+				{
+					"amount": 100,
+					"currency": "CHF",
+					"payment_gateway": "Payrexx-TestGW",
+					"reference_doctype": "Payment Request",
+					"reference_docname": payment_request.name,
+					"payrexx_settings": "TestGW",
+					"payrexx_gateway_id": 123,
+					"payrexx_gateway_hash": "hash",
+					"payrexx_checkout_url": payment_request.payment_url,
+					"payrexx_gateway_amount": 10000,
+					"payrexx_gateway_currency": "CHF",
+				}
+			),
+		)
 
-		with patch("payrexx_integration.api.frappe.db.get_value"):
-			checkout_url = _get_payment_request_checkout_url(payment_request)
+		with (
+			patch(
+				"payrexx_integration.api.frappe.get_doc",
+				side_effect=(payment_request, sales_invoice),
+			),
+			patch(
+				"payrexx_integration.api._validate_payment_request_checkout_state",
+				return_value=(10000, "CHF"),
+			),
+			patch(
+				"payrexx_integration.api._get_active_checkout_requests",
+				return_value=[active_request],
+			),
+			patch(
+				"payrexx_integration.api._get_active_payrexx_payment_requests",
+				return_value=[frappe._dict(name=payment_request.name)],
+			),
+		):
+			checkout_url = _get_payment_request_checkout_url(payment_request, sales_invoice, "TestGW")
 
 		self.assertEqual(checkout_url, payment_request.payment_url)
 		payment_request.get_payment_url.assert_not_called()
 		payment_request.db_set.assert_not_called()
 
 	def test_payment_request_without_url_recovers_stored_checkout(self):
+		sales_invoice = Mock()
+		sales_invoice.name = "SINV-TEST"
 		payment_request = Mock()
 		payment_request.name = "PAY-REQ-TEST"
 		payment_request.docstatus = 1
 		payment_request.payment_url = ""
 		active_request = frappe._dict(
 			name="PAYREXX-IR-TEST",
-			data=frappe.as_json({"payrexx_checkout_url": "https://pay.example/recovered"}),
+			status="Queued",
+			reference_doctype="Payment Request",
+			reference_docname=payment_request.name,
+			data=frappe.as_json(
+				{
+					"amount": 100,
+					"currency": "CHF",
+					"payment_gateway": "Payrexx-TestGW",
+					"reference_doctype": "Payment Request",
+					"reference_docname": payment_request.name,
+					"payrexx_settings": "TestGW",
+					"payrexx_gateway_id": 123,
+					"payrexx_gateway_hash": "hash",
+					"payrexx_checkout_url": "https://pay.example/recovered",
+					"payrexx_gateway_amount": 10000,
+					"payrexx_gateway_currency": "CHF",
+				}
+			),
 		)
 
 		with (
-			patch("payrexx_integration.api.frappe.db.get_value"),
-			patch("payrexx_integration.api.frappe.get_all", return_value=[active_request]),
+			patch(
+				"payrexx_integration.api.frappe.get_doc",
+				side_effect=(payment_request, sales_invoice),
+			),
+			patch(
+				"payrexx_integration.api._validate_payment_request_checkout_state",
+				return_value=(10000, "CHF"),
+			),
+			patch(
+				"payrexx_integration.api._get_active_checkout_requests",
+				return_value=[active_request],
+			),
+			patch(
+				"payrexx_integration.api._get_active_payrexx_payment_requests",
+				return_value=[frappe._dict(name=payment_request.name)],
+			),
 		):
-			checkout_url = _get_payment_request_checkout_url(payment_request)
+			checkout_url = _get_payment_request_checkout_url(payment_request, sales_invoice, "TestGW")
 
 		self.assertEqual(checkout_url, "https://pay.example/recovered")
 		payment_request.get_payment_url.assert_not_called()
@@ -810,6 +954,8 @@ class TestPayrexxSettings(IntegrationTestCase):
 		)
 
 	def test_payment_request_without_url_does_not_duplicate_unknown_active_checkout(self):
+		sales_invoice = Mock()
+		sales_invoice.name = "SINV-TEST"
 		payment_request = Mock()
 		payment_request.name = "PAY-REQ-TEST"
 		payment_request.docstatus = 1
@@ -817,11 +963,25 @@ class TestPayrexxSettings(IntegrationTestCase):
 		active_request = frappe._dict(name="PAYREXX-IR-LEGACY", data="{}")
 
 		with (
-			patch("payrexx_integration.api.frappe.db.get_value"),
-			patch("payrexx_integration.api.frappe.get_all", return_value=[active_request]),
+			patch(
+				"payrexx_integration.api.frappe.get_doc",
+				side_effect=(payment_request, sales_invoice),
+			),
+			patch(
+				"payrexx_integration.api._validate_payment_request_checkout_state",
+				return_value=(10000, "CHF"),
+			),
+			patch(
+				"payrexx_integration.api._get_active_checkout_requests",
+				return_value=[active_request],
+			),
+			patch(
+				"payrexx_integration.api._get_active_payrexx_payment_requests",
+				return_value=[frappe._dict(name=payment_request.name)],
+			),
 			self.assertRaises(frappe.ValidationError),
 		):
-			_get_payment_request_checkout_url(payment_request)
+			_get_payment_request_checkout_url(payment_request, sales_invoice, "TestGW")
 
 		payment_request.get_payment_url.assert_not_called()
 
@@ -1063,6 +1223,8 @@ class TestPayrexxSettings(IntegrationTestCase):
 		the webhook binding depends on this."""
 		settings = frappe.get_doc("Payrexx Settings", self.settings_name)
 		_sales_invoice, payment_request = _create_submitted_test_payment_request()
+		payment_request.db_set("payment_gateway", "Payrexx-" + self.settings_name)
+		payment_request.reload()
 
 		class _FakeClient:
 			def create_gateway(self, payload):
@@ -1070,8 +1232,8 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 		with patch.object(type(settings), "_client", return_value=_FakeClient()):
 			link = settings.get_payment_url(
-				amount=10,
-				currency="CHF",
+				amount=payment_request.grand_total,
+				currency=payment_request.currency,
 				payment_gateway="Payrexx-" + self.settings_name,
 				reference_doctype="Payment Request",
 				reference_docname=payment_request.name,
@@ -1089,8 +1251,8 @@ class TestPayrexxSettings(IntegrationTestCase):
 		self.assertEqual(data.get("payrexx_settings"), self.settings_name)
 		self.assertEqual(data.get("payrexx_gateway_id"), 4242)
 		self.assertEqual(data.get("payrexx_checkout_url"), "https://pay.example/checkout")
-		self.assertEqual(data.get("payrexx_gateway_amount"), 1000)
-		self.assertEqual(data.get("payrexx_gateway_currency"), "CHF")
+		self.assertEqual(data.get("payrexx_gateway_amount"), int(payment_request.grand_total * 100))
+		self.assertEqual(data.get("payrexx_gateway_currency"), payment_request.currency)
 
 	def test_get_payment_url_rejects_sales_order_payment_request_before_gateway_creation(self):
 		settings = frappe.get_doc("Payrexx Settings", self.settings_name)
@@ -1335,6 +1497,23 @@ class TestPayrexxSettings(IntegrationTestCase):
 			(frappe.parse_json(ir.data) or {})["payrexx_settlement_conflict"]["code"],
 			"payment_request_reference_required",
 		)
+
+	def test_deadlock_retry_is_bounded_and_rolls_back_every_failed_attempt(self):
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		operation = Mock(side_effect=frappe.QueryDeadlockError((1020, "Record has changed since last read")))
+		with (
+			patch.object(ps_module.frappe.db, "rollback") as rollback,
+			patch.object(ps_module.time, "sleep") as sleep,
+			self.assertRaises(frappe.QueryDeadlockError),
+		):
+			ps_module._run_with_deadlock_retry(operation)
+
+		self.assertEqual(operation.call_count, ps_module.DEADLOCK_MAX_ATTEMPTS)
+		self.assertEqual(rollback.call_count, ps_module.DEADLOCK_MAX_ATTEMPTS)
+		self.assertEqual([item.args[0] for item in sleep.call_args_list], [0.25, 0.5])
 
 	def test_deadlock_retry_completes_request_and_creates_exactly_one_payment_entry(self):
 		from erpnext.accounts.doctype.payment_request.payment_request import (
@@ -1978,3 +2157,636 @@ class TestPayrexxSettings(IntegrationTestCase):
 			"https://demo.example.test/payment-failed?doctype=Donation&docname=NPO-DTN-PENDING",
 		)
 		self.assertFalse(commit_requested)
+
+
+class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
+	def setUp(self):
+		super().setUp()
+		if frappe.db.db_type == "sqlite":
+			self.skipTest("SQLite does not provide the current row-locking semantics under test")
+
+	def test_concurrent_draft_payment_requests_create_only_one_gateway(self):
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		frappe.db.rollback()
+		settings_name = _ensure_settings()
+		frappe.db.commit()
+		company = _test_company()
+		currency = frappe.db.get_value("Company", company, "default_currency")
+		invoice_name = f"PAYREXX-CONCURRENT-SINV-{frappe.generate_hash(length=10)}"
+		payment_request_names = [
+			f"PAYREXX-CONCURRENT-PR-{frappe.generate_hash(length=10)}" for _index in range(2)
+		]
+		history_names = [f"PAYREXX-HISTORY-PR-{frappe.generate_hash(length=10)}" for _index in range(2)]
+		all_payment_request_names = payment_request_names + history_names
+		payment_gateway = f"Payrexx-{settings_name}"
+		frappe.get_doc(
+			{
+				"doctype": "Sales Invoice",
+				"name": invoice_name,
+				"docstatus": 1,
+				"is_return": 0,
+				"company": company,
+				"currency": currency,
+				"grand_total": 100,
+				"rounded_total": 0,
+				"outstanding_amount": 100,
+			}
+		).db_insert()
+		for payment_request_name in payment_request_names:
+			frappe.get_doc(
+				{
+					"doctype": "Payment Request",
+					"name": payment_request_name,
+					"docstatus": 0,
+					"status": "Draft",
+					"payment_request_type": "Inward",
+					"payment_gateway": payment_gateway,
+					"company": company,
+					"currency": currency,
+					"grand_total": 100,
+					"outstanding_amount": 0,
+					"reference_doctype": "Sales Invoice",
+					"reference_name": invoice_name,
+				}
+			).db_insert()
+		for payment_request_name, docstatus, status in (
+			(history_names[0], 1, "Paid"),
+			(history_names[1], 2, "Cancelled"),
+		):
+			frappe.get_doc(
+				{
+					"doctype": "Payment Request",
+					"name": payment_request_name,
+					"docstatus": docstatus,
+					"status": status,
+					"payment_request_type": "Inward",
+					"payment_gateway": payment_gateway,
+					"company": company,
+					"currency": currency,
+					"grand_total": 100,
+					"outstanding_amount": 0,
+					"reference_doctype": "Sales Invoice",
+					"reference_name": invoice_name,
+				}
+			).db_insert()
+		frappe.db.commit()
+
+		client = Mock()
+		client.create_gateway.return_value = {
+			"id": 93001,
+			"hash": "concurrent-gateway-hash",
+			"link": "https://pay.example/concurrent-checkout",
+		}
+		barrier = Barrier(2)
+		site = frappe.local.site
+		sites_path = frappe.local.sites_path
+		try:
+			with (
+				patch.object(ps_module.PayrexxSettings, "_client", return_value=client),
+				patch.object(ps_module, "_log_gateway_recovery_pending"),
+				patch.object(ps_module, "_log_gateway_recovery_committed"),
+				patch.object(ps_module, "_log_gateway_orphan_recovery"),
+				ThreadPoolExecutor(max_workers=2) as executor,
+			):
+				futures = [
+					executor.submit(
+						_run_concurrent_manual_payrexx_checkout,
+						site,
+						sites_path,
+						settings_name,
+						payment_request_name,
+						barrier,
+					)
+					for payment_request_name in payment_request_names
+				]
+				results = [future.result(timeout=60) for future in futures]
+
+			frappe.db.rollback()
+			self.assertEqual(results.count("created"), 1)
+			self.assertEqual(results.count("rejected"), 1)
+			client.create_gateway.assert_called_once()
+			self.assertEqual(
+				frappe.db.count(
+					"Payment Request",
+					{
+						"name": ["in", payment_request_names],
+						"docstatus": 1,
+						"status": "Requested",
+					},
+				),
+				1,
+			)
+			self.assertEqual(
+				frappe.db.count(
+					"Integration Request",
+					{
+						"reference_doctype": "Payment Request",
+						"reference_docname": ["in", payment_request_names],
+						"integration_request_service": "Payrexx",
+					},
+				),
+				1,
+			)
+			self.assertTrue(frappe.db.exists("Payment Request", history_names[0]))
+			self.assertTrue(frappe.db.exists("Payment Request", history_names[1]))
+		finally:
+			frappe.db.rollback()
+			frappe.db.delete(
+				"Integration Request",
+				{
+					"reference_doctype": "Payment Request",
+					"reference_docname": ["in", payment_request_names],
+				},
+			)
+			frappe.db.delete("Payment Request", {"name": ["in", all_payment_request_names]})
+			frappe.db.delete("Sales Invoice", {"name": invoice_name})
+			frappe.db.commit()
+
+	def test_concurrent_payment_entry_prevents_second_settlement_attempt(self):
+		from erpnext.accounts.doctype.payment_request.payment_request import PaymentRequest
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		payment_request_name = f"PAYREXX-CONCURRENT-PR-{frappe.generate_hash(length=10)}"
+		payment_entry_name = f"PAYREXX-CONCURRENT-PE-{frappe.generate_hash(length=10)}"
+		integration_request_name = f"PAYREXX-CONCURRENT-IR-{frappe.generate_hash(length=10)}"
+		confirmed_transaction = {
+			"id": 90001,
+			"status": "confirmed",
+			"amount": 10000,
+			"currency": "CHF",
+		}
+		with self.primary_connection(), self.secondary_connection():
+			frappe.get_doc(
+				{
+					"doctype": "Payment Request",
+					"name": payment_request_name,
+					"docstatus": 1,
+					"payment_request_type": "Inward",
+					"status": "Requested",
+					"grand_total": 100,
+					"outstanding_amount": 100,
+					"currency": "CHF",
+				}
+			).db_insert()
+			frappe.get_doc(
+				{
+					"doctype": "Integration Request",
+					"name": integration_request_name,
+					"integration_request_service": "Payrexx",
+					"status": "Queued",
+					"reference_doctype": "Payment Request",
+					"reference_docname": payment_request_name,
+					"data": frappe.as_json(
+						{
+							"payrexx_gateway_amount": 10000,
+							"payrexx_gateway_currency": "CHF",
+						}
+					),
+				}
+			).db_insert()
+			frappe.db.commit()
+
+		try:
+			with self.primary_connection():
+				frappe.db.rollback()
+				stale_payment_request = frappe.get_doc("Payment Request", payment_request_name)
+				self.assertEqual(stale_payment_request.status, "Requested")
+
+			with self.primary_connection(), self.secondary_connection():
+				frappe.get_doc(
+					{
+						"doctype": "Payment Entry",
+						"name": payment_entry_name,
+						"docstatus": 1,
+						"payment_type": "Receive",
+						"paid_amount": 100,
+						"received_amount": 100,
+					}
+				).db_insert()
+				frappe.get_doc(
+					{
+						"doctype": "Payment Entry Reference",
+						"name": frappe.generate_hash(length=10),
+						"parent": payment_entry_name,
+						"parenttype": "Payment Entry",
+						"parentfield": "references",
+						"idx": 1,
+						"docstatus": 1,
+						"reference_doctype": "Sales Invoice",
+						"reference_name": "PAYREXX-CONCURRENT-SINV",
+						"payment_request": payment_request_name,
+						"total_amount": 100,
+						"outstanding_amount": 100,
+						"allocated_amount": 100,
+					}
+				).db_insert()
+				frappe.db.set_value(
+					"Payment Request",
+					payment_request_name,
+					{"status": "Paid", "outstanding_amount": 0},
+					update_modified=False,
+				)
+				frappe.db.commit()
+
+			with self.primary_connection():
+				attempts = []
+				complete_locked = ps_module._complete_locked_integration_request
+
+				def count_attempts(request_name, transaction):
+					attempts.append((request_name, transaction))
+					return complete_locked(request_name, transaction)
+
+				with (
+					patch.object(
+						ps_module,
+						"_complete_locked_integration_request",
+						side_effect=count_attempts,
+					),
+					patch.object(PaymentRequest, "set_as_paid", autospec=True) as settle_again,
+					patch.object(ps_module.time, "sleep") as sleep,
+				):
+					ps_module._complete_integration_request(
+						integration_request_name,
+						confirmed_transaction,
+					)
+
+				self.assertEqual(
+					attempts,
+					[
+						(integration_request_name, confirmed_transaction),
+						(integration_request_name, confirmed_transaction),
+					],
+				)
+				sleep.assert_called_once_with(0.25)
+				settle_again.assert_not_called()
+				current_request = frappe.get_doc("Integration Request", integration_request_name)
+				self.assertEqual(current_request.status, "Failed")
+				self.assertEqual(
+					(frappe.parse_json(current_request.data) or {})[ps_module.SETTLEMENT_CONFLICT_DATA_KEY][
+						"code"
+					],
+					"payment_request_not_active",
+				)
+
+			with self.primary_connection(), self.secondary_connection():
+				self.assertEqual(
+					frappe.db.count(
+						"Payment Entry Reference",
+						{"payment_request": payment_request_name, "docstatus": 1},
+					),
+					1,
+				)
+		finally:
+			with self.primary_connection():
+				frappe.db.rollback()
+			with self.primary_connection(), self.secondary_connection():
+				frappe.db.rollback()
+				frappe.db.delete(
+					"ToDo",
+					{
+						"reference_type": "Integration Request",
+						"reference_name": integration_request_name,
+					},
+				)
+				frappe.db.delete("Payment Entry Reference", {"parent": payment_entry_name})
+				frappe.db.delete("Payment Entry", {"name": payment_entry_name})
+				frappe.db.delete("Integration Request", {"name": integration_request_name})
+				frappe.db.delete("Payment Request", {"name": payment_request_name})
+				frappe.db.commit()
+
+	def test_chargeback_boundary_retries_after_concurrent_completion(self):
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		integration_request_name = f"PAYREXX-CONCURRENT-IR-{frappe.generate_hash(length=10)}"
+		confirmed_transaction = {"id": 90501, "status": "confirmed"}
+		chargeback_transaction = {"id": 90502, "status": "chargeback"}
+		with self.primary_connection(), self.secondary_connection():
+			frappe.get_doc(
+				{
+					"doctype": "Integration Request",
+					"name": integration_request_name,
+					"integration_request_service": "Payrexx",
+					"status": "Queued",
+					"data": "{}",
+				}
+			).db_insert()
+			frappe.db.commit()
+
+		try:
+			with self.primary_connection():
+				stale_request = frappe.get_doc("Integration Request", integration_request_name)
+				self.assertEqual(stale_request.status, "Queued")
+
+			with self.primary_connection(), self.secondary_connection():
+				frappe.db.set_value(
+					"Integration Request",
+					integration_request_name,
+					{
+						"status": "Completed",
+						"data": frappe.as_json({"payrexx_transaction": confirmed_transaction}),
+					},
+					update_modified=False,
+				)
+				frappe.db.commit()
+
+			with self.primary_connection():
+				attempts = []
+				mark_locked_chargeback = ps_module._mark_locked_chargeback
+
+				def count_attempts(request_name, transaction=None):
+					attempts.append((request_name, transaction))
+					return mark_locked_chargeback(request_name, transaction)
+
+				with (
+					patch.object(
+						ps_module,
+						"_mark_locked_chargeback",
+						side_effect=count_attempts,
+					),
+					patch.object(ps_module.time, "sleep") as sleep,
+				):
+					ps_module._mark_chargeback(integration_request_name, chargeback_transaction)
+
+				self.assertEqual(
+					attempts,
+					[
+						(integration_request_name, chargeback_transaction),
+						(integration_request_name, chargeback_transaction),
+					],
+				)
+				sleep.assert_called_once_with(0.25)
+				current_request = frappe.get_doc("Integration Request", integration_request_name)
+				self.assertEqual(current_request.status, "Failed")
+				self.assertEqual(current_request.error, ps_module.CHARGEBACK_ERROR)
+				self.assertEqual(
+					(frappe.parse_json(current_request.data) or {})["payrexx_transaction"],
+					chargeback_transaction,
+				)
+				self.assertEqual(
+					frappe.db.count(
+						"ToDo",
+						{
+							"reference_type": "Integration Request",
+							"reference_name": integration_request_name,
+							"description": ["like", f"{ps_module.CHARGEBACK_TODO_MARKER}%"],
+						},
+					),
+					1,
+				)
+		finally:
+			with self.primary_connection():
+				frappe.db.rollback()
+			with self.primary_connection(), self.secondary_connection():
+				frappe.db.rollback()
+				frappe.db.delete(
+					"ToDo",
+					{
+						"reference_type": "Integration Request",
+						"reference_name": integration_request_name,
+					},
+				)
+				frappe.db.delete("Integration Request", {"name": integration_request_name})
+				frappe.db.commit()
+
+	def test_reconciliation_failure_preserves_concurrent_terminal_evidence(self):
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		terminal_cases = (
+			(
+				"chargeback",
+				{"payrexx_transaction": {"id": 91001, "status": "chargeback"}},
+				ps_module.CHARGEBACK_ERROR,
+			),
+			(
+				"settlement conflict",
+				{
+					"payrexx_transaction": {"id": 91002, "status": "confirmed"},
+					ps_module.SETTLEMENT_CONFLICT_DATA_KEY: {
+						"version": 1,
+						"terminal": True,
+						"code": "amount_mismatch",
+					},
+				},
+				"Provider amount does not match the requested amount.",
+			),
+		)
+
+		for label, terminal_data, terminal_error in terminal_cases:
+			with self.subTest(terminal_state=label):
+				integration_request_name = f"PAYREXX-CONCURRENT-IR-{frappe.generate_hash(length=10)}"
+				initial_data = {
+					"payrexx_gateway_id": 91000,
+					"payrexx_settings": GATEWAY_NAME,
+				}
+				with self.primary_connection(), self.secondary_connection():
+					frappe.get_doc(
+						{
+							"doctype": "Integration Request",
+							"name": integration_request_name,
+							"integration_request_service": "Payrexx",
+							"status": "Queued",
+							"data": frappe.as_json(initial_data),
+						}
+					).db_insert()
+					frappe.db.commit()
+
+				try:
+					with self.primary_connection():
+						stale_request = frappe.get_doc("Integration Request", integration_request_name)
+						self.assertEqual(stale_request.status, "Queued")
+
+					with self.primary_connection(), self.secondary_connection():
+						frappe.db.set_value(
+							"Integration Request",
+							integration_request_name,
+							{
+								"status": "Failed",
+								"error": terminal_error,
+								"data": frappe.as_json(terminal_data),
+							},
+							update_modified=False,
+						)
+						frappe.db.commit()
+
+					with self.primary_connection():
+						client = Mock()
+						client.retrieve_gateway.return_value = {
+							"status": "declined",
+							"invoices": [],
+						}
+						settings = frappe._dict(_client=lambda: client)
+						attempts = []
+						reconcile_once = ps_module._reconcile_integration_request_once
+
+						def count_attempts(request_name, gateway_name=None):
+							attempts.append((request_name, gateway_name))
+							return reconcile_once(request_name, gateway_name)
+
+						with (
+							patch.object(ps_module, "_resolve_settings", return_value=settings),
+							patch.object(
+								ps_module,
+								"_reconcile_integration_request_once",
+								side_effect=count_attempts,
+							),
+							patch.object(ps_module.time, "sleep") as sleep,
+						):
+							self.assertFalse(
+								ps_module.reconcile_integration_request(integration_request_name)
+							)
+
+						self.assertEqual(
+							attempts,
+							[
+								(integration_request_name, None),
+								(integration_request_name, None),
+							],
+						)
+						sleep.assert_called_once_with(0.25)
+						client.retrieve_gateway.assert_called_once_with(91000)
+						current_request = frappe.get_doc(
+							"Integration Request",
+							integration_request_name,
+							for_update=True,
+						)
+						self.assertEqual(current_request.status, "Failed")
+						self.assertEqual(current_request.error, terminal_error)
+						self.assertEqual(frappe.parse_json(current_request.data), terminal_data)
+				finally:
+					with self.primary_connection():
+						frappe.db.rollback()
+					with self.primary_connection(), self.secondary_connection():
+						frappe.db.rollback()
+						frappe.db.delete(
+							"Integration Request",
+							{"name": integration_request_name},
+						)
+						frappe.db.commit()
+
+	def test_waiting_callback_observes_concurrently_completed_request(self):
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		integration_request_name = f"PAYREXX-CONCURRENT-IR-{frappe.generate_hash(length=10)}"
+		confirmed_transaction = {
+			"id": 92001,
+			"status": "confirmed",
+			"amount": 10000,
+			"currency": "CHF",
+		}
+		with self.primary_connection(), self.secondary_connection():
+			frappe.get_doc(
+				{
+					"doctype": "Integration Request",
+					"name": integration_request_name,
+					"integration_request_service": "Payrexx",
+					"status": "Queued",
+					"data": frappe.as_json({"payrexx_settings": GATEWAY_NAME}),
+				}
+			).db_insert()
+			frappe.db.commit()
+
+		try:
+			with self.primary_connection():
+				_ensure_settings()
+				stale_request = frappe.get_doc("Integration Request", integration_request_name)
+				self.assertEqual(stale_request.status, "Queued")
+
+			with self.primary_connection(), self.secondary_connection():
+				frappe.db.set_value(
+					"Integration Request",
+					integration_request_name,
+					{
+						"status": "Completed",
+						"data": frappe.as_json(
+							{
+								"payrexx_settings": GATEWAY_NAME,
+								"payrexx_transaction": confirmed_transaction,
+							}
+						),
+					},
+					update_modified=False,
+				)
+				frappe.db.commit()
+
+			waiting_transaction = {
+				"id": 92002,
+				"status": "waiting",
+				"referenceId": integration_request_name,
+				"invoice": {"referenceId": integration_request_name},
+			}
+			body = frappe.as_json({"transaction": waiting_transaction}).encode()
+			signature = base64.b64encode(hmac.new(b"whk_test_dummy", body, hashlib.sha256).digest()).decode(
+				"ascii"
+			)
+
+			class _FakeRequest:
+				def __init__(self):
+					self.args = {}
+					self.form = {}
+
+				def get_data(self):
+					return body
+
+			with self.primary_connection():
+				original_request = getattr(frappe.local, "request", None)
+				frappe.local.request = _FakeRequest()
+				attempts = []
+				process_callback = ps_module._process_callback_transaction
+
+				def count_attempts(settings_name, transaction, reference_id, status):
+					attempts.append((settings_name, transaction, reference_id, status))
+					return process_callback(settings_name, transaction, reference_id, status)
+
+				try:
+					with (
+						patch.object(frappe, "get_request_header", return_value=signature),
+						patch.object(
+							ps_module,
+							"_process_callback_transaction",
+							side_effect=count_attempts,
+						),
+						patch.object(ps_module.time, "sleep") as sleep,
+					):
+						self.assertEqual(ps_module.callback(gateway_name=GATEWAY_NAME), {"ok": True})
+				finally:
+					if original_request is None:
+						delattr(frappe.local, "request")
+					else:
+						frappe.local.request = original_request
+
+				self.assertEqual(len(attempts), 2)
+				self.assertEqual(
+					attempts[0],
+					(GATEWAY_NAME, waiting_transaction, integration_request_name, "waiting"),
+				)
+				self.assertEqual(attempts[1], attempts[0])
+				sleep.assert_called_once_with(0.25)
+				current_request = frappe.get_doc(
+					"Integration Request",
+					integration_request_name,
+					for_update=True,
+				)
+				self.assertEqual(current_request.status, "Completed")
+				self.assertEqual(
+					(frappe.parse_json(current_request.data) or {})["payrexx_transaction"],
+					confirmed_transaction,
+				)
+		finally:
+			with self.primary_connection():
+				frappe.db.rollback()
+			with self.primary_connection(), self.secondary_connection():
+				frappe.db.rollback()
+				frappe.db.delete("Integration Request", {"name": integration_request_name})
+				frappe.db.commit()

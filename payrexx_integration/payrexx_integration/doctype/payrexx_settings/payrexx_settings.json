@@ -49,7 +49,7 @@
   },
   {
    "default": "payrexx.com",
-   "description": "API base domain for Payrexx platform accounts. Use payrexx.com for normal Payrexx instances, or e.g. pay.goodvantage.ch for customer.pay.goodvantage.ch.",
+   "description": "Host-only API base domain. Use payrexx.com normally. Custom platform domains (e.g. pay.goodvantage.ch) require the exact final host (api.pay.goodvantage.ch) in site_config payrexx_allowed_api_hosts.",
    "fieldname": "api_base_domain",
    "fieldtype": "Data",
    "label": "API Base Domain",

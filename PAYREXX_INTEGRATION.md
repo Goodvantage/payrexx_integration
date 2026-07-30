@@ -37,9 +37,9 @@ Sales Invoice-backed Payment Request
         │ get_payment_url()        ← controller method on Payrexx Settings
         ▼
 Payrexx Settings.get_payment_url()
-        │  • create_request_log()  → Integration Request (Queued)
+        │  • app-owned insert      → uncommitted Integration Request (Queued)
         │  • POST /Gateway/        → Payrexx hosted checkout URL
-        │  • stash gateway id on Integration Request.data
+        │  • atomically store id/hash/link/amount/currency in request transaction
         ▼
 Customer pays on https://<instance>.payrexx.com/...
         │
@@ -50,8 +50,8 @@ Payrexx → POST callback URL (webhook)
         │  • update status → Completed / Authorized / Failed
         │  • settle the Payment Request through set_as_paid()
         ▼
-Customer returns through server-side reconciliation; a confirmed transaction then
-redirect to the same-site redirect_to when present, otherwise /payment-success
+Customer returns through server-side reconciliation; an IR-bound confirmed
+transaction redirects to same-site redirect_to when present, otherwise /payment-success
 ```
 
 ---
@@ -96,7 +96,7 @@ row order or names such as `Live` and `Sandbox`.
 |---|---|---|
 | `gateway_name` | Data, unique, reqd | `Live`, `Sandbox`, … — used to build `Payrexx-{name}` |
 | `instance_name` | Data, reqd | Payrexx instance subdomain. For `customer.pay.goodvantage.ch`, use `customer` |
-| `api_base_domain` | Data, default `payrexx.com`, reqd | API base domain. Normal accounts use `payrexx.com`; platform accounts use the remaining domain, e.g. `pay.goodvantage.ch` |
+| `api_base_domain` | Data, default `payrexx.com`, reqd | Host-only API base domain. Normal accounts use `payrexx.com`; platform accounts use the remaining domain, e.g. `pay.goodvantage.ch`, with exact final host allowlisting |
 | `api_version` | Data, default `v1.14` | Bump without code change |
 | `api_secret` | Password, reqd | Sent as `x-api-key` header |
 | `webhook_signing_key` | Password, reqd | HMAC key for `X-Webhook-Signature` |
@@ -146,9 +146,19 @@ In the desk, open **Payrexx Settings → New** and fill in:
 For a partner checkout domain such as `customer.pay.goodvantage.ch`, set
 `Instance Name` to `customer` and `API Base Domain` to
 `pay.goodvantage.ch`. The app then calls
-`https://api.pay.goodvantage.ch/v1.14/...`. If that custom API host rejects the
-instance credentials with 401/403/404, the client retries once on the default
-`https://api.payrexx.com/v1.14/...` host.
+`https://api.pay.goodvantage.ch/v1.14/...`. First add that exact final host to
+the site-config JSON list:
+
+```bash
+bench --site <site> set-config --parse payrexx_allowed_api_hosts '["api.pay.goodvantage.ch"]'
+```
+
+Canonical API hosts under `payrexx.com` need no override. Custom entries must be
+exact bare hostnames: userinfo, URL schemes/paths/query/fragment, IP literals,
+wildcards, malformed names, control characters, and ports other than 443 are
+rejected before the API secret is read. If an allowed custom API host rejects
+the instance credentials with 401/403/404, the client retries once on trusted
+`https://api.payrexx.com/v1.14/...`.
 
 After `Gateway Name` is filled, the settings form immediately displays the
 webhook callback URL using the configured public `host_name` where available.
@@ -200,7 +210,27 @@ In a `Payment Request` sourced from a submitted Sales Invoice, pick
 Payment Requests sourced from Sales Orders or any other doctype are rejected
 before an Integration Request or provider Gateway is created. This integration
 does not implement Sales Order advance-payable/idempotency semantics and must
-not be used to create order advances.
+not be used to create order advances. Existing invoice checkouts are reused only
+while current locked state proves a wholly unpaid invoice and a submitted,
+`Requested`, fully outstanding Payment Request whose amount, currency, source,
+gateway, and persisted provider metadata all match exactly. Partial or changed
+receivables fail before provider contact. The Sales Invoice boundary also takes
+a current locking read of all submitted active `Payrexx-*` Payment Requests, so
+concurrent full-value drafts cannot each create a Gateway; one proceeds and the
+other is preserved/rejected. Existing checkout reuse follows settlement's
+Integration Request → Payment Request → Sales Invoice lock order. Bounded
+checkout retries are permitted only before any Gateway POST attempt.
+
+Checkout Integration Requests are inserted by this app without calling core
+`create_request_log()` or committing. Provider id/hash/link metadata and the
+Payment Request persist atomically with the caller transaction. A provider
+Gateway response immediately writes non-secret
+`[Payrexx Gateway recovery] state=local_commit_pending` evidence; successful
+commit and ordinary rollback add their corresponding outcome records. An
+unpaired pending record covers Frappe's residual commit-failure window after
+rollback callbacks were cleared but before SQL commit completed. Review local
+and provider state manually; only a Gateway with no transaction and no complete
+local owner may be deleted before retrying.
 
 ---
 
@@ -208,7 +238,7 @@ not be used to create order advances.
 
 | | |
 |---|---|
-| **Base URL** | `https://api.<api_base_domain>/v1.14/`, default `https://api.payrexx.com/v1.14/` |
+| **Base URL** | `https://api.<api_base_domain>/v1.14/`, default `https://api.payrexx.com/v1.14/`; custom final hosts require `payrexx_allowed_api_hosts` |
 | **Auth** | `x-api-key: <api_secret>` header |
 | **Required query param** | `?instance=<your_instance>` on every request |
 | **POST body format** | `application/x-www-form-urlencoded` |
@@ -276,14 +306,25 @@ Failed for manual accounting review. After chargeback evidence is stored, every
 non-chargeback replay, including `confirmed`, preserves Failed status, the
 chargeback error, and the first chargeback transaction. Duplicate chargeback
 delivery is idempotent.
+Mutable callback and settlement documents are loaded directly with their
+`FOR UPDATE` lock; they are never locked by a scalar query and then reloaded from
+the older `REPEATABLE READ` snapshot. Standard settlement locks Integration
+Request, Payment Request, and Sales Invoice in that order.
+MariaDB error 1020 and other `QueryDeadlockError` failures propagate out of
+locked helpers. Callback, reconciliation, chargeback, and settlement boundaries
+roll back before replaying their complete atomic unit, with at most three
+attempts and bounded linear backoff. Code never continues in the failed
+transaction.
 
 The integration does not initiate capture, later-charge, void/cancel, or refund
 operations. Perform those provider actions in Payrexx and post the approved
 ERPNext accounting reversal manually.
 
 Success-return reconciliation requires a confirmed transaction inside the
-retrieved Gateway's `invoices[].transactions[]`. A Gateway-level `confirmed`
-status by itself never settles the Payment Request or produces a success return.
+retrieved Gateway's `invoices[].transactions[]` whose provider `referenceId`
+matches the expected Integration Request. A Gateway-level `confirmed` status or
+a confirmed transaction with a missing/different reference never settles the
+Payment Request or produces a success return.
 Unsupported legacy/in-flight Payment Requests become terminal settlement
 conflicts without calling `set_as_paid()`.
 
@@ -306,6 +347,8 @@ Run the app-owned Python suites with separate module commands:
 cd /workspace/development/frappe-bench
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_settlement_validation
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_checkout_security
 bench --site development16.localhost run-tests \
   --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings
 bench --site development16.localhost run-tests \

@@ -1,11 +1,17 @@
 # Copyright (c) 2026, Goodvantage GmbH and contributors
 
+import ipaddress
+import re
 from urllib.parse import urlencode, urlsplit
 
+import frappe
 from frappe.integrations.utils import make_get_request, make_post_request
 from requests import HTTPError
 
 DEFAULT_API_BASE_DOMAIN = "payrexx.com"
+ALLOWED_API_HOSTS_CONFIG = "payrexx_allowed_api_hosts"
+_HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class PayrexxAPIError(RuntimeError):
@@ -30,12 +36,14 @@ class PayrexxClient:
 	):
 		if not instance:
 			raise ValueError("Payrexx instance name is required")
+		# Validate the destination before retaining or using the API secret. Settings
+		# callers perform the same validation before reading the Password field.
+		self.api_base_domain = _normalize_api_base_domain(api_base_domain)
 		if not api_secret:
 			raise ValueError("Payrexx API secret is required")
 		self.instance = instance
 		self.api_secret = api_secret
 		self.version = api_version
-		self.api_base_domain = _normalize_api_base_domain(api_base_domain)
 
 	# ----------------------------------------------------------------- Gateway
 
@@ -70,27 +78,31 @@ class PayrexxClient:
 	# ----------------------------------------------------------------- internal
 
 	def _get(self, path: str) -> dict:
+		url = self._url(path)
 		try:
-			return make_get_request(url=self._url(path), headers=self._headers())
+			return make_get_request(url=url, headers=self._headers())
 		except Exception as exc:
 			if self._should_retry_default_domain(exc):
+				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
 				return make_get_request(
-					url=self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN),
+					url=fallback_url,
 					headers=self._headers(),
 				)
 			raise
 
 	def _post(self, path: str, *, data: dict) -> dict:
+		url = self._url(path)
 		headers = {
 			**self._headers(),
 			"Content-Type": "application/x-www-form-urlencoded",
 		}
 		try:
-			return make_post_request(url=self._url(path), data=data, headers=headers)
+			return make_post_request(url=url, data=data, headers=headers)
 		except Exception as exc:
 			if self._should_retry_default_domain(exc):
+				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
 				return make_post_request(
-					url=self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN),
+					url=fallback_url,
 					data=data,
 					headers=headers,
 				)
@@ -114,7 +126,7 @@ class PayrexxClient:
 		q = {"instance": self.instance}
 		if query:
 			q.update(query)
-		domain = api_base_domain or self.api_base_domain
+		domain = _normalize_api_base_domain(api_base_domain or self.api_base_domain)
 		return f"https://api.{domain}/{self.version}/{path.lstrip('/')}?{urlencode(q)}"
 
 	def _headers(self) -> dict:
@@ -130,16 +142,81 @@ def _unwrap(resp: dict) -> dict:
 
 
 def _normalize_api_base_domain(value: str | None) -> str:
-	raw = (value or DEFAULT_API_BASE_DOMAIN).strip().rstrip("/")
-	if not raw:
-		return DEFAULT_API_BASE_DOMAIN
-	if "://" in raw:
-		parts = urlsplit(raw)
-		raw = parts.netloc or parts.path
-	raw = raw.strip().strip("/")
-	if raw.startswith("api."):
-		raw = raw[4:]
-	return raw or DEFAULT_API_BASE_DOMAIN
+	host = _parse_bare_host(value or DEFAULT_API_BASE_DOMAIN, "Payrexx API Base Domain")
+	if host.startswith("api."):
+		host = host.removeprefix("api.")
+	if not host or host.startswith("api."):
+		raise ValueError("Payrexx API Base Domain is malformed")
+
+	api_host = f"api.{host}"
+	if _is_canonical_payrexx_host(api_host) or api_host in _configured_allowed_api_hosts():
+		return host
+	raise ValueError(
+		f"Payrexx API host {api_host} is not trusted; add the exact host to "
+		f"{ALLOWED_API_HOSTS_CONFIG} in site_config.json"
+	)
+
+
+def _parse_bare_host(value: str, label: str) -> str:
+	if not isinstance(value, str) or not value or value != value.strip():
+		raise ValueError(f"{label} must be a bare hostname")
+	if _CONTROL_CHARACTERS.search(value):
+		raise ValueError(f"{label} contains control characters")
+	if "://" in value:
+		raise ValueError(f"{label} must not include a URL scheme")
+
+	try:
+		parts = urlsplit(f"//{value}")
+		port = parts.port
+	except ValueError as exc:
+		raise ValueError(f"{label} is malformed") from exc
+	if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+		raise ValueError(f"{label} must not include user information")
+	if parts.path or parts.query or parts.fragment:
+		raise ValueError(f"{label} must not include a path, query, or fragment")
+	if port not in (None, 443):
+		raise ValueError(f"{label} must not include port {port}")
+
+	host = (parts.hostname or "").lower()
+	if not host or host.endswith(".") or len(host) > 253:
+		raise ValueError(f"{label} is malformed")
+	normalized_netloc = host if port is None else f"{host}:{port}"
+	if parts.netloc.lower() != normalized_netloc:
+		raise ValueError(f"{label} is malformed")
+	try:
+		host.encode("ascii")
+	except UnicodeEncodeError as exc:
+		raise ValueError(f"{label} must use an ASCII hostname") from exc
+	try:
+		ipaddress.ip_address(host)
+	except ValueError:
+		pass
+	else:
+		raise ValueError(f"{label} must not be an IP address")
+
+	labels = host.split(".")
+	if len(labels) < 2 or all(part.isdigit() for part in labels):
+		raise ValueError(f"{label} is malformed")
+	if any(not _HOST_LABEL.fullmatch(part) for part in labels):
+		raise ValueError(f"{label} is malformed")
+	return host
+
+
+def _is_canonical_payrexx_host(host: str) -> bool:
+	return host == "api.payrexx.com" or host.endswith(".payrexx.com")
+
+
+def _configured_allowed_api_hosts() -> set[str]:
+	configured = frappe.conf.get(ALLOWED_API_HOSTS_CONFIG)
+	if configured in (None, ""):
+		return set()
+	if not isinstance(configured, list):
+		raise ValueError(f"{ALLOWED_API_HOSTS_CONFIG} must be a JSON list of exact API hostnames")
+
+	allowed_hosts = set()
+	for value in configured:
+		allowed_hosts.add(_parse_bare_host(value, ALLOWED_API_HOSTS_CONFIG))
+	return allowed_hosts
 
 
 def get_http_status(exc: Exception) -> int | None:

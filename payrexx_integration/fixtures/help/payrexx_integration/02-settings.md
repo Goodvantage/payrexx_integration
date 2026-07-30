@@ -24,6 +24,19 @@ Der **Payrexx Settings** Datensatz enthält die Zugangsdaten und das Verhalten f
 - **Gateway Validity**: optionale Gültigkeit des Checkout-Links in Minuten.
 - **Redirect Overrides**: optionale globale Ziel-URLs für Erfolg, Fehler und Abbruch.
 
+Payrexx-eigene API-Hosts unter `payrexx.com` sind standardmässig erlaubt. Eine
+Plattform-Domain wie `pay.goodvantage.ch` muss zusätzlich als exakter finaler
+API-Host in der Site-Konfiguration freigegeben werden:
+
+```bash
+bench --site <site> set-config --parse payrexx_allowed_api_hosts '["api.pay.goodvantage.ch"]'
+```
+
+Die Freigabe ist eine JSON-Liste ohne Schema, Pfad oder Wildcards. IP-Adressen,
+Benutzerinformationen, Query/Fragment und andere Ports als HTTPS 443 werden
+abgelehnt, bevor das API Secret gelesen wird. Nach einer Änderung die
+langlaufenden Web- und Worker-Prozesse neu starten.
+
 Sobald **Gateway Name** ausgefüllt ist, zeigt bereits das ungespeicherte Formular die Webhook URL an. Diese URL zuerst in Payrexx anlegen, den dort erzeugten Signing Key in **Webhook Signing Key** eintragen und erst danach speichern. Beim Speichern werden die API-Zugangsdaten geprüft und der Payment Gateway `Payrexx-<Gateway Name>` erzeugt.
 
 ## Payment Gateway Account

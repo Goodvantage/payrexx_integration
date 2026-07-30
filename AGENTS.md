@@ -47,10 +47,10 @@ procedures), and the code. Record new or changed requirements in
 |---|---|
 | `gateway_selection.py` | Canonical strict resolver shared by native flows and downstream apps. Supports explicit selection, a caller-owned site-config key, and unambiguous single-row fallback. |
 | `payrexx_integration/payrexx_integration/doctype/payrexx_settings/` | The settings DocType. One row per environment (`Sandbox` / `Live`). `on_update` auto-creates the matching `Payment Gateway` row (`Payrexx-<gateway_name>`). |
-| `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client. **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The legacy `ApiSignature` body field is no longer used. Supports Payrexx Platform domains through `Payrexx Settings.api_base_domain`. |
+| `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client. **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The legacy `ApiSignature` body field is no longer used. Canonical `*.payrexx.com` API hosts are trusted by default; custom Platform hosts require exact `payrexx_allowed_api_hosts` site-config entries and are validated before secret access. |
 | `payrexx_integration/payrexx_integration/payrexx/webhook_validator.py` | HMAC-SHA256 verification of `X-Webhook-Signature`. Tries base64 first, falls back to hex. The signing key is **separate** from the API secret (configured per webhook in the Payrexx dashboard). |
 | `api.py::payrexx_pay_url(sales_invoice, gateway_name=None)` | Jinja helper (registered via `hooks.py.jinja`). Resolves the gateway and returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
-| `api.py::pay_invoice(si=None, token=None, gateway_name=None)` | Whitelisted GET redirect endpoint. Verifies the invoice-and-gateway-bound HMAC token, looks up the Sales Invoice, lazy-creates a Payment Request via ERPNext's `make_payment_request`, and 302s to the Payrexx hosted checkout. Because Frappe otherwise rolls back GET transactions, it sets `frappe.local.flags.commit` only after successful local setup and checkout URL resolution. **All args remain optional kwargs** so missing-param requests return clean 403, not 500. |
+| `api.py::pay_invoice(si=None, token=None, gateway_name=None)` | Whitelisted GET redirect endpoint. Verifies the invoice-and-gateway-bound HMAC token, locks/revalidates the wholly unpaid invoice and exact submitted/Requested Payment Request plus Integration Request checkout metadata, lazy-creates through ERPNext only when safe, and 302s to Payrexx. Because Frappe otherwise rolls back GET transactions, it sets `frappe.local.flags.commit` only after atomic local setup and checkout URL resolution. **All args remain optional kwargs** so missing-param requests return clean 403, not 500. |
 | `hosted_qa.py` | Explicitly gated, System-Manager-and-Accounts-Manager-only, read-only hosted sandbox preflight and settlement evidence. Exact invoice/gateway targets come from site config; never add checkout creation, callback replay, or reconciliation here. |
 | `tests/hosted_settlement_qa.py` | Protected hosted CLI. Credentials and target allowlists are environment-only; persisted state contains no signed/provider URLs or transaction identifiers. |
 | `playwright/` | Self-contained Playwright project (npm). Covers the Payrexx Settings desk flow, `pay_invoice` endpoint auth, and an optional existing Good Event Booking → invoice email flow. Test data remains owned by Good Event; this app must not seed Buzz/Event records. |
@@ -100,7 +100,9 @@ retried.
 
 This endpoint is a fallback reconciliation path. It retrieves the Payrexx
 Gateway server-side and only completes the Integration Request when the Gateway
-contains an actual confirmed transaction; Gateway status alone is insufficient.
+contains an actual confirmed transaction whose provider `referenceId` belongs
+to the expected Integration Request; Gateway status alone and cross-reference
+transactions are insufficient.
 It then redirects directly to the
 Integration Request's same-site `redirect_to` when present, otherwise to the
 standard `/payment-success` page. Because the provider return is a GET, it sets
@@ -122,7 +124,7 @@ URLs resolve correctly.
 
 | | |
 |---|---|
-| Base URL | `https://api.<api_base_domain>/v1.14/`; default `https://api.payrexx.com/v1.14/` |
+| Base URL | `https://api.<api_base_domain>/v1.14/`; default `https://api.payrexx.com/v1.14/`; custom final hosts require exact `payrexx_allowed_api_hosts` entries |
 | Auth | `x-api-key: <api_secret>` header |
 | Required query param | `?instance=<instance_name>` on every call |
 | POST body format | `application/x-www-form-urlencoded` |
@@ -136,9 +138,23 @@ by `_ping()` — HTTP 200 with `status: error` means creds are valid.
 For Payrexx Platform / partner accounts, split the checkout/login domain:
 `customer.pay.goodvantage.ch` means `instance_name = "customer"` and
 `api_base_domain = "pay.goodvantage.ch"`. Do not put the full login domain in
-`instance_name`. If a custom API domain returns 401/403/404, the client retries
-the same request once against `api.payrexx.com` so instance API keys still work
-when only the checkout/login surface uses a custom domain.
+`instance_name`. Add the exact final host (`api.pay.goodvantage.ch`) to the
+site-config JSON list `payrexx_allowed_api_hosts` before saving. URL-like values,
+IP literals, malformed hosts, wildcards, and non-HTTPS ports are rejected before
+the Password field is read. If an allowed custom API domain returns 401/403/404,
+the client retries the same request once against `api.payrexx.com` so instance
+API keys still work when only the checkout/login surface uses a custom domain.
+
+Checkout creation must use the app-owned `_create_integration_request()` path,
+never core `create_request_log()` (it commits). Provider metadata and the
+Payment Request persist atomically with the caller transaction. Provider success
+immediately journals `[Payrexx Gateway recovery] state=local_commit_pending`;
+commit adds `local_commit_confirmed` and ordinary rollback adds
+`[Payrexx possible orphan Gateway] state=local_rollback_confirmed`. Frappe clears
+rollback callbacks before SQL commit, so an unpaired pending record is the exact
+commit-failure residual. Operators search by `referenceId`/Gateway id and delete
+only a transaction-free external orphan; never add an internal commit or blind
+provider teardown to close this gap.
 
 ### Status mapping (webhook)
 
@@ -174,6 +190,9 @@ workflows until an explicit, tested contract is implemented.
 # Focused Python tests
 bench --site <site> run-tests \
   --module payrexx_integration.tests.test_settlement_validation
+
+bench --site <site> run-tests \
+  --module payrexx_integration.tests.test_checkout_security
 
 bench --site <site> run-tests \
   --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings
@@ -215,6 +234,30 @@ the provider page human-operated, require provider `TEST` evidence, and disable
   row by name or creation order. Gateway-unbound legacy payment links work only
   when one settings row exists; resend them after selecting a gateway when the
   site has multiple rows.
+- **Checkout URL reuse is strict.** A Payment Request URL is reused only when
+  current locking reads prove submitted/Requested/fully outstanding state and
+  exact invoice plus Integration Request amount/currency/source/provider
+  metadata. Partial or changed receivables stop before provider contact.
+- **One active Payrexx request per invoice.** Before every Gateway POST, lock
+  the Sales Invoice and current submitted active `Payrexx-*` Payment Requests.
+  Any other active request blocks provider contact; preserve draft and
+  terminal/cancelled history.
+- **Lock and hydrate in one read.** For mutable callback/settlement state, use
+  `frappe.get_doc(..., for_update=True)` (or the app helper wrapping it). Never
+  issue a scalar `for_update` query and then call ordinary `get_doc()`; under
+  MariaDB `REPEATABLE READ` that reload can return an older snapshot. Keep the
+  standard settlement and existing-checkout reuse order Integration Request →
+  Payment Request → Sales Invoice. New creation may start from the Sales Invoice
+  only while no active Integration Request exists; restart if one appears.
+- **Retry only at transaction boundaries.** MariaDB error 1020 is exposed as
+  `QueryDeadlockError`. Locked one-attempt helpers must propagate it; callback,
+  reconciliation, chargeback, settlement, and pay-link checkout boundaries roll
+  back before replaying the complete unit, at most three times. Checkout retries
+  stop permanently once a provider POST has been attempted. Never catch a
+  deadlock and continue inside the failed transaction or replay Gateway creation.
+- **Custom API hosts are opt-in.** Keep `api_base_domain` host-only and add the
+  final `api.<base-domain>` hostname exactly to `payrexx_allowed_api_hosts`; do
+  not weaken the parser or move `get_password("api_secret")` before validation.
 - **No URL hard-coding** — externally shared URLs go through
   `payrexx_integration.url_utils.get_public_url()`, which respects
   `host_name` without leaking the local bench port. The Playwright config is

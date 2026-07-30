@@ -33,9 +33,17 @@ store only the first subdomain in `instance_name` and the remaining platform
 domain in `api_base_domain`; for example, `customer.pay.goodvantage.ch`
 uses `instance_name = "customer"` and
 `api_base_domain = "pay.goodvantage.ch"`, producing API calls to
-`https://api.pay.goodvantage.ch/...`. If a custom API domain rejects the
-instance credentials with 401/403/404, the client retries the same request
-against the default `api.payrexx.com` host. This keeps instance API keys working
+`https://api.pay.goodvantage.ch/...`. Canonical Payrexx-owned API hosts under
+`payrexx.com` are trusted by default. Every custom final host must be listed
+exactly in the site-config JSON list `payrexx_allowed_api_hosts`, for example
+`["api.pay.goodvantage.ch"]`; entries are hostnames, not base-domain values or
+URLs. The strict parser rejects userinfo, schemes, paths, queries, fragments,
+control characters, IP literals, malformed DNS names, wildcard entries, and
+ports other than explicit HTTPS 443. `PayrexxSettings._client()` validates this
+destination before reading the Password field, and the client validates it
+again before constructing request headers. If an allowed custom API domain
+rejects the instance credentials with 401/403/404, the client retries the same
+request against trusted `api.payrexx.com`. This keeps instance API keys working
 when a checkout/login custom domain exists but the REST API still authenticates
 on Payrexx's default API domain.
 
@@ -64,10 +72,35 @@ Pay-by-email links are generated only for submitted Sales Invoices. Draft
 invoices return no payment URL, and `pay_invoice` rejects draft invoices before
 creating a Payrexx gateway. Submitting the ERPNext Payment Request creates the
 Payrexx Gateway and stores its URL; `pay_invoice` redirects to that stored URL
-instead of requesting a second checkout. If a legacy Payment Request has no URL,
-the app recovers the URL recorded in its active Integration Request. An active
-request with no recoverable URL raises a clean error rather than creating a
-potential duplicate checkout.
+instead of requesting a second checkout only after current locking reads prove
+the Sales Invoice remains wholly unpaid and the Payment Request remains an
+inward, submitted, `Requested`, fully outstanding request with the exact same
+full amount, currency, company, source, and gateway. It then locks the active
+Integration Request and compares both references, the original amount, currency,
+gateway, owning settings row, canonical provider amount/currency, provider
+id/hash, and checkout URL. A partial payment, changed request, ambiguous active
+request, stale URL, or incomplete metadata fails before any provider contact.
+If a matching legacy Payment Request has no URL, the app recovers the URL only
+from this complete exact Integration Request. A fully matching manual request
+with neither URL nor active checkout may create one while both source and
+Payment Request locks are held.
+
+Existing-checkout reuse uses the same lock direction as settlement:
+Integration Request, all submitted active Payrexx Payment Request rows for the
+invoice, then Sales Invoice. New checkout creation has no externally visible
+Integration Request yet, so it serializes first on the Sales Invoice and takes a
+current locking read of every submitted active Payrexx Payment Request before
+provider contact. Any other active Payrexx request, including one for another
+settings row, blocks creation. Drafts and terminal/cancelled history remain
+untouched. This also covers two staff-created full-value drafts submitted at the
+same time: one may create the Gateway, while the other is preserved and rejected
+before its provider call.
+
+The complete pay-link checkout boundary retries a changed lock-order discovery
+or `QueryDeadlockError` at most three times, rolling back before each replay.
+Retries are allowed only while the current attempt has not started the Payrexx
+Gateway POST. Once provider contact begins, any later deadlock is rolled back
+and surfaced; external Gateway creation is never blindly replayed.
 
 Payrexx checkout and automatic settlement support Payment Requests whose source
 is a Sales Invoice. The controller checks the Payment Request source before
@@ -82,15 +115,39 @@ does not authorize the source.
 
 The pay-by-email endpoint is necessarily an HTTP GET. Frappe normally rolls
 back GET transactions, so `pay_invoice` sets the framework end-of-request commit
-flag only after Payment Request creation and checkout URL resolution both
-succeed. Exceptions retain Frappe's normal rollback behavior. Without that flag,
-the external Gateway can be created while the submitted Payment Request and the
-stored checkout metadata are rolled back locally.
+flag only after Payment Request creation, the app-owned Integration Request, and
+complete checkout metadata all succeed. The app intentionally does not call
+core `create_request_log()`, because that helper unconditionally commits. Its
+own `_create_integration_request()` inserts the Queued row without transaction
+control; provider id/hash/link and canonical amount/currency are saved in that
+same caller transaction. Provider failures therefore roll back Payment Request
+and Integration Request state together rather than persisting an incomplete
+checkout.
+
+A provider Gateway cannot participate in the local database transaction. As
+soon as Payrexx returns one, the app writes compact non-secret
+`[Payrexx Gateway recovery] state=local_commit_pending` evidence to the app file
+log, then registers outcome callbacks. A successful SQL transaction produces
+`state=local_commit_confirmed`; an ordinary rollback produces
+`[Payrexx possible orphan Gateway] state=local_rollback_confirmed`. Ambiguous
+provider failures log the Integration Request `referenceId` immediately. These
+records deliberately omit API keys, hashes, checkout URLs, and payer data.
+
+There is an exact residual framework gap: Frappe clears rollback callbacks
+before issuing SQL `COMMIT`. If that SQL call raises, neither outcome callback
+can prove the result. The already-written, unpaired `local_commit_pending` line
+therefore remains conservative durable recovery evidence. The app cannot safely
+add an internal commit or automatically delete the Gateway, because the commit
+outcome may be unknown and a provider transaction may already exist. Operators
+must compare the local Integration Request and Payrexx reference/id, delete only
+an unused Gateway with no transaction, and retry only after that review;
+incomplete local state is never committed as recovery.
 
 ERPNext `make_payment_request` re-uses any existing draft Payment Request for
 the same invoice without first applying the requested gateway. The pay-link
 flow therefore never deletes drafts. It reuses a pending request for the
-resolved gateway, but if another draft exists it preserves that draft, logs
+resolved gateway only after the exact current-state validation above; if a draft
+exists it preserves that draft, logs
 the conflict and fails closed with an instruction to contact the accounts
 team. A failed current endpoint attempt is rolled back with the request
 transaction rather than cleaned up by deleting persisted records.
@@ -166,15 +223,18 @@ whose ERPNext outstanding and gateway amounts use different units. A
 bank/manual partial or full payment therefore cannot be followed by a second
 automatic Payrexx ledger entry.
 
-The Integration Request becomes `Failed`, keeps the confirmed provider
-transaction, and stores a versioned `payrexx_settlement_conflict` object with a
-terminal flag, stable reason code, timestamp, and non-PII evidence snapshot. It
-also receives one high-priority settlement-conflict ToDo. Later authentic
-webhook and success-return replays preserve the first marker/evidence and cannot
-settle or reopen the request. No automated conflict-resolution endpoint exists;
-the supported path is accounting review followed by an approved refund or
-allocation and ToDo closure. Any future automated reopen flow requires a new
-explicit, tested contract.
+The locked Integration Request becomes `Failed` through a direct transactional
+field update, keeps the confirmed provider transaction, and stores a versioned
+`payrexx_settlement_conflict` object with a terminal flag, stable reason code,
+timestamp, and non-PII evidence snapshot. The direct update deliberately avoids
+ERPNext's authorization validation: if another Payment Entry already paid the
+request, that validation must not prevent recording the terminal conflict. The
+request also receives one high-priority settlement-conflict ToDo. Later
+authentic webhook and success-return replays preserve the first marker/evidence
+and cannot settle or reopen the request. No automated conflict-resolution
+endpoint exists; the supported path is accounting review followed by an
+approved refund or allocation and ToDo closure. Any future automated reopen
+flow requires a new explicit, tested contract.
 
 When settlement creates a Payment Entry, its exact name is stored in the
 Integration Request data as `payrexx_payment_entry` in the same transaction.
@@ -182,11 +242,29 @@ Hosted acceptance uses that provenance to distinguish provider settlement from
 an unrelated manual Payment Entry that ERPNext may automatically match to an
 open Payment Request.
 
-Transient `QueryDeadlockError` failures retry the entire locked completion unit:
-the Integration Request is reloaded, transaction data and status are saved, and
-the downstream settlement runs again in one transaction. Duplicate confirmed
-callbacks return after observing the locked completed row, while separate
-requests for the same Payment Request are serialized on that Payment Request.
+Transient `QueryDeadlockError` failures, including MariaDB error 1020 after a
+stale snapshot, are handled only by the complete callback, reconciliation,
+chargeback, settlement, or pay-link checkout boundary. Locked one-attempt
+helpers propagate the error. The boundary rolls back the failed transaction,
+waits with bounded linear backoff, and replays the whole atomic unit from a fresh
+snapshot, for at most three attempts; the final failure is also rolled back
+before it is re-raised. Checkout is stricter: it retries only before provider
+contact and never repeats a Gateway POST. This prevents code from continuing
+inside an invalid transaction and ensures a partial Integration Request or
+Payment Entry attempt is never retained.
+Duplicate confirmed callbacks return after observing the locked completed row,
+while separate requests for the same Payment Request are serialized on that
+Payment Request.
+Every mutable payment row used to authorize a state change is hydrated by the
+same current `FOR UPDATE` read that acquires its lock. The code never performs a
+scalar locking query followed by an ordinary `get_doc()` reload: under MariaDB
+`REPEATABLE READ`, that second query can return the transaction's older snapshot
+even though the first query locked a newer row. Standard settlement and
+existing-checkout reuse keep the lock order Integration Request, Payment
+Request, then Sales Invoice. Two-connection regressions establish stale
+snapshots explicitly and verify that a concurrent completion, Payment Entry,
+chargeback, settlement conflict, or competing manual checkout remains
+authoritative.
 Once an Integration Request is Completed, delayed or replayed webhook statuses
 such as `authorized`, `reserved`, `waiting`, provider failures, or `refunded`
 are ignored and cannot replace its confirmed transaction evidence. A verified
@@ -224,9 +302,13 @@ GET /api/method/payrexx_integration.api.payment_success?ir=<Integration Request>
 Payrexx success redirects reconcile the Integration Request by fetching the
 Gateway from Payrexx server-side. Webhooks remain the primary completion path,
 but the success return is a safe fallback because payment side effects run only
-when `invoices[].transactions[]` contains an actual `confirmed` transaction. A
-Gateway-level `confirmed` status without such a transaction is not settlement
-evidence and follows the failed-payment route. An already-Completed Integration
+when `invoices[].transactions[]` contains an actual `confirmed` transaction
+whose invoice, transaction, or Gateway `referenceId` exactly matches the
+expected Integration Request. A Gateway-level `confirmed` status, a missing
+transaction reference, or a confirmed transaction belonging to another request
+is not settlement evidence and follows the failed-payment route. If several
+confirmed transactions are present, mismatched ones are skipped and only an
+exactly bound transaction can be selected. An already-Completed Integration
 Request likewise returns success only when its stored `payrexx_transaction` is
 confirmed.
 The return endpoint is an HTTP GET, so it requests Frappe's end-of-request
@@ -286,7 +368,11 @@ Failed and preserves the first chargeback evidence.
 - Pay-by-email URLs are signed with an HMAC derived from the site's `encryption_key`.
 - Payrexx webhooks are validated with `X-Webhook-Signature`.
 - Webhook signing key and API secret are separate values.
+- API secrets are read and sent only after strict final-host validation; custom API hosts require an exact `payrexx_allowed_api_hosts` site-config entry.
+- Checkout reuse requires current locked receivable state plus exact persisted provider metadata; a stored URL alone is never trusted.
+- A new Gateway is rejected while any other submitted active Payrexx Payment Request exists for the invoice; terminal and cancelled history is preserved.
 - Webhook diagnostics avoid logging full payer/payment payloads.
+- Commit/rollback recovery logs contain provider/reference identifiers but no secret, checkout URL, hash, or payer data; an unpaired `local_commit_pending` record is an explicit manual-recovery condition.
 - Guest endpoints are intentionally whitelisted and documented in `SEMGREP_OVERRIDES.md`.
 
 ## Hosted Sandbox Acceptance
@@ -345,6 +431,9 @@ does not import the downstream app or interpret its site-config keys.
 cd frappe-bench
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_settlement_validation
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_checkout_security
 
 bench --site development16.localhost run-tests \
   --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings

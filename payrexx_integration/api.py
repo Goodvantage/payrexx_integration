@@ -16,12 +16,22 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import time
 from urllib.parse import urlencode
 
 import frappe
 from frappe import _
 
 from payrexx_integration.gateway_selection import resolve_payrexx_settings
+from payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings import (
+	CHECKOUT_PROVIDER_CONTACT_FLAG,
+	DEADLOCK_MAX_ATTEMPTS,
+	_canonical_gateway_amount,
+	_get_active_payrexx_payment_requests,
+	_provider_gateway_amount,
+	_validate_payment_request_checkout_state,
+	_validate_sales_invoice_checkout_state,
+)
 from payrexx_integration.session_utils import as_automation_user
 from payrexx_integration.url_utils import get_public_url
 from payrexx_integration.url_utils import safe_return_url as _safe_return_url
@@ -146,8 +156,7 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 	# Runs as the configured least-privilege automation user (same resolution
 	# as the webhook path), never as a hardcoded Administrator.
 	with as_automation_user():
-		payment_request = _get_or_create_payment_request(sales_invoice, settings_name)
-		checkout_url = _get_payment_request_checkout_url(payment_request)
+		checkout_url = _run_checkout_with_deadlock_retry(lambda: _get_invoice_checkout_url(si, settings_name))
 
 	# Email links must remain GET requests, but successful first-click setup writes
 	# the Payment Request and Integration Request. Frappe rolls back GET requests
@@ -185,28 +194,78 @@ def payment_success(ir: str | None = None, gateway_name: str | None = None) -> N
 # ------------------------------------------------------------------- internals
 
 
-def _get_or_create_payment_request(sales_invoice, settings_name: str):
-	# Serialize first-click creation so concurrent email-link requests cannot
-	# create separate Payment Requests and Payrexx Gateways for one invoice.
-	frappe.db.get_value("Sales Invoice", sales_invoice.name, "name", for_update=True)
-	sales_invoice.reload()
+class _CheckoutLockOrderRetry(Exception):
+	pass
 
+
+def _run_checkout_with_deadlock_retry(operation):
+	"""Replay the complete checkout boundary only while no provider POST occurred."""
+	for attempt in range(1, DEADLOCK_MAX_ATTEMPTS + 1):
+		frappe.flags[CHECKOUT_PROVIDER_CONTACT_FLAG] = False
+		try:
+			return operation()
+		except _CheckoutLockOrderRetry:
+			provider_contacted = bool(frappe.flags.get(CHECKOUT_PROVIDER_CONTACT_FLAG))
+			frappe.db.rollback()
+			if provider_contacted:
+				raise
+			if attempt == DEADLOCK_MAX_ATTEMPTS:
+				frappe.throw(
+					_("Payment state changed repeatedly while checkout was prepared. Please retry the link.")
+				)
+		except frappe.QueryDeadlockError:
+			provider_contacted = bool(frappe.flags.get(CHECKOUT_PROVIDER_CONTACT_FLAG))
+			frappe.db.rollback()
+			if provider_contacted or attempt == DEADLOCK_MAX_ATTEMPTS:
+				raise
+		if attempt < DEADLOCK_MAX_ATTEMPTS:
+			time.sleep(0.25 * attempt)
+
+
+def _get_invoice_checkout_url(sales_invoice_name: str, settings_name: str) -> str:
+	sales_invoice = frappe.get_doc("Sales Invoice", sales_invoice_name)
+	payment_request, sales_invoice = _get_or_create_payment_request(sales_invoice, settings_name)
+	return _get_payment_request_checkout_url(payment_request, sales_invoice, settings_name)
+
+
+def _get_or_create_payment_request(sales_invoice, settings_name: str):
+	_validate_sales_invoice_checkout_state(sales_invoice)
 	gateway = "Payrexx-" + settings_name
-	existing = frappe.get_all(
-		"Payment Request",
-		filters={
-			"reference_doctype": "Sales Invoice",
-			"reference_name": sales_invoice.name,
-			"payment_gateway": gateway,
-			"status": ["in", ("Draft", "Requested", "Initiated", "Partially Paid")],
-			"docstatus": ["<", 2],
-		},
-		pluck="name",
-		limit=1,
-		order_by="creation desc",
-	)
+	existing = _get_active_payrexx_payment_requests(sales_invoice.name, for_update=False)
+	if len(existing) > 1:
+		frappe.throw(
+			_(
+				"Multiple active Payrexx Payment Requests exist for this invoice. "
+				"The accounts team must review them before online payment can continue."
+			)
+		)
 	if existing:
-		return frappe.get_doc("Payment Request", existing[0])
+		if existing[0].payment_gateway != gateway:
+			frappe.throw(
+				_(
+					"Another active Payrexx Payment Request already exists for this invoice. "
+					"The accounts team must review it before online payment can continue."
+				)
+			)
+		# Do not lock the source or request before the active Integration Request.
+		# The reuse helper acquires the settlement-compatible order.
+		return frappe._dict(name=existing[0].name), frappe._dict(name=sales_invoice.name)
+
+	# No active request was visible. Serialize first creation on the invoice and
+	# repeat the query as a current locking read. If a request won while this
+	# transaction waited, restart so its Integration Request can be locked first.
+	sales_invoice = frappe.get_doc("Sales Invoice", sales_invoice.name, for_update=True)
+	_validate_sales_invoice_checkout_state(sales_invoice)
+	existing = _get_active_payrexx_payment_requests(sales_invoice.name, for_update=True)
+	if len(existing) > 1:
+		frappe.throw(
+			_(
+				"Multiple active Payrexx Payment Requests exist for this invoice. "
+				"The accounts team must review them before online payment can continue."
+			)
+		)
+	if existing:
+		raise _CheckoutLockOrderRetry
 
 	conflicting_draft = frappe.db.get_value(
 		"Payment Request",
@@ -238,51 +297,191 @@ def _get_or_create_payment_request(sales_invoice, settings_name: str):
 	payment_request = make_payment_request(
 		dt="Sales Invoice",
 		dn=sales_invoice.name,
+		ref_doc=sales_invoice,
 		payment_gateway=gateway,
 		payment_gateway_account=_gateway_account_filter(sales_invoice, gateway),
 		submit_doc=1,
 		mute_email=1,
 		return_doc=True,
 	)
-	return payment_request
-
-
-def _get_payment_request_checkout_url(payment_request) -> str:
-	"""Return the one checkout created by Payment Request submission."""
-	frappe.db.get_value("Payment Request", payment_request.name, "name", for_update=True)
-	payment_request.reload()
-	if payment_request.payment_url:
-		return payment_request.payment_url
-
-	active_requests = frappe.get_all(
-		"Integration Request",
-		filters={
-			"reference_doctype": "Payment Request",
-			"reference_docname": payment_request.name,
-			"integration_request_service": "Payrexx",
-			"status": ["in", ("Queued", "Authorized")],
-		},
-		fields=["name", "data"],
-		order_by="creation desc",
-		limit=1,
+	_validate_payment_request_checkout_state(
+		payment_request,
+		sales_invoice,
+		expected_gateway=gateway,
+		require_submitted=True,
 	)
+	return payment_request, sales_invoice
+
+
+def _get_payment_request_checkout_url(payment_request, sales_invoice, settings_name: str) -> str:
+	"""Return the one checkout created by Payment Request submission."""
+	expected_gateway = f"Payrexx-{settings_name}"
+	# Existing checkout reuse follows the settlement order exactly: Integration
+	# Request, every active Payrexx Payment Request, then Sales Invoice.
+	active_requests = _get_active_checkout_requests(payment_request.name)
+	if len(active_requests) > 1:
+		frappe.throw(
+			_(
+				"Multiple active Payrexx checkouts exist for Payment Request {0}. "
+				"No checkout was reused; please ask the accounts team to review them."
+			).format(payment_request.name)
+		)
 	if active_requests:
-		checkout_url = (frappe.parse_json(active_requests[0].data) or {}).get("payrexx_checkout_url")
-		if not checkout_url:
+		active_payment_requests = _get_active_payrexx_payment_requests(
+			sales_invoice.name,
+			for_update=True,
+		)
+		_reject_competing_active_payment_requests(active_payment_requests, payment_request.name)
+		payment_request = frappe.get_doc("Payment Request", payment_request.name, for_update=True)
+		sales_invoice = frappe.get_doc("Sales Invoice", sales_invoice.name, for_update=True)
+		expected_amount, expected_currency = _validate_payment_request_checkout_state(
+			payment_request,
+			sales_invoice,
+			expected_gateway=expected_gateway,
+			require_submitted=True,
+		)
+		checkout_url = _validated_checkout_url(
+			active_requests[0],
+			payment_request,
+			settings_name=settings_name,
+			expected_amount=expected_amount,
+			expected_currency=expected_currency,
+		)
+		if payment_request.payment_url and payment_request.payment_url != checkout_url:
 			frappe.throw(
 				_(
-					"The existing Payrexx checkout has no stored URL. No duplicate checkout was created; "
-					"please review Integration Request {0}."
+					"The Payment Request URL does not match its active Payrexx checkout. "
+					"No checkout was reused; please review Integration Request {0}."
 				).format(active_requests[0].name)
 			)
 	else:
+		# A submitted manual request may not have a checkout yet. Serialize on
+		# the source, lock all active requests, then recheck for an Integration
+		# Request before the one allowed provider POST.
+		sales_invoice = frappe.get_doc("Sales Invoice", sales_invoice.name, for_update=True)
+		active_payment_requests = _get_active_payrexx_payment_requests(
+			sales_invoice.name,
+			for_update=True,
+		)
+		_reject_competing_active_payment_requests(active_payment_requests, payment_request.name)
+		payment_request = frappe.get_doc("Payment Request", payment_request.name, for_update=True)
+		expected_amount, expected_currency = _validate_payment_request_checkout_state(
+			payment_request,
+			sales_invoice,
+			expected_gateway=expected_gateway,
+			require_submitted=True,
+		)
+		if _get_active_checkout_requests(payment_request.name):
+			raise _CheckoutLockOrderRetry
+		if payment_request.payment_url:
+			frappe.throw(
+				_(
+					"The Payment Request has a stored URL but no active matching Payrexx checkout. "
+					"No checkout was reused; please ask the accounts team to review it."
+				)
+			)
 		# Legacy/manual Payment Requests can be submitted without a checkout.
-		# Generate it once while holding the Payment Request lock.
+		# Generate it once while holding both source and Payment Request locks.
 		checkout_url = payment_request.get_payment_url()
+		if not checkout_url:
+			frappe.throw(_("Could not generate Payrexx payment URL"))
 
-	if not checkout_url:
-		frappe.throw(_("Could not generate Payrexx payment URL"))
-	payment_request.db_set("payment_url", checkout_url, update_modified=False)
+		active_requests = _get_active_checkout_requests(payment_request.name)
+		if len(active_requests) != 1:
+			frappe.throw(
+				_("Payrexx did not persist exactly one active checkout for Payment Request {0}.").format(
+					payment_request.name
+				)
+			)
+		stored_checkout_url = _validated_checkout_url(
+			active_requests[0],
+			payment_request,
+			settings_name=settings_name,
+			expected_amount=expected_amount,
+			expected_currency=expected_currency,
+		)
+		if stored_checkout_url != checkout_url:
+			frappe.throw(_("Payrexx returned a checkout URL that does not match the persisted request."))
+
+	if not payment_request.payment_url:
+		payment_request.db_set("payment_url", checkout_url, update_modified=False)
+	return checkout_url
+
+
+def _reject_competing_active_payment_requests(
+	active_payment_requests: list, payment_request_name: str
+) -> None:
+	if any(row.name != payment_request_name for row in active_payment_requests):
+		frappe.throw(
+			_(
+				"Another active Payrexx Payment Request exists for this invoice. "
+				"No checkout was reused or created; please ask the accounts team to review it."
+			)
+		)
+
+
+def _get_active_checkout_requests(payment_request_name: str) -> list:
+	return frappe.db.get_values(
+		"Integration Request",
+		filters={
+			"reference_doctype": "Payment Request",
+			"reference_docname": payment_request_name,
+			"integration_request_service": "Payrexx",
+			"status": ["in", ("Queued", "Authorized")],
+		},
+		fieldname=["name", "status", "reference_doctype", "reference_docname", "data"],
+		as_dict=True,
+		order_by="creation desc",
+		for_update=True,
+	)
+
+
+def _validated_checkout_url(
+	integration_request,
+	payment_request,
+	*,
+	settings_name: str,
+	expected_amount: int,
+	expected_currency: str,
+) -> str:
+	data = frappe.parse_json(integration_request.data) or {}
+	if not isinstance(data, dict):
+		frappe.throw(
+			_("Integration Request {0} does not contain valid checkout metadata.").format(
+				integration_request.name
+			)
+		)
+	try:
+		stored_amount = _provider_gateway_amount(data.get("payrexx_gateway_amount"))
+		original_amount = _canonical_gateway_amount(data.get("amount"), expected_currency)
+	except ValueError:
+		stored_amount = original_amount = None
+
+	checkout_url = data.get("payrexx_checkout_url")
+	metadata_matches = all(
+		(
+			integration_request.reference_doctype == "Payment Request",
+			integration_request.reference_docname == payment_request.name,
+			data.get("reference_doctype") == "Payment Request",
+			data.get("reference_docname") == payment_request.name,
+			data.get("payment_gateway") == f"Payrexx-{settings_name}",
+			data.get("payrexx_settings") == settings_name,
+			stored_amount == expected_amount,
+			original_amount == expected_amount,
+			str(data.get("payrexx_gateway_currency") or "").strip().upper() == expected_currency,
+			str(data.get("currency") or "").strip().upper() == expected_currency,
+			bool(data.get("payrexx_gateway_id")),
+			bool(data.get("payrexx_gateway_hash")),
+			bool(checkout_url),
+		)
+	)
+	if not metadata_matches:
+		frappe.throw(
+			_(
+				"The existing Payrexx checkout no longer exactly matches the Payment Request. "
+				"No checkout was reused; please review Integration Request {0}."
+			).format(integration_request.name)
+		)
 	return checkout_url
 
 
