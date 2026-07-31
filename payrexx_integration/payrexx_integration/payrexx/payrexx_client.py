@@ -76,6 +76,24 @@ class PayrexxClient:
 		"""GET /Gateway/0/ for a cheap credential check without creating checkout data."""
 		return self._get("Gateway/0/")
 
+	# ----------------------------------------------------------------- static QR codes
+
+	def create_qr_code(self, webshop_url: str) -> dict:
+		"""POST /QrCode/  ->  dict with uuid, webshopUrl, png, svg (base64 data URIs).
+
+		The returned code is a permanent static QR. A plain camera scan opens
+		``webshop_url`` unchanged; a TWINT-app scan opens it with
+		``qr_code_session_id`` plus ``returnAppScheme`` (iOS) or
+		``returnAppPackage`` (Android) appended as query parameters.
+		"""
+		return _unwrap(self._post("QrCode/", data={"webshopUrl": webshop_url}))
+
+	def delete_qr_code(self, qr_code_uuid: str) -> None:
+		"""DELETE /QrCode/{uuid}/"""
+		resp = self._delete(f"QrCode/{qr_code_uuid}/")
+		if isinstance(resp, dict) and resp.get("status") not in (None, "success"):
+			raise PayrexxAPIError(resp.get("message", "Unknown Payrexx error"))
+
 	# ----------------------------------------------------------------- internal
 
 	def _get(self, path: str) -> dict:
@@ -94,6 +112,15 @@ class PayrexxClient:
 			if self._should_retry_default_domain(exc):
 				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
 				return _execute_request("POST", fallback_url, authorize=self._authorize, data=data)
+			raise
+
+	def _delete(self, path: str) -> dict:
+		try:
+			return _execute_request("DELETE", self._url(path), authorize=self._authorize)
+		except Exception as exc:
+			if self._should_retry_default_domain(exc):
+				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
+				return _execute_request("DELETE", fallback_url, authorize=self._authorize)
 			raise
 
 	def _should_retry_default_domain(self, exc: Exception) -> bool:

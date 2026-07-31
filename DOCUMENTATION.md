@@ -53,7 +53,7 @@ on Payrexx's default API domain.
 |---|---|
 | `api.py` | Signed pay-by-email URL generation and `pay_invoice` redirect endpoint. |
 | `gateway_selection.py` | Generic, strict Payrexx Settings resolver for this app and downstream consumers. |
-| `payrexx/payrexx_client.py` | Thin Payrexx REST client (`create_gateway`, `retrieve_gateway`, `ping_gateway`); host trust and credential-safe request execution. |
+| `payrexx/payrexx_client.py` | Thin Payrexx REST client (`create_gateway`, `retrieve_gateway`, `ping_gateway`, `create_qr_code`, `delete_qr_code`); host trust and credential-safe request execution. |
 | `payrexx/webhook_validator.py` | HMAC webhook signature validation. |
 | `doctype/payrexx_settings/payrexx_settings.py` | Settings controller, gateway creation, callback endpoint. |
 | `hosted_qa.py` | Read-only, exact-target evidence endpoints for explicitly enabled sandbox acceptance. |
@@ -343,11 +343,41 @@ appropriate reversal. Repeated chargeback callbacks reuse that exception, and a
 later duplicate confirmation cannot move the chargeback request back to
 `Completed`.
 
+## Static QR Codes (TWINT-capable)
+
+`PayrexxSettings.create_static_qr(webshop_url)` creates a permanent Payrexx
+static QR code (`POST /QrCode/`) whose scan target is `webshop_url`, and
+returns the provider payload: `uuid`, `webshopUrl`, and ready-made `png` /
+`svg` images as base64 data URIs. `delete_static_qr(uuid)` removes the code
+(`DELETE /QrCode/{uuid}/`); a provider-side 404 counts as deleted. Neither
+method is whitelisted — downstream callers (e.g. Good NPO campaign QR
+generation) own permission checks. The target URL must be an absolute
+http(s) URL without userinfo; the UUID must match the provider's shape.
+
+Scan behavior: a plain camera scan opens `webshop_url` unchanged; a TWINT-app
+scan (enabled by default for verified Swiss Payrexx accounts) opens it with
+`qr_code_session_id` plus `returnAppScheme` (iOS) or `returnAppPackage`
+(Android) appended as query parameters. The landing page forwards those into
+checkout creation as the `get_payment_url` kwargs `qr_code_session_id` and
+`return_app`. When present and valid, the Gateway payload carries
+`qrCodeSessionId` / `returnApp`, and `get_payment_url` returns the Gateway
+response's `appLink` (the deep link back into the TWINT app) instead of the
+hosted checkout `link`. The Integration Request data still records the
+canonical hosted URL in `payrexx_checkout_url` and adds
+`payrexx_gateway_app_link`; webhook settlement is unchanged.
+
+Both values originate from a guest query string, so they are sanitized against
+a strict character allowlist and **dropped silently** when invalid — a
+checkout without them simply behaves as a plain hosted checkout. `returnApp`
+is never sent without a session id.
+
 ## Supported Payment Operations
 
-The client surface is exactly `create_gateway`, `retrieve_gateway`, and
-`ping_gateway`: it creates hosted Gateways and retrieves Gateway state for
-Sales-Invoice-backed Payment Requests and explicitly owned extension sources.
+The payment client surface is `create_gateway`, `retrieve_gateway`, and
+`ping_gateway`, plus the non-payment static QR helpers `create_qr_code` /
+`delete_qr_code` documented above: it creates hosted Gateways and retrieves
+Gateway state for Sales-Invoice-backed Payment Requests and explicitly owned
+extension sources.
 There is no Gateway deletion or standalone transaction lookup.
 Webhook and success-return reconciliation settle only actual `confirmed`
 transactions; Gateway status alone cannot settle.

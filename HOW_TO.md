@@ -418,10 +418,31 @@ and require HTTP 403 before closing the acceptance run.
 Payrexx test transactions cannot be deleted. Keep their run marker and exact
 ERPNext records as acceptance evidence; never add destructive provider cleanup.
 
-## 11. Run Tests
+## 11. Static QR Codes (TWINT)
+
+Downstream apps (e.g. Good NPO donation campaigns) can mint permanent static
+QR codes through this app: `PayrexxSettings.create_static_qr(<landing URL>)`
+returns the QR as ready PNG/SVG images. There is no Desk UI in this app; the
+generating app owns the workflow and permissions.
+
+Prerequisites for the TWINT-app scan path (in the Payrexx dashboard):
+
+1. The Payrexx account must be **verified** and Swiss — TWINT scanning of
+   static QR codes is enabled by default only then.
+2. TWINT must be activated as a payment method: *Zahlungsanbieter → Payrexx
+   Pay → Konfigurieren → TWINT*.
+
+A plain phone-camera scan always works and opens the landing page directly.
+Deleting a QR code in the Payrexx dashboard does not break local cleanup —
+the app treats a provider 404 as already deleted.
+
+## 12. Run Tests
 
 ```bash
 cd frappe-bench
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_static_qr
+
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_settlement_validation
 
