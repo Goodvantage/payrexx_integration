@@ -15,9 +15,9 @@ def verify_webhook_signature(raw_body: bytes, received_signature: str, signing_k
 	The payload for the digest is the raw request body bytes — do NOT
 	re-serialise the JSON before hashing.
 
-	The default expected encoding is base64. Some Payrexx accounts deliver hex
-	instead; if base64 verification fails consistently in production, swap to
-	the hex branch (see commented code below).
+	The default expected encoding is base64. Some Payrexx accounts deliver a
+	lowercase hex digest instead, so both encodings are verified below (base64
+	first, then hex) with a constant-time comparison.
 	"""
 	if not received_signature or not signing_key:
 		return False

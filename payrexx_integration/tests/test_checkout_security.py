@@ -1,8 +1,10 @@
 from unittest.mock import Mock, patch
 
 import frappe
+import requests
 from frappe.tests import UnitTestCase
 from frappe.utils import CallbackManager
+from requests import Response
 
 from payrexx_integration import api
 from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
@@ -128,12 +130,111 @@ class TestPayrexxApiHostTrust(UnitTestCase):
 	def test_untrusted_client_never_contacts_provider(self):
 		with (
 			patch(f"{CLIENT_MODULE}.frappe.conf", {}),
-			patch(f"{CLIENT_MODULE}.make_get_request") as request,
+			patch(f"{CLIENT_MODULE}._execute_request") as request,
 			self.assertRaises(ValueError),
 		):
 			PayrexxClient(instance="demo", api_secret="secret", api_base_domain="attacker.example")
 
 		request.assert_not_called()
+
+
+class _StubProviderSession:
+	"""Real request preparation, canned response.
+
+	Keeps the client's auth callable on the actual wire path (so the header is
+	really attached) while making the failure deterministic and offline.
+	"""
+
+	def __init__(self, response):
+		self._session = requests.Session()
+		self._response = response
+
+	def prepare_request(self, request):
+		prepared_request = self._session.prepare_request(request)
+		self._response.request = prepared_request
+		return prepared_request
+
+	def merge_environment_settings(self, *args, **kwargs):
+		return self._session.merge_environment_settings(*args, **kwargs)
+
+	def send(self, prepared_request, **kwargs):
+		return self._response
+
+
+class TestApiSecretNeverReachesLoggedTracebacks(UnitTestCase):
+	"""Regression guard for audit finding V-H1 (2026-07-30).
+
+	Every failed provider request is written to Error Log — and to Sentry when
+	telemetry is on — with the frame variables of the failing frames. Frappe's
+	sanitizer redacts only the exact dict keys password/passwd/secret/token/key/
+	pwd, so an `{"x-api-key": <secret>}` header dict (or a client attribute
+	holding the secret) is persisted verbatim. The client must therefore keep the
+	secret and the payer payload out of every frame variable of the request path.
+	"""
+
+	API_SECRET = "sk_live_payrexx_secret_leak_regression"
+	PAYER_EMAIL = "payer-leak-regression@example.test"
+
+	def _tracebacks_logged_by(self, provider_call):
+		"""Return exactly what frappe would persist for a failing provider call."""
+		logged = []
+
+		def capture_traceback(*args, **kwargs):
+			logged.append(frappe.get_traceback(with_context=True))
+
+		original_request_doc = frappe.flags.integration_request_doc
+		frappe.flags.integration_request_doc = None
+		try:
+			with (
+				patch.object(frappe, "log_error", side_effect=capture_traceback),
+				self.assertRaises(Exception),
+			):
+				provider_call()
+		finally:
+			frappe.flags.integration_request_doc = original_request_doc
+
+		self.assertTrue(logged, "the failing provider request was not reported at all")
+		return logged
+
+	def test_client_does_not_retain_the_api_secret_as_an_attribute(self):
+		client = PayrexxClient(instance="demo", api_secret=self.API_SECRET)
+
+		# Traceback dumps expand plain objects, so an attribute leaks like a local.
+		self.assertNotIn(self.API_SECRET, repr(vars(client)))
+
+	def test_connection_failure_traceback_never_contains_the_api_secret(self):
+		client = PayrexxClient(instance="demo", api_secret=self.API_SECRET)
+
+		with patch.object(PayrexxClient, "_url", return_value="https://127.0.0.1:1/v1.14/Gateway/0/"):
+			logged = self._tracebacks_logged_by(client.ping_gateway)
+
+		for traceback_text in logged:
+			self.assertNotIn(self.API_SECRET, traceback_text)
+
+	def test_http_error_traceback_never_contains_the_api_secret_or_payer_data(self):
+		response = Response()
+		response.status_code = 401
+		response.reason = "Unauthorized"
+		response.url = "https://api.payrexx.com/v1.14/Gateway/?instance=demo"
+		client = PayrexxClient(instance="demo", api_secret=self.API_SECRET)
+
+		with patch(f"{CLIENT_MODULE}.get_request_session", return_value=_StubProviderSession(response)):
+			logged = self._tracebacks_logged_by(
+				lambda: client.create_gateway(
+					{
+						"amount": 10000,
+						"currency": "CHF",
+						"referenceId": "IR-LEAK-REGRESSION",
+						"fields[email][value]": self.PAYER_EMAIL,
+					}
+				)
+			)
+
+		# The header still goes out on the wire; it just never becomes a variable.
+		self.assertEqual(response.request.headers["x-api-key"], self.API_SECRET)
+		for traceback_text in logged:
+			self.assertNotIn(self.API_SECRET, traceback_text)
+			self.assertNotIn(self.PAYER_EMAIL, traceback_text)
 
 
 class TestCheckoutCurrentState(UnitTestCase):

@@ -53,7 +53,7 @@ on Payrexx's default API domain.
 |---|---|
 | `api.py` | Signed pay-by-email URL generation and `pay_invoice` redirect endpoint. |
 | `gateway_selection.py` | Generic, strict Payrexx Settings resolver for this app and downstream consumers. |
-| `payrexx/payrexx_client.py` | Thin Payrexx REST client. |
+| `payrexx/payrexx_client.py` | Thin Payrexx REST client (`create_gateway`, `retrieve_gateway`, `ping_gateway`); host trust and credential-safe request execution. |
 | `payrexx/webhook_validator.py` | HMAC webhook signature validation. |
 | `doctype/payrexx_settings/payrexx_settings.py` | Settings controller, gateway creation, callback endpoint. |
 | `hosted_qa.py` | Read-only, exact-target evidence endpoints for explicitly enabled sandbox acceptance. |
@@ -345,8 +345,10 @@ later duplicate confirmation cannot move the chargeback request back to
 
 ## Supported Payment Operations
 
-The client creates hosted Gateways and retrieves Gateway/Transaction state for
+The client surface is exactly `create_gateway`, `retrieve_gateway`, and
+`ping_gateway`: it creates hosted Gateways and retrieves Gateway state for
 Sales-Invoice-backed Payment Requests and explicitly owned extension sources.
+There is no Gateway deletion or standalone transaction lookup.
 Webhook and success-return reconciliation settle only actual `confirmed`
 transactions; Gateway status alone cannot settle.
 `authorized` and `reserved` callbacks record the Integration Request as
@@ -369,6 +371,7 @@ Failed and preserves the first chargeback evidence.
 - Payrexx webhooks are validated with `X-Webhook-Signature`.
 - Webhook signing key and API secret are separate values.
 - API secrets are read and sent only after strict final-host validation; custom API hosts require an exact `payrexx_allowed_api_hosts` site-config entry.
+- The API secret never becomes a frame variable, argument, or object attribute on the request path. It is attached through a `requests` auth callable holding it in its closure, and requests are sent as session-prepared requests instead of through `frappe.integrations.utils.make_*_request`. Frappe logs the frame variables of a failing outbound request to Error Log (and Sentry when telemetry is on) and its sanitizer does not match an `x-api-key` header key, so any secret reachable from those frames would be stored in plaintext. The same request frame drops its reference to the POST payer payload before the network call.
 - Checkout reuse requires current locked receivable state plus exact persisted provider metadata; a stored URL alone is never trusted.
 - A new Gateway is rejected while any other submitted active Payrexx Payment Request exists for the invoice; terminal and cancelled history is preserved.
 - Webhook diagnostics avoid logging full payer/payment payloads.
@@ -457,4 +460,4 @@ event fixtures.
 - `README.md` - installation notes.
 - `HOW_TO.md` - operator runbook.
 - `AGENTS.md` - detailed implementation notes.
-- `PAYREXX_INTEGRATION.md` - integration design/reference.
+- `PAYREXX_INTEGRATION.md` - design rationale, repository layout, and the Payrexx provider wire format (payload/webhook shapes).

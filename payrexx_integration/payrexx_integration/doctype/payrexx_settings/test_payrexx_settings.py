@@ -410,7 +410,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 	def test_payrexx_client_falls_back_to_default_api_domain_on_custom_auth_reject(self):
 		called_urls = []
 
-		def fake_post_request(url, **kwargs):
+		def fake_execute_request(method, url, **kwargs):
 			called_urls.append(url)
 			if "api.pay.goodvantage.ch" in url:
 				response = Response()
@@ -425,8 +425,8 @@ class TestPayrexxSettings(IntegrationTestCase):
 				{"payrexx_allowed_api_hosts": ["api.pay.goodvantage.ch"]},
 			),
 			patch(
-				"payrexx_integration.payrexx_integration.payrexx.payrexx_client.make_post_request",
-				side_effect=fake_post_request,
+				"payrexx_integration.payrexx_integration.payrexx.payrexx_client._execute_request",
+				side_effect=fake_execute_request,
 			),
 		):
 			client = PayrexxClient(

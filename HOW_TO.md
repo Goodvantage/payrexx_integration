@@ -207,6 +207,11 @@ If saving Payrexx Settings fails:
 
 The app pings `GET /Gateway/0/`; a Payrexx JSON response with `status: error` can still mean credentials are accepted if the error is "gateway not found".
 
+Every failed provider call also writes an `Error Log` entry. Those entries
+deliberately contain no API secret and no payer payload, so they can be shared
+with support or forwarded to error telemetry as they are. Read the credentials
+from `Payrexx Settings` in Desk when you need to compare them, never from a log.
+
 ## 8. Troubleshoot A Payment Link
 
 If a pay link returns 403:

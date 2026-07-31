@@ -1,7 +1,18 @@
 # Payrexx Payment Gateway — `payrexx_integration` App
 
-A standalone Frappe app that adds **Payrexx** as a payment gateway, depending on
-the `payments` app. Lives at `frappe-bench/apps/payrexx_integration/`.
+Design reference for the Payrexx gateway app: why it exists, how it plugs into
+upstream `payments`, and the provider wire format it speaks.
+
+This is the thinnest of the repo's docs on purpose — it does not repeat the
+canonical material:
+
+| Looking for | Read |
+|---|---|
+| Numbered requirements | [`REQUIREMENTS.md`](REQUIREMENTS.md) |
+| Architecture, modules, URL contracts, security model, test commands | [`DOCUMENTATION.md`](DOCUMENTATION.md) |
+| Operator setup, webhook configuration, troubleshooting, runbooks | [`HOW_TO.md`](HOW_TO.md) |
+| Coding-agent rules, gotchas, API quick reference, status mapping | [`AGENTS.md`](AGENTS.md) |
+| Installation | [`README.md`](README.md) |
 
 | | |
 |---|---|
@@ -26,8 +37,9 @@ gateway by:
 2. Calling `payments.utils.create_payment_gateway(...)` in `on_update` to insert
    the registry row.
 
-That's exactly what this app does. The `Payment Gateway` row is created
-automatically the first time you save `Payrexx Settings` — no fixture needed.
+That's exactly what this app does, which is why it needs neither a fork of
+upstream `payments` nor a fixture: the `Payment Gateway` row is created
+automatically the first time you save `Payrexx Settings`.
 
 End-to-end flow:
 
@@ -54,9 +66,13 @@ Customer returns through server-side reconciliation; an IR-bound confirmed
 transaction redirects to same-site redirect_to when present, otherwise /payment-success
 ```
 
+The locking, reuse, retry, and commit rules behind those steps are specified in
+`DOCUMENTATION.md` ("URL Contracts", "Supported Payment Operations") and
+`REQUIREMENTS.md` §2.
+
 ---
 
-## 2. What's in the app
+## 2. Repository layout
 
 ```
 apps/payrexx_integration/
@@ -64,8 +80,12 @@ apps/payrexx_integration/
 ├── license.txt                             # unlicense
 ├── README.md
 └── payrexx_integration/                    # Python package
-    ├── hooks.py                            # required_apps = ["payments"]
+    ├── hooks.py                            # required_apps = ["payments"], jinja methods
+    ├── api.py                              # pay-by-email URL + guest endpoints
     ├── gateway_selection.py                # strict shared settings resolver
+    ├── url_utils.py                        # public URL / same-site return URL helpers
+    ├── session_utils.py                    # local automation-user context manager
+    ├── hosted_qa.py                        # gated hosted sandbox acceptance
     ├── modules.txt                         # Payrexx Integration
     └── payrexx_integration/                # Frappe module folder
         ├── doctype/
@@ -105,145 +125,17 @@ row order or names such as `Live` and `Sandbox`.
 | `validity_minutes` | Int | Optional gateway TTL |
 | `success_redirect_url` / `failed_redirect_url` / `cancel_redirect_url` | Data | Optional global overrides; defaults bring success through the reconciliation endpoint and failed/cancelled returns to `/payment-failed`. Per-checkout `failed_redirect_to` / `cancel_redirect_to` kwargs override the generic failed/cancelled pages for branded flows. |
 
----
-
-## 3. Installation
-
-```bash
-# from the bench root
-cd /workspace/development/frappe-bench
-
-# 1. Make sure the prerequisite app is on the site
-bench --site <your-site> install-app payments
-
-# 2. Install this app
-bench --site <your-site> install-app payrexx_integration
-
-# 3. Apply schema (creates the Payrexx Settings DocType)
-bench --site <your-site> migrate
-```
-
-The app is already pip-installed in the bench (it was added to
-`sites/apps.txt` automatically by `bench new-app`), so steps 2 and 3 are all
-that's needed on each site.
+Installation is in `README.md`; creating the settings row, the
+`Payment Gateway Account`, and the Payrexx webhook is in `HOW_TO.md` §1–§4.
 
 ---
 
-## 4. Configuration
+## 3. Provider wire format
 
-### 4.1 Create a `Payrexx Settings` row
-
-In the desk, open **Payrexx Settings → New** and fill in:
-
-| Field | Value |
-|---|---|
-| Gateway Name | `Live` (or `Sandbox`) |
-| Instance Name | your Payrexx instance subdomain |
-| API Base Domain | `payrexx.com`, or the partner/platform base domain such as `pay.goodvantage.ch` |
-| API Secret | from Payrexx → Integrations → API & Plugins |
-| Webhook Signing Key | from Payrexx → Webhooks → (signing key field) |
-
-For a partner checkout domain such as `customer.pay.goodvantage.ch`, set
-`Instance Name` to `customer` and `API Base Domain` to
-`pay.goodvantage.ch`. The app then calls
-`https://api.pay.goodvantage.ch/v1.14/...`. First add that exact final host to
-the site-config JSON list:
-
-```bash
-bench --site <site> set-config --parse payrexx_allowed_api_hosts '["api.pay.goodvantage.ch"]'
-```
-
-Canonical API hosts under `payrexx.com` need no override. Custom entries must be
-exact bare hostnames: userinfo, URL schemes/paths/query/fragment, IP literals,
-wildcards, malformed names, control characters, and ports other than 443 are
-rejected before the API secret is read. If an allowed custom API host rejects
-the instance credentials with 401/403/404, the client retries once on trusted
-`https://api.payrexx.com/v1.14/...`.
-
-After `Gateway Name` is filled, the settings form immediately displays the
-webhook callback URL using the configured public `host_name` where available.
-The row does not need to be saved yet, so you can create the webhook in Payrexx
-first and then paste the generated signing key into **Webhook Signing Key**.
-
-Save. Two things happen automatically:
-1. `validate()` pings `GET /Gateway/0/` — if your credentials are wrong
-   the save is rejected.
-2. `on_update()` calls `create_payment_gateway("Payrexx-Live", …)` — a new
-   `Payment Gateway` row appears in the desk.
-
-### 4.2 Create a `Payment Gateway Account`
-
-The generated Payment Gateway is a registry row, not an accounting setup. In
-ERPNext create a `Payment Gateway Account` with:
-
-- **Payment Gateway**: `Payrexx-Live` (or the generated Sandbox name)
-- **Payment Account**: the Bank/Cash account that receives Payrexx settlements;
-  its account currency must match the invoices because ERPNext derives the
-  gateway account's **Currency** from this account
-- **Company**: matching the invoices that use this gateway
-- **Is Default**: enabled when this is the default for that combination
-
-Repeat for each company/currency combination. Without this row, a valid signed
-invoice link fails before Payment Request creation with `No Payment Gateway
-Account configured for Payrexx-<name>`.
-
-### 4.3 Configure the webhook in Payrexx
-
-In the Payrexx merchant dashboard go to **Settings → Webhooks → Add**:
-
-- **URL** (use the generated URL, including `gateway_name`):
-  ```
-  https://<your-site>/api/method/payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
-  ```
-- **Content type**: `application/json`
-- **Retry on failure**: enabled (recommended)
-- Copy the signing key Payrexx shows you into the **Webhook Signing Key** field
-  on the settings doc.
-
-The webhook URL is also displayed in the dashboard of the settings form for
-convenience (see `payrexx_settings.js`).
-
-### 4.4 Use it
-
-In a `Payment Request` sourced from a submitted Sales Invoice, pick
-`Payrexx-Live`. On submit, the customer gets a Payrexx hosted checkout URL.
-Payment Requests sourced from Sales Orders or any other doctype are rejected
-before an Integration Request or provider Gateway is created. This integration
-does not implement Sales Order advance-payable/idempotency semantics and must
-not be used to create order advances. Existing invoice checkouts are reused only
-while current locked state proves a wholly unpaid invoice and a submitted,
-`Requested`, fully outstanding Payment Request whose amount, currency, source,
-gateway, and persisted provider metadata all match exactly. Partial or changed
-receivables fail before provider contact. The Sales Invoice boundary also takes
-a current locking read of all submitted active `Payrexx-*` Payment Requests, so
-concurrent full-value drafts cannot each create a Gateway; one proceeds and the
-other is preserved/rejected. Existing checkout reuse follows settlement's
-Integration Request → Payment Request → Sales Invoice lock order. Bounded
-checkout retries are permitted only before any Gateway POST attempt.
-
-Checkout Integration Requests are inserted by this app without calling core
-`create_request_log()` or committing. Provider id/hash/link metadata and the
-Payment Request persist atomically with the caller transaction. A provider
-Gateway response immediately writes non-secret
-`[Payrexx Gateway recovery] state=local_commit_pending` evidence; successful
-commit and ordinary rollback add their corresponding outcome records. An
-unpaired pending record covers Frappe's residual commit-failure window after
-rollback callbacks were cleared but before SQL commit completed. Review local
-and provider state manually; only a Gateway with no transaction and no complete
-local owner may be deleted before retrying.
-
----
-
-## 5. Payrexx API quick reference
-
-| | |
-|---|---|
-| **Base URL** | `https://api.<api_base_domain>/v1.14/`, default `https://api.payrexx.com/v1.14/`; custom final hosts require `payrexx_allowed_api_hosts` |
-| **Auth** | `x-api-key: <api_secret>` header |
-| **Required query param** | `?instance=<your_instance>` on every request |
-| **POST body format** | `application/x-www-form-urlencoded` |
-| **Response envelope** | `{"status":"success", "data":[ … ]}` |
-| **Amount unit** | Smallest currency unit (CHF 2.00 → `200`) |
+The base URL, auth header, mandatory `?instance=` param, POST encoding, response
+envelope, amount unit, and webhook signature header are tabulated in `AGENTS.md`
+("Payrexx API quick reference"). The provider payload details below exist only
+here.
 
 ### Client endpoints
 
@@ -251,7 +143,10 @@ local owner may be deleted before retrying.
 |---|---|---|
 | `POST` | `/Gateway/` | Create a hosted checkout. Returns `{id, link, hash, status}`. |
 | `GET` | `/Gateway/{id}/` | Look up a gateway and its `invoices[].transactions[]`. |
-| `GET` | `/Transaction/{id}/` | Read-only client helper; current settlement reconciles from Gateway/webhook data and does not call this method. |
+| `GET` | `/Gateway/0/` | Credential ping — HTTP 200 with `status: error` means the credentials are valid. |
+
+That is the whole client surface: no Gateway deletion, capture, void, refund, or
+standalone transaction lookup (`REQUIREMENTS.md` REQ-PRX-BND-01).
 
 ### `POST /Gateway/` parameters emitted by this app
 
@@ -287,73 +182,31 @@ local owner may be deleted before retrying.
 }
 ```
 
-### Status mapping (controller logic)
+Payrexx delivers `X-Webhook-Signature` as a base64 HMAC-SHA256 digest of the raw
+body, keyed with the per-webhook signing key (separate from the API secret).
+`webhook_validator.verify_webhook_signature` checks base64 first and falls back
+to lowercase hex, because some accounts deliver hex.
 
-| Payrexx `transaction.status` | Integration Request status | Notes |
-|---|---|---|
-| `confirmed` | `Completed` or terminal `Failed` conflict | Settles only a supported Sales Invoice-backed Payment Request after exact provider evidence validation |
-| `authorized` | `Authorized` | State is recorded; later charging is not implemented |
-| `reserved` | `Authorized` | State is recorded; capture is not implemented |
-| `waiting` | unchanged | In-progress; expect another webhook |
-| `cancelled`, `declined`, `error`, `expired` | `Failed` | Records error string; does not initiate provider cancellation |
-| `chargeback` | `Failed` | Preserves submitted ledger rows and creates one accounting-review ToDo |
-| `refunded` or unknown | unchanged | Stores transaction data; refund reconciliation is not implemented |
+The `transaction.status` → `Integration Request.status` mapping, including the
+terminal-evidence and chargeback rules, is in `AGENTS.md` ("Status mapping") and
+`DOCUMENTATION.md` ("Supported Payment Operations", "Chargebacks").
 
-The ordinary mappings apply only before completion. A Completed request ignores
-all delayed or replayed non-chargeback statuses and preserves its confirmed
-transaction evidence. A verified `chargeback` remains allowed to move it to
-Failed for manual accounting review. After chargeback evidence is stored, every
-non-chargeback replay, including `confirmed`, preserves Failed status, the
-chargeback error, and the first chargeback transaction. Duplicate chargeback
-delivery is idempotent.
-Mutable callback and settlement documents are loaded directly with their
-`FOR UPDATE` lock; they are never locked by a scalar query and then reloaded from
-the older `REPEATABLE READ` snapshot. Standard settlement locks Integration
-Request, Payment Request, and Sales Invoice in that order.
-MariaDB error 1020 and other `QueryDeadlockError` failures propagate out of
-locked helpers. Callback, reconciliation, chargeback, and settlement boundaries
-roll back before replaying their complete atomic unit, with at most three
-attempts and bounded linear backoff. Code never continues in the failed
-transaction.
+### Credential handling
 
-The integration does not initiate capture, later-charge, void/cancel, or refund
-operations. Perform those provider actions in Payrexx and post the approved
-ERPNext accounting reversal manually.
-
-Success-return reconciliation requires a confirmed transaction inside the
-retrieved Gateway's `invoices[].transactions[]` whose provider `referenceId`
-matches the expected Integration Request. A Gateway-level `confirmed` status or
-a confirmed transaction with a missing/different reference never settles the
-Payment Request or produces a success return.
-Unsupported legacy/in-flight Payment Requests become terminal settlement
-conflicts without calling `set_as_paid()`.
-
-### Webhook signature
-
-Payrexx delivers `X-Webhook-Signature: <base64 HMAC-SHA256 of raw body>`. The
-key is the per-webhook signing key (separate from the API secret) configured in
-the Payrexx dashboard. `webhook_validator.verify_webhook_signature` checks
-base64 first and falls back to hex — confirm which encoding your account uses
-on the first sandbox webhook and remove the unused branch if you want to be
-strict.
+The API secret is never held in a variable, argument, or attribute on the
+request path — it lives only in the closure of the `requests` auth callable, and
+requests are sent as session-prepared requests instead of through
+`frappe.integrations.utils.make_*_request`. Frappe logs frame variables for
+failed outbound requests and does not redact an `x-api-key` header key. See
+`AGENTS.md` ("Never let the API secret become a variable") and REQ-PRX-SEC-05.
 
 ---
 
-## 6. Testing checklist
+## 4. Manual acceptance checklist
 
-Run the app-owned Python suites with separate module commands:
-
-```bash
-cd /workspace/development/frappe-bench
-bench --site development16.localhost run-tests \
-  --module payrexx_integration.tests.test_settlement_validation
-bench --site development16.localhost run-tests \
-  --module payrexx_integration.tests.test_checkout_security
-bench --site development16.localhost run-tests \
-  --module payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payrexx_settings
-bench --site development16.localhost run-tests \
-  --module payrexx_integration.tests.test_hosted_qa
-```
+Automated suites and their commands are listed in `DOCUMENTATION.md`
+("Testing"). This checklist covers what only a human on a real (sandbox) tenant
+can confirm:
 
 - [ ] `bench --site <site> migrate` runs cleanly; `Payrexx Settings` appears in
       the DocType list.
@@ -370,6 +223,8 @@ bench --site development16.localhost run-tests \
       `Integration Request` flips to `Completed`.
 - [ ] Forging a request with a wrong `X-Webhook-Signature` is rejected
       (check `Error Log`).
+- [ ] A failed provider call (e.g. a deliberately wrong API secret) writes an
+      `Error Log` entry containing neither the API secret nor payer data.
 - [ ] The Sales Invoice-backed Payment Request becomes Paid through
       `set_as_paid()`, with exactly one submitted Payment Entry.
 - [ ] A `cancel` from the Payrexx checkout returns the user to
@@ -378,20 +233,7 @@ bench --site development16.localhost run-tests \
 
 ---
 
-## 7. Where to find things
-
-| Concern | File |
-|---|---|
-| DocType definition | `payrexx_integration/payrexx_integration/payrexx_integration/doctype/payrexx_settings/payrexx_settings.json` |
-| Controller + webhook | `…/doctype/payrexx_settings/payrexx_settings.py` |
-| Desk form helpers (shows webhook URL) | `…/doctype/payrexx_settings/payrexx_settings.js` |
-| HTTP client | `…/payrexx_integration/payrexx/payrexx_client.py` |
-| Signature verifier | `…/payrexx_integration/payrexx/webhook_validator.py` |
-| App-level config | `payrexx_integration/payrexx_integration/hooks.py` |
-
----
-
-## 8. References
+## 5. External references
 
 - Payrexx Gateway API — <https://developers.payrexx.com/reference/create-a-gateway>
 - Payrexx Webhook docs — <https://docs.payrexx.com/developer/guides/webhook>
