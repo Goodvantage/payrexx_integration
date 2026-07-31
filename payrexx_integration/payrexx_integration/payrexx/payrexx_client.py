@@ -2,10 +2,12 @@
 
 import ipaddress
 import re
-from urllib.parse import urlencode, urlsplit
+from collections.abc import Callable
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import frappe
-from frappe.integrations.utils import make_get_request, make_post_request
+import requests
+from frappe.utils import get_request_session
 from requests import HTTPError
 
 DEFAULT_API_BASE_DOMAIN = "payrexx.com"
@@ -25,6 +27,16 @@ class PayrexxClient:
 	per the official PHP SDK in payrexx/payrexx-php). The legacy ApiSignature
 	body field is no longer required. Platform accounts can pass a custom
 	``api_base_domain`` such as ``pay.goodvantage.ch``.
+
+	The secret is kept **only** inside the closure of the requests auth callable
+	built in ``__init__``. It is never stored as an attribute, never built into a
+	header dict, and never passed to another function as an argument, because a
+	failing provider request is logged with the frame variables of every frame in
+	the traceback (``frappe.log_error`` -> ``frappe.get_traceback(with_context=True)``,
+	plus Sentry when telemetry is on). That dump also expands plain objects, so an
+	``self.api_secret`` attribute would leak just like a ``{"x-api-key": ...}``
+	local: frappe's sanitizer redacts only the exact keys password/passwd/secret/
+	token/key/pwd and does not match ``x-api-key``.
 	"""
 
 	def __init__(
@@ -42,7 +54,7 @@ class PayrexxClient:
 		if not api_secret:
 			raise ValueError("Payrexx API secret is required")
 		self.instance = instance
-		self.api_secret = api_secret
+		self._authorize = _api_key_auth(api_secret)
 		self.version = api_version
 
 	# ----------------------------------------------------------------- Gateway
@@ -64,48 +76,24 @@ class PayrexxClient:
 		"""GET /Gateway/0/ for a cheap credential check without creating checkout data."""
 		return self._get("Gateway/0/")
 
-	def delete_gateway(self, gateway_id: int) -> dict:
-		# DELETE not exposed by frappe.integrations.utils; use a plain request
-		# only when needed. Stub here for completeness.
-		raise NotImplementedError("Delete via Payrexx dashboard or extend with a DELETE call.")
-
-	# ------------------------------------------------------------- Transaction
-
-	def retrieve_transaction(self, transaction_id: int) -> dict:
-		"""GET /Transaction/{id}/"""
-		return _unwrap(self._get(f"Transaction/{transaction_id}/"))
-
 	# ----------------------------------------------------------------- internal
 
 	def _get(self, path: str) -> dict:
-		url = self._url(path)
 		try:
-			return make_get_request(url=url, headers=self._headers())
+			return _execute_request("GET", self._url(path), authorize=self._authorize)
 		except Exception as exc:
 			if self._should_retry_default_domain(exc):
 				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
-				return make_get_request(
-					url=fallback_url,
-					headers=self._headers(),
-				)
+				return _execute_request("GET", fallback_url, authorize=self._authorize)
 			raise
 
 	def _post(self, path: str, *, data: dict) -> dict:
-		url = self._url(path)
-		headers = {
-			**self._headers(),
-			"Content-Type": "application/x-www-form-urlencoded",
-		}
 		try:
-			return make_post_request(url=url, data=data, headers=headers)
+			return _execute_request("POST", self._url(path), authorize=self._authorize, data=data)
 		except Exception as exc:
 			if self._should_retry_default_domain(exc):
 				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
-				return make_post_request(
-					url=fallback_url,
-					data=data,
-					headers=headers,
-				)
+				return _execute_request("POST", fallback_url, authorize=self._authorize, data=data)
 			raise
 
 	def _should_retry_default_domain(self, exc: Exception) -> bool:
@@ -129,8 +117,75 @@ class PayrexxClient:
 		domain = _normalize_api_base_domain(api_base_domain or self.api_base_domain)
 		return f"https://api.{domain}/{self.version}/{path.lstrip('/')}?{urlencode(q)}"
 
-	def _headers(self) -> dict:
-		return {"x-api-key": self.api_secret, "Accept": "application/json"}
+
+def _api_key_auth(api_secret: str) -> Callable[[requests.PreparedRequest], requests.PreparedRequest]:
+	"""Build a requests auth callable that holds the API secret in its closure.
+
+	A closure cell is the one place the secret can live without appearing in the
+	frame variables (or expanded object attributes) that frappe writes to Error
+	Log — and to Sentry — for every failed provider request.
+	"""
+
+	def apply_api_key(prepared_request: requests.PreparedRequest) -> requests.PreparedRequest:
+		prepared_request.headers["x-api-key"] = api_secret
+		return prepared_request
+
+	return apply_api_key
+
+
+def _execute_request(
+	method: str,
+	url: str,
+	*,
+	authorize: Callable[[requests.PreparedRequest], requests.PreparedRequest],
+	data: dict | None = None,
+) -> dict | list | str | None:
+	"""Send one authenticated Payrexx request without leaking credentials or payer data.
+
+	Deliberately does not use ``frappe.integrations.utils.make_*_request``: that
+	helper takes the auth header and the form body as ordinary arguments, so both
+	become frame variables of framework code and are written verbatim into the
+	Error Log traceback it produces on failure. Response handling and the error
+	reporting contract are otherwise identical to ``make_request``.
+	"""
+	headers = {"Accept": "application/json"}
+	if data is not None:
+		headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+	session = get_request_session()
+	prepared_request = session.prepare_request(
+		requests.Request(method=method, url=url, headers=headers, data=data, auth=authorize)
+	)
+	# The body is now sealed inside the prepared request, which does not expose it
+	# to traceback frame dumps. Drop this frame's own reference to the payer data.
+	data = None
+	# ``Session.request()`` merges proxy, CA-bundle, and client-certificate settings
+	# from the environment before sending; ``Session.send()`` does not. Replicate it
+	# so proxied and custom-CA deployments behave exactly as they did.
+	environment_settings = session.merge_environment_settings(prepared_request.url, {}, None, None, None)
+
+	try:
+		response = frappe.flags.integration_request = session.send(prepared_request, **environment_settings)
+		response.raise_for_status()
+		return _parse_response(response)
+	except Exception:
+		if frappe.flags.integration_request_doc:
+			frappe.flags.integration_request_doc.log_error()
+		else:
+			frappe.log_error()
+		raise
+
+
+def _parse_response(response: requests.Response) -> dict | list | str | None:
+	"""Mirror ``frappe.integrations.utils.make_request`` content-type handling."""
+	if content_type := response.headers.get("content-type"):
+		if content_type == "text/plain; charset=utf-8":
+			return parse_qs(response.text)
+		elif content_type.startswith("application/") and content_type.split(";")[0].endswith("json"):
+			return response.json()
+		elif response.text:
+			return response.text
+	return None
 
 
 def _unwrap(resp: dict) -> dict:

@@ -11,7 +11,8 @@ app_license = "unlicense"
 
 required_apps = ["payments"]
 
-# With no extension provider, only Sales Invoice-backed Payment Requests are supported.
+# Extension point for apps that own a non-Sales-Invoice settlement source.
+# With no provider registered, only Sales Invoice-backed Payment Requests are supported.
 payrexx_settlement_source_providers = []
 
 jinja = {
