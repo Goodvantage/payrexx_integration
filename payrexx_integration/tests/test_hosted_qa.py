@@ -25,6 +25,7 @@ from payrexx_integration.payrexx_integration.doctype.payrexx_settings.test_payre
 	_create_submitted_test_sales_invoice,
 	_ensure_settings,
 	_ensure_test_payment_gateway_account,
+	_test_payment_account,
 )
 from payrexx_integration.tests.hosted_settlement_qa import (
 	_state_record_names,
@@ -245,7 +246,14 @@ class TestHostedPayrexxQA(IntegrationTestCase):
 
 	def test_inspector_rejects_manual_payment_entry_not_created_by_payrexx(self):
 		payment_request_name, integration_request_name = self.create_checkout()
-		payment_entry = get_payment_entry("Sales Invoice", self.invoice.name)
+		# Name the credited account explicitly: the fixture company has no default
+		# bank/cash account, so ERPNext would leave `paid_to` (and with it the target
+		# exchange rate) unset and the manual Payment Entry could never be submitted.
+		payment_entry = get_payment_entry(
+			"Sales Invoice",
+			self.invoice.name,
+			bank_account=_test_payment_account(self.invoice.company),
+		)
 		payment_entry.reference_no = "MANUAL-PAYMENT"
 		payment_entry.reference_date = nowdate()
 		payment_entry.insert(ignore_permissions=True)
