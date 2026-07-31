@@ -120,19 +120,32 @@ def _create_submitted_test_sales_invoice():
 	return sales_invoice
 
 
-def _ensure_test_payment_gateway_account(payment_gateway: str, sales_invoice) -> str:
+def _test_payment_account(company: str) -> str:
+	"""Return the Bank/Cash account the payment fixtures book against.
+
+	Companies on this bench leave `default_bank_account` and `default_cash_account`
+	empty, so ERPNext cannot resolve a payment account on its own (it only falls back
+	to a lone Bank/Cash account, and there are several). Tests therefore name the
+	account explicitly instead of depending on ambient site configuration.
+	"""
 	payment_account = frappe.db.get_value(
 		"Account",
 		{
-			"company": sales_invoice.company,
+			"company": company,
 			"account_type": ["in", ["Bank", "Cash"]],
 			"is_group": 0,
 			"disabled": 0,
 		},
 		"name",
+		order_by="name asc",
 	)
 	if not payment_account:
-		raise AssertionError(f"No payment account available for {sales_invoice.company}")
+		raise AssertionError(f"No payment account available for {company}")
+	return payment_account
+
+
+def _ensure_test_payment_gateway_account(payment_gateway: str, sales_invoice) -> str:
+	payment_account = _test_payment_account(sales_invoice.company)
 
 	gateway_account = frappe.db.get_value(
 		"Payment Gateway Account",
