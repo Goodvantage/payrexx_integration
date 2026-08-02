@@ -17,3 +17,9 @@
 - Rule: `frappe-setuser`
 - What it prevents: Unsafe privilege switching that can leave requests running under the wrong user.
 - Why this override is safe: `as_automation_user` is the single privilege-switch context manager for both guest payment paths. `pay_invoice` only reaches it after HMAC verification of the signed email link; the webhook path only after `X-Webhook-Signature` verification. It resolves the configured least-privilege `Non Profit Settings.creation_user` (falling back to Administrator), and restores the original Frappe session in `finally`.
+
+## `frappe-manual-commit` in Payrexx Settings concurrency tests
+
+- Rule: `frappe-manual-commit`
+- What it prevents: Application code committing partial transactions outside Frappe's request lifecycle.
+- Why this override is safe: These commits only occur in integration tests that open independent database connections to reproduce concurrent checkout and settlement races. Setup and simulated competing writes must commit so the other connection can observe them, while cleanup commits remove rows across those connections. No production request or document hook uses these commits.
