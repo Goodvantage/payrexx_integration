@@ -1,20 +1,25 @@
 import { Page, APIRequestContext, expect } from "@playwright/test";
 
 /** Navigate to the desk URL and wait for the SPA to settle. */
-export async function gotoDesk(page: Page, route: string) {
+export async function gotoDesk(page: Page, doctype: string, name: string) {
 	// A fresh API-authenticated session can still inherit the website home route.
 	await page.goto("/desk", { waitUntil: "domcontentloaded" });
-	await waitForDesk(page);
-	await page.goto(route, { waitUntil: "domcontentloaded" });
-	await waitForDesk(page);
-}
-
-async function waitForDesk(page: Page) {
 	await page.waitForFunction(() => {
-		const user = (window as any).frappe?.boot?.user?.name;
-		return Boolean(user && user !== "Guest");
+		const frappe = (window as any).frappe;
+		const user = frappe?.boot?.user?.name;
+		return Boolean(user && user !== "Guest" && typeof frappe.set_route === "function");
 	});
-	await expect(page.locator(".page-container:visible, .desktop-wrapper:visible").first()).toBeVisible();
+	await page.evaluate(
+		({ doctype, name }) => (window as any).frappe.set_route("Form", doctype, name),
+		{ doctype, name },
+	);
+	await page.waitForFunction(
+		({ doctype, name }) => {
+			const form = (window as any).cur_frm;
+			return form?.doctype === doctype && form?.doc?.name === name;
+		},
+		{ doctype, name },
+	);
 }
 
 /** Convenience GET against an API endpoint using the authed context. */
