@@ -3,6 +3,7 @@
 
 import logging
 import time
+from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 
@@ -21,6 +22,7 @@ from payrexx_integration.payrexx_integration.payrexx.payrexx_client import (
 from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
+from payrexx_integration.session_utils import as_automation_user, payment_authorization_user_name
 from payrexx_integration.url_utils import get_public_url, safe_return_url
 
 DEADLOCK_MAX_ATTEMPTS = 3
@@ -39,6 +41,8 @@ SETTLEMENT_CONFLICT_VERSION = 1
 SETTLEMENT_SOURCE_PROVIDER_HOOK = "payrexx_settlement_source_providers"
 GATEWAY_RECOVERY_LOG_MARKER = "[Payrexx Gateway recovery]"
 GATEWAY_ORPHAN_LOG_MARKER = "[Payrexx possible orphan Gateway]"
+PAYREXX_SUCCESS_TOKEN_VERSION_KEY = "payrexx_success_token_version"
+PAYREXX_SUCCESS_TOKEN_VERSION = 1
 DECIMAL_CONVERSION_ERRORS = (InvalidOperation, TypeError, ValueError)
 
 
@@ -61,6 +65,7 @@ def _run_with_deadlock_retry(operation):
 
 class PayrexxSettings(Document):
 	def validate(self):
+		payment_authorization_user_name(self)
 		try:
 			self.api_base_domain = _normalize_api_base_domain(self.get("api_base_domain"))
 		except ValueError as exc:
@@ -99,48 +104,49 @@ class PayrexxSettings(Document):
 		  amount, currency, reference_doctype, reference_docname,
 		  payer_name, payer_email, description, redirect_to, title
 		"""
-		self._validate_payment_request_source(kwargs)
-		# _client validates the destination before get_password reads the API key.
-		client = self._client()
-		integration_request = None
-		provider_contacted = False
-		gateway = None
-		try:
-			integration_request = _create_integration_request(kwargs)
+		with as_automation_user(self):
+			self._validate_payment_request_source(kwargs)
+			# _client validates the destination before get_password reads the API key.
+			client = self._client()
+			integration_request = None
+			provider_contacted = False
+			gateway = None
+			try:
+				integration_request = _create_integration_request(kwargs, self.name)
 
-			payload = self._build_create_gateway_payload(kwargs, integration_request.name)
-			provider_contacted = True
-			frappe.flags[CHECKOUT_PROVIDER_CONTACT_FLAG] = True
-			gateway = client.create_gateway(payload)
-			_register_gateway_orphan_recovery(
-				integration_request,
-				gateway,
-				settings_name=self.name,
-			)
-			gateway = _validate_created_gateway(gateway)
+				payload = self._build_create_gateway_payload(kwargs, integration_request.name)
+				provider_contacted = True
+				frappe.flags[CHECKOUT_PROVIDER_CONTACT_FLAG] = True
+				gateway = client.create_gateway(payload)
+				_register_gateway_orphan_recovery(
+					integration_request,
+					gateway,
+					settings_name=self.name,
+				)
+				gateway = _validate_created_gateway(gateway)
 
-			data = frappe.parse_json(integration_request.data) or {}
-			data["payrexx_gateway_id"] = gateway.get("id")
-			data["payrexx_gateway_hash"] = gateway.get("hash")
-			data["payrexx_checkout_url"] = gateway.get("link")
-			data["payrexx_gateway_amount"] = payload["amount"]
-			data["payrexx_gateway_currency"] = payload["currency"]
-			# Authoritative record of which settings row created this request —
-			# the webhook only accepts callbacks verified with this row's key.
-			data["payrexx_settings"] = self.name
-			integration_request.data = frappe.as_json(data)
-			integration_request.save(ignore_permissions=True)
+				data = frappe.parse_json(integration_request.data) or {}
+				data["payrexx_gateway_id"] = gateway.get("id")
+				data["payrexx_gateway_hash"] = gateway.get("hash")
+				data["payrexx_checkout_url"] = gateway.get("link")
+				data["payrexx_gateway_amount"] = payload["amount"]
+				data["payrexx_gateway_currency"] = payload["currency"]
+				# Authoritative record of which settings row created this request —
+				# the webhook only accepts callbacks verified with this row's key.
+				data["payrexx_settings"] = self.name
+				integration_request.data = frappe.as_json(data)
+				integration_request.save(ignore_permissions=True)
 
-			return gateway["link"]
-		except frappe.QueryDeadlockError:
-			if provider_contacted and gateway is None and integration_request:
-				_log_unknown_gateway_outcome(integration_request.name, self.name)
-			raise
-		except Exception:
-			if provider_contacted and gateway is None and integration_request:
-				_log_unknown_gateway_outcome(integration_request.name, self.name)
-			frappe.log_error(title="Payrexx get_payment_url", message=frappe.get_traceback())
-			frappe.throw(_("Could not generate Payrexx payment URL"))
+				return gateway["link"]
+			except frappe.QueryDeadlockError:
+				if provider_contacted and gateway is None and integration_request:
+					_log_unknown_gateway_outcome(integration_request.name, self.name)
+				raise
+			except Exception:
+				if provider_contacted and gateway is None and integration_request:
+					_log_unknown_gateway_outcome(integration_request.name, self.name)
+				frappe.log_error(title="Payrexx get_payment_url", message=frappe.get_traceback())
+				frappe.throw(_("Could not generate Payrexx payment URL"))
 
 	# ------------------------------------------------------------------ helpers
 
@@ -278,12 +284,15 @@ class PayrexxSettings(Document):
 			return override
 
 		if kind == "success" and integration_request_name:
+			from payrexx_integration.api import sign_payment_success_reference
+
 			return get_public_url(
 				"/api/method/payrexx_integration.api.payment_success?"
 				+ urlencode(
 					{
 						"ir": integration_request_name,
 						"gateway_name": self.name,
+						"token": sign_payment_success_reference(integration_request_name, self.name),
 					}
 				)
 			)
@@ -298,14 +307,19 @@ class PayrexxSettings(Document):
 		return f"{base}?{urlencode(params)}"
 
 
-def _create_integration_request(data: dict):
+def _create_integration_request(data: dict, settings_name: str):
 	"""Insert a Payrexx request log without committing the caller's transaction."""
+	request_data = {
+		**data,
+		"payrexx_settings": settings_name,
+		PAYREXX_SUCCESS_TOKEN_VERSION_KEY: PAYREXX_SUCCESS_TOKEN_VERSION,
+	}
 	integration_request = frappe.get_doc(
 		{
 			"doctype": "Integration Request",
 			"integration_request_service": "Payrexx",
 			"status": "Queued",
-			"data": frappe.as_json(data),
+			"data": frappe.as_json(request_data),
 			"reference_doctype": data.get("reference_doctype"),
 			"reference_docname": data.get("reference_docname"),
 		}
@@ -489,19 +503,18 @@ def _process_callback_transaction(
 			),
 		)
 		return {"ok": True}
-
 	# Chargeback evidence is terminal. Only an authentic duplicate chargeback
 	# may re-enter its idempotent ToDo repair path.
 	if _is_chargeback_recorded(ir, ir_data):
 		if status == "chargeback":
-			_mark_locked_chargeback(ir.name, transaction)
+			_mark_locked_chargeback(ir.name, transaction, settings_name=settings_name)
 		return {"ok": True}
 
 	# A confirmed settlement conflict is an accounting terminal state. Keep
 	# authenticating replays, but never let a later status silently reopen it.
 	if ir_data.get(SETTLEMENT_CONFLICT_DATA_KEY):
 		if status == "chargeback":
-			_mark_locked_chargeback(ir.name, transaction)
+			_mark_locked_chargeback(ir.name, transaction, settings_name=settings_name)
 		return {"ok": True}
 
 	# Confirmation is terminal except for a later chargeback. Ignore delayed
@@ -509,39 +522,36 @@ def _process_callback_transaction(
 	if ir.status == "Completed" and status != "chargeback":
 		return {"ok": True}
 
-	if status == "confirmed":
-		if not expected_settings and _multiple_gateways_configured():
-			# Legacy request with no stored gateway binding: on a multi-gateway
-			# site any row's key would verify, so completion cannot be trusted.
-			# Only settlement is refused - chargebacks and failure evidence
-			# above still apply. Staff can backfill `payrexx_settings` to
-			# re-enable settlement.
-			frappe.log_error(
-				title="Payrexx webhook unbound legacy request",
-				message=frappe.as_json(
-					_webhook_log_summary(transaction, reference_id, status) | {"verified_with": settings_name}
-				),
-			)
-			return {"ok": True}
-		_complete_locked_integration_request(ir.name, transaction)
-	elif status in ("authorized", "reserved"):
-		ir_data["payrexx_transaction"] = transaction
-		ir.data = frappe.as_json(ir_data)
-		ir.status = "Authorized"
-		ir.save(ignore_permissions=True)
-	elif status == "chargeback":
-		_mark_locked_chargeback(ir.name, transaction)
-	elif status in ("cancelled", "declined", "error", "expired"):
-		ir_data["payrexx_transaction"] = transaction
-		ir.data = frappe.as_json(ir_data)
-		ir.status = "Failed"
-		ir.error = f"Payrexx status: {status}"
-		ir.save(ignore_permissions=True)
-	else:
-		# 'waiting' and anything we don't recognise — keep listening.
-		ir_data["payrexx_transaction"] = transaction
-		ir.data = frappe.as_json(ir_data)
-		ir.save(ignore_permissions=True)
+	if status == "confirmed" and not expected_settings and _multiple_gateways_configured():
+		frappe.log_error(
+			title="Payrexx webhook unbound legacy request",
+			message=frappe.as_json(
+				_webhook_log_summary(transaction, reference_id, status) | {"verified_with": settings_name}
+			),
+		)
+		return {"ok": True}
+
+	with _payment_authorization_user(ir, settings_name):
+		if status == "confirmed":
+			_complete_locked_integration_request(ir.name, transaction, settings_name=settings_name)
+		elif status in ("authorized", "reserved"):
+			ir_data["payrexx_transaction"] = transaction
+			ir.data = frappe.as_json(ir_data)
+			ir.status = "Authorized"
+			ir.save(ignore_permissions=True)
+		elif status == "chargeback":
+			_mark_locked_chargeback(ir.name, transaction, settings_name=settings_name)
+		elif status in ("cancelled", "declined", "error", "expired"):
+			ir_data["payrexx_transaction"] = transaction
+			ir.data = frappe.as_json(ir_data)
+			ir.status = "Failed"
+			ir.error = f"Payrexx status: {status}"
+			ir.save(ignore_permissions=True)
+		else:
+			# 'waiting' and anything we don't recognise — keep listening.
+			ir_data["payrexx_transaction"] = transaction
+			ir.data = frappe.as_json(ir_data)
+			ir.save(ignore_permissions=True)
 
 	return {"ok": True}
 
@@ -634,18 +644,19 @@ def _reconcile_integration_request_once(
 		)
 		return False
 	settings = _resolve_settings(stored_settings or gateway_name)
-	gateway = settings._client().retrieve_gateway(int(gateway_id))
-	transaction = _confirmed_transaction_from_gateway(gateway, ir.name)
+	with _payment_authorization_user(ir, settings.name):
+		gateway = settings._client().retrieve_gateway(int(gateway_id))
+		transaction = _confirmed_transaction_from_gateway(gateway, ir.name)
 
-	if transaction:
-		_complete_locked_integration_request(ir.name, transaction)
-		return frappe.db.get_value("Integration Request", ir.name, "status") == "Completed"
-	status = (gateway.get("status") or "").lower()
-	if status == "chargeback":
-		_mark_locked_chargeback(ir.name, gateway)
-	elif status in ("cancelled", "declined", "error", "expired"):
-		_mark_reconciliation_failure(ir.name, status)
-	return False
+		if transaction:
+			_complete_locked_integration_request(ir.name, transaction, settings_name=settings.name)
+			return frappe.db.get_value("Integration Request", ir.name, "status") == "Completed"
+		status = (gateway.get("status") or "").lower()
+		if status == "chargeback":
+			_mark_locked_chargeback(ir.name, gateway, settings_name=settings.name)
+		elif status in ("cancelled", "declined", "error", "expired"):
+			_mark_reconciliation_failure(ir.name, status)
+		return False
 
 
 def _multiple_gateways_configured() -> bool:
@@ -703,7 +714,10 @@ def _complete_integration_request(integration_request_name: str, transaction: di
 
 
 def _complete_locked_integration_request(
-	integration_request_name: str, transaction: dict | None = None
+	integration_request_name: str,
+	transaction: dict | None = None,
+	*,
+	settings_name: str | None = None,
 ) -> None:
 	integration_request = _get_current_locked_doc("Integration Request", integration_request_name)
 	ir_data = frappe.parse_json(integration_request.data) or {}
@@ -714,26 +728,36 @@ def _complete_locked_integration_request(
 	if integration_request.status == "Completed":
 		return
 
-	if transaction:
-		ir_data["payrexx_transaction"] = transaction
-	if conflict := _settlement_conflict(integration_request, ir_data, transaction or {}):
-		_mark_settlement_conflict(integration_request, ir_data, conflict)
-		return
-	integration_request.data = frappe.as_json(ir_data)
-	integration_request.status = "Completed"
-	integration_request.error = ""
-	integration_request.save(ignore_permissions=True)
-	payment_entry_name = _on_payment_authorized(integration_request, "Completed")
-	if payment_entry_name:
-		ir_data["payrexx_payment_entry"] = payment_entry_name
-		integration_request.db_set("data", frappe.as_json(ir_data), update_modified=False)
+	with _payment_authorization_user(integration_request, settings_name):
+		if transaction:
+			ir_data["payrexx_transaction"] = transaction
+		if conflict := _settlement_conflict(integration_request, ir_data, transaction or {}):
+			_mark_settlement_conflict(integration_request, ir_data, conflict, settings_name=settings_name)
+			return
+		integration_request.data = frappe.as_json(ir_data)
+		integration_request.status = "Completed"
+		integration_request.error = ""
+		integration_request.save(ignore_permissions=True)
+		payment_entry_name = _on_payment_authorized(
+			integration_request,
+			"Completed",
+			settings_name=settings_name,
+		)
+		if payment_entry_name:
+			ir_data["payrexx_payment_entry"] = payment_entry_name
+			integration_request.db_set("data", frappe.as_json(ir_data), update_modified=False)
 
 
-def _on_payment_authorized(integration_request, status) -> str | None:
+def _on_payment_authorized(
+	integration_request,
+	status,
+	*,
+	settings_name: str | None = None,
+) -> str | None:
 	if not (integration_request.reference_doctype and integration_request.reference_docname):
 		return None
 	try:
-		with _payment_authorization_user():
+		with _payment_authorization_user(integration_request, settings_name):
 			if integration_request.reference_doctype == "Payment Request":
 				return _set_payment_request_as_paid(integration_request.reference_docname)
 			else:
@@ -1095,7 +1119,13 @@ def _extension_source_validation(*, phase: str, **context) -> bool | dict | None
 	return None
 
 
-def _mark_settlement_conflict(integration_request, ir_data: dict, conflict: dict) -> None:
+def _mark_settlement_conflict(
+	integration_request,
+	ir_data: dict,
+	conflict: dict,
+	*,
+	settings_name: str | None = None,
+) -> None:
 	if ir_data.get(SETTLEMENT_CONFLICT_DATA_KEY):
 		return
 	marker = {
@@ -1113,36 +1143,51 @@ def _mark_settlement_conflict(integration_request, ir_data: dict, conflict: dict
 		}
 	)
 	_ensure_review_todo(
-		integration_request.name,
+		integration_request,
 		SETTLEMENT_CONFLICT_TODO_MARKER,
 		f"{SETTLEMENT_CONFLICT_TODO_MARKER} {conflict['reason']}",
+		settings_name=settings_name,
 	)
 
 
-def _mark_chargeback(integration_request_name: str, transaction: dict | None = None) -> None:
+def _mark_chargeback(
+	integration_request_name: str,
+	transaction: dict | None = None,
+	*,
+	settings_name: str | None = None,
+) -> None:
 	"""Apply a chargeback atomically when called outside callback or reconciliation."""
-	_run_with_deadlock_retry(lambda: _mark_locked_chargeback(integration_request_name, transaction))
+	_run_with_deadlock_retry(
+		lambda: _mark_locked_chargeback(integration_request_name, transaction, settings_name=settings_name)
+	)
 
 
-def _mark_locked_chargeback(integration_request_name: str, transaction: dict | None = None) -> None:
+def _mark_locked_chargeback(
+	integration_request_name: str,
+	transaction: dict | None = None,
+	*,
+	settings_name: str | None = None,
+) -> None:
 	integration_request = _get_current_locked_doc("Integration Request", integration_request_name)
 	ir_data = frappe.parse_json(integration_request.data) or {}
-	chargeback_recorded = _is_chargeback_recorded(integration_request, ir_data)
-	if transaction and not chargeback_recorded:
-		ir_data["payrexx_transaction"] = transaction
-	updates = {"status": "Failed", "error": CHARGEBACK_ERROR}
-	if not chargeback_recorded:
-		updates["data"] = frappe.as_json(ir_data)
-	integration_request.db_set(updates)
+	with _evidence_recording_user(integration_request, settings_name):
+		chargeback_recorded = _is_chargeback_recorded(integration_request, ir_data)
+		if transaction and not chargeback_recorded:
+			ir_data["payrexx_transaction"] = transaction
+		updates = {"status": "Failed", "error": CHARGEBACK_ERROR}
+		if not chargeback_recorded:
+			updates["data"] = frappe.as_json(ir_data)
+		integration_request.db_set(updates)
 
 	_ensure_review_todo(
-		integration_request.name,
+		integration_request,
 		CHARGEBACK_TODO_MARKER,
 		f"{CHARGEBACK_TODO_MARKER} "
 		+ _(
 			"Manual accounting reversal required. Review the linked settlement; "
 			"submitted ledger records were preserved."
 		),
+		settings_name=settings_name,
 	)
 
 
@@ -1154,14 +1199,20 @@ def _is_chargeback_recorded(integration_request, ir_data: dict | None = None) ->
 	) == CHARGEBACK_ERROR
 
 
-def _ensure_review_todo(integration_request_name: str, marker: str, description: str) -> None:
+def _ensure_review_todo(
+	integration_request,
+	marker: str,
+	description: str,
+	*,
+	settings_name: str | None = None,
+) -> None:
 	"""Idempotently create the High-priority review ToDo for an Integration Request."""
-	with _payment_authorization_user():
+	with _evidence_recording_user(integration_request, settings_name):
 		if frappe.db.exists(
 			"ToDo",
 			{
 				"reference_type": "Integration Request",
-				"reference_name": integration_request_name,
+				"reference_name": integration_request.name,
 				"description": ["like", f"{marker}%"],
 			},
 		):
@@ -1174,13 +1225,40 @@ def _ensure_review_todo(integration_request_name: str, marker: str, description:
 				"allocated_to": frappe.session.user,
 				"assigned_by": frappe.session.user,
 				"reference_type": "Integration Request",
-				"reference_name": integration_request_name,
+				"reference_name": integration_request.name,
 				"description": description,
 			}
 		).insert(ignore_permissions=True)
 
 
-def _payment_authorization_user():
+def _payment_authorization_user(integration_request, settings_name: str | None = None):
 	from payrexx_integration.session_utils import as_automation_user
 
-	return as_automation_user()
+	ir_data = frappe.parse_json(integration_request.get("data")) or {}
+	stored_settings = ir_data.get("payrexx_settings") or _settings_name_from_request_data(ir_data)
+	return as_automation_user(stored_settings or settings_name or _resolve_settings().name)
+
+
+def _evidence_recording_user(integration_request, settings_name: str | None = None):
+	"""Privilege switch for terminal-evidence writes (chargebacks, review ToDos).
+
+	Settlement stays fail-closed via ``_payment_authorization_user`` — money must
+	never move without the owning gateway's automation user. Recording chargeback
+	or conflict *evidence* is different: for a request with no stored gateway
+	binding on a site with zero or multiple Payrexx Settings rows, gateway
+	resolution is impossible, and throwing here would discard the evidence and
+	its review ToDo. Degrade instead: log the anomaly and record the evidence as
+	the current session user.
+	"""
+	try:
+		return _payment_authorization_user(integration_request, settings_name)
+	except frappe.ValidationError:
+		frappe.log_error(
+			title="Payrexx evidence recorded without gateway automation user",
+			message=(
+				f"Integration Request {integration_request.name}: no Payrexx Settings row "
+				"could be resolved (unbound request on a zero- or multi-gateway site). "
+				f"Terminal evidence was recorded as {frappe.session.user}.\n\n" + frappe.get_traceback()
+			),
+		)
+		return nullcontext()

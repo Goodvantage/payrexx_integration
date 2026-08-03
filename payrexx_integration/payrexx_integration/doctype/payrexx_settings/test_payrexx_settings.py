@@ -22,6 +22,7 @@ from payrexx_integration.api import (
 	_verify,
 	payment_success,
 	payrexx_pay_url,
+	sign_payment_success_reference,
 )
 from payrexx_integration.gateway_selection import resolve_payrexx_settings
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import PayrexxClient
@@ -29,14 +30,26 @@ from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
 
+IGNORE_TEST_RECORD_DEPENDENCIES = ["User"]
+
 GATEWAY_NAME = "TestGW"
 SETTINGS_NAME_PREFIX = "Payrexx-Test-"
 
 
-def _ensure_settings(name: str = GATEWAY_NAME) -> str:
+def _ensure_settings(name: str = GATEWAY_NAME, automation_user: str = "Administrator") -> str:
 	"""Create a Payrexx Settings row (if missing) and return its name."""
 	if frappe.db.exists("Payrexx Settings", {"gateway_name": name}):
-		return frappe.db.get_value("Payrexx Settings", {"gateway_name": name}, "name")
+		settings_name = frappe.db.get_value("Payrexx Settings", {"gateway_name": name}, "name")
+		if not frappe.db.get_value("Payrexx Settings", settings_name, "automation_user"):
+			frappe.db.set_value(
+				"Payrexx Settings",
+				settings_name,
+				"automation_user",
+				automation_user,
+				update_modified=False,
+			)
+			frappe.clear_document_cache("Payrexx Settings", settings_name)
+		return settings_name
 
 	doc = frappe.get_doc(
 		{
@@ -46,11 +59,30 @@ def _ensure_settings(name: str = GATEWAY_NAME) -> str:
 			"api_base_domain": "payrexx.com",
 			"api_secret": "sk_test_dummy",
 			"webhook_signing_key": "whk_test_dummy",
+			"automation_user": automation_user,
 			"supported_currencies": "CHF,EUR,USD",
 		}
 	)
 	doc.insert(ignore_permissions=True)
 	return doc.name
+
+
+def _create_test_user(*, user_type: str = "System User", enabled: int = 1) -> str:
+	user_name = f"payrexx-{frappe.generate_hash(length=10)}@example.test"
+	user = frappe.get_doc(
+		{
+			"doctype": "User",
+			"email": user_name,
+			"first_name": "Payrexx",
+			"enabled": enabled,
+			"user_type": user_type,
+			"send_welcome_email": 0,
+		}
+	)
+	if user_type == "System User":
+		user.append("roles", {"role": "System Manager"})
+	user.insert(ignore_permissions=True)
+	return user_name
 
 
 def _test_company() -> str:
@@ -486,6 +518,13 @@ class TestPayrexxSettings(IntegrationTestCase):
 			"https://demo.example.test/demo?donation_status=failed&donation=NPO-DTN-TEST",
 		)
 		self.assertEqual(payload["cancelRedirectUrl"], payload["failedRedirectUrl"])
+		success_params = parse_qs(urlparse(payload["successRedirectUrl"]).query)
+		self.assertEqual(success_params["ir"], ["PAYREXX-IR-TEST"])
+		self.assertEqual(success_params["gateway_name"], [self.settings_name])
+		self.assertEqual(
+			success_params["token"],
+			[sign_payment_success_reference("PAYREXX-IR-TEST", self.settings_name)],
+		)
 
 	def test_gateway_payload_rejects_sub_cent_and_non_two_decimal_amounts(self):
 		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
@@ -1230,9 +1269,55 @@ class TestPayrexxSettings(IntegrationTestCase):
 		ir.reload()
 		self.assertEqual(ir.status, "Queued")
 
+	def test_callback_records_unbound_legacy_nonconfirmed_evidence_on_multi_gateway_site(self):
+		_ensure_settings("OtherGateway")
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		for status, expected_status in (
+			("authorized", "Authorized"),
+			("reserved", "Authorized"),
+			("declined", "Failed"),
+			("error", "Failed"),
+			("waiting", "Queued"),
+			("refunded", "Queued"),
+			("chargeback", "Failed"),
+		):
+			with self.subTest(status=status):
+				integration_request = frappe.get_doc(
+					{
+						"doctype": "Integration Request",
+						"integration_request_service": "Payrexx",
+						"status": "Queued",
+						"data": frappe.as_json({"payrexx_gateway_id": 999}),
+					}
+				).insert(ignore_permissions=True)
+				transaction = {"id": 12345, "status": status, "referenceId": integration_request.name}
+
+				self.assertEqual(
+					ps_module._process_callback_transaction(
+						GATEWAY_NAME,
+						transaction,
+						integration_request.name,
+						status,
+					),
+					{"ok": True},
+				)
+				integration_request.reload()
+				self.assertEqual(integration_request.status, expected_status)
+				self.assertEqual(
+					(frappe.parse_json(integration_request.data) or {})["payrexx_transaction"],
+					transaction,
+				)
+
 	def test_get_payment_url_records_owning_settings_on_integration_request(self):
 		"""The settings row that creates a checkout is recorded on the IR —
 		the webhook binding depends on this."""
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
 		settings = frappe.get_doc("Payrexx Settings", self.settings_name)
 		_sales_invoice, payment_request = _create_submitted_test_payment_request()
 		payment_request.db_set("payment_gateway", "Payrexx-" + self.settings_name)
@@ -1261,6 +1346,10 @@ class TestPayrexxSettings(IntegrationTestCase):
 		)[0]
 		data = frappe.parse_json(frappe.db.get_value("Integration Request", ir_name, "data"))
 		self.assertEqual(data.get("payrexx_settings"), self.settings_name)
+		self.assertEqual(
+			data.get(ps_module.PAYREXX_SUCCESS_TOKEN_VERSION_KEY),
+			ps_module.PAYREXX_SUCCESS_TOKEN_VERSION,
+		)
 		self.assertEqual(data.get("payrexx_gateway_id"), 4242)
 		self.assertEqual(data.get("payrexx_checkout_url"), "https://pay.example/checkout")
 		self.assertEqual(data.get("payrexx_gateway_amount"), int(payment_request.grand_total * 100))
@@ -1269,15 +1358,15 @@ class TestPayrexxSettings(IntegrationTestCase):
 	def test_get_payment_url_rejects_sales_order_payment_request_before_gateway_creation(self):
 		settings = frappe.get_doc("Payrexx Settings", self.settings_name)
 		client = Mock()
+		get_value = frappe.db.get_value
+
+		def get_payment_request_source(doctype, *args, **kwargs):
+			if doctype == "Payment Request":
+				return frappe._dict(reference_doctype="Sales Order", reference_name="SO-TEST")
+			return get_value(doctype, *args, **kwargs)
+
 		with (
-			patch.object(
-				frappe.db,
-				"get_value",
-				return_value=frappe._dict(
-					reference_doctype="Sales Order",
-					reference_name="SO-TEST",
-				),
-			),
+			patch.object(frappe.db, "get_value", side_effect=get_payment_request_source),
 			patch.object(type(settings), "_client", return_value=client),
 			self.assertRaisesRegex(frappe.ValidationError, "Sales Invoices"),
 		):
@@ -1496,7 +1585,9 @@ class TestPayrexxSettings(IntegrationTestCase):
 				"doctype": "Integration Request",
 				"integration_request_service": "Payrexx",
 				"status": "Queued",
-				"data": json.dumps({"amount": 100, "currency": "CHF"}),
+				"data": json.dumps(
+					{"amount": 100, "currency": "CHF", "payrexx_settings": self.settings_name}
+				),
 			}
 		).insert(ignore_permissions=True)
 
@@ -1589,7 +1680,11 @@ class TestPayrexxSettings(IntegrationTestCase):
 				"reference_doctype": "Payment Request",
 				"reference_docname": payment_request.name,
 				"data": json.dumps(
-					{"amount": payment_request.grand_total, "currency": payment_request.currency}
+					{
+						"amount": payment_request.grand_total,
+						"currency": payment_request.currency,
+						"payrexx_settings": self.settings_name,
+					}
 				),
 			}
 		).insert(ignore_permissions=True)
@@ -1746,7 +1841,11 @@ class TestPayrexxSettings(IntegrationTestCase):
 				"reference_doctype": "Payment Request",
 				"reference_docname": payment_request.name,
 				"data": json.dumps(
-					{"amount": payment_request.grand_total, "currency": payment_request.currency}
+					{
+						"amount": payment_request.grand_total,
+						"currency": payment_request.currency,
+						"payrexx_settings": self.settings_name,
+					}
 				),
 			}
 		).insert(ignore_permissions=True)
@@ -1811,6 +1910,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 					{
 						"payrexx_gateway_amount": expected_amount,
 						"payrexx_gateway_currency": payment_request.currency,
+						"payrexx_settings": self.settings_name,
 					}
 				),
 			}
@@ -1948,6 +2048,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 					{
 						"payrexx_gateway_amount": int(draft_request.grand_total * 100),
 						"payrexx_gateway_currency": draft_request.currency,
+						"payrexx_settings": self.settings_name,
 					}
 				),
 			}
@@ -1987,6 +2088,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 					{
 						"payrexx_gateway_amount": int(submitted_request.grand_total * 100),
 						"payrexx_gateway_currency": submitted_request.currency,
+						"payrexx_settings": self.settings_name,
 					}
 				),
 			}
@@ -2028,6 +2130,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 					{
 						"payrexx_gateway_amount": expected_amount,
 						"payrexx_gateway_currency": payment_request.currency,
+						"payrexx_settings": self.settings_name,
 					}
 				),
 			}
@@ -2197,6 +2300,174 @@ class TestPayrexxSettings(IntegrationTestCase):
 		self.assertFalse(commit_requested)
 
 
+class TestPayrexxAutomationUser(IntegrationTestCase):
+	def test_configured_automation_user_is_resolved(self):
+		from payrexx_integration.session_utils import payment_authorization_user_name
+
+		user_name = _create_test_user()
+		settings_name = _ensure_settings(f"Automation-{frappe.generate_hash(length=8)}", user_name)
+
+		self.assertEqual(payment_authorization_user_name(settings_name), user_name)
+
+	def test_missing_disabled_and_website_automation_users_fail_closed(self):
+		from payrexx_integration.session_utils import payment_authorization_user_name
+
+		settings_name = _ensure_settings(f"Automation-{frappe.generate_hash(length=8)}")
+		invalid_users = ("", _create_test_user(enabled=0), _create_test_user(user_type="Website User"))
+		for user_name in invalid_users:
+			with self.subTest(user_name=user_name or "missing"):
+				frappe.db.set_value(
+					"Payrexx Settings",
+					settings_name,
+					"automation_user",
+					user_name,
+					update_modified=False,
+				)
+				frappe.clear_document_cache("Payrexx Settings", settings_name)
+				with self.assertRaises(frappe.ValidationError):
+					payment_authorization_user_name(settings_name)
+
+	def test_automation_context_restores_session_after_failure(self):
+		from payrexx_integration.session_utils import as_automation_user
+
+		user_name = _create_test_user()
+		settings_name = _ensure_settings(f"Automation-{frappe.generate_hash(length=8)}", user_name)
+		previous_user = frappe.session.user
+		previous_sid = getattr(frappe.session, "sid", None)
+		previous_data = getattr(frappe.session, "data", None)
+
+		with self.assertRaises(RuntimeError):
+			with as_automation_user(settings_name):
+				with as_automation_user(settings_name):
+					self.assertEqual(frappe.session.user, user_name)
+					raise RuntimeError("restore session")
+
+		self.assertEqual(frappe.session.user, previous_user)
+		self.assertEqual(getattr(frappe.session, "sid", None), previous_sid)
+		self.assertIs(getattr(frappe.session, "data", None), previous_data)
+
+	def test_direct_controller_checkout_runs_provider_setup_as_automation_user(self):
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		user_name = _create_test_user()
+		settings_name = _ensure_settings(f"Automation-{frappe.generate_hash(length=8)}", user_name)
+		settings = frappe.get_doc("Payrexx Settings", settings_name)
+		previous_user = frappe.session.user
+		observed_users = []
+		gateway = {"id": 42, "hash": "hash", "link": "https://pay.example/direct"}
+		client = Mock()
+		client.create_gateway.side_effect = lambda _payload: (
+			observed_users.append(frappe.session.user) or gateway
+		)
+		integration_request = frappe._dict(
+			name="IR-DIRECT-CONTROLLER",
+			data=frappe.as_json({}),
+			reference_doctype="Donation",
+			reference_docname="DONATION-DIRECT",
+		)
+		integration_request.save = Mock(
+			side_effect=lambda **_kwargs: observed_users.append(frappe.session.user)
+		)
+
+		with (
+			patch.object(
+				ps_module.PayrexxSettings,
+				"_validate_payment_request_source",
+				side_effect=lambda _kwargs: observed_users.append(frappe.session.user),
+			),
+			patch.object(ps_module.PayrexxSettings, "_client", return_value=client),
+			patch.object(
+				ps_module.PayrexxSettings,
+				"_build_create_gateway_payload",
+				return_value={"amount": 10000, "currency": "CHF"},
+			),
+			patch.object(
+				ps_module,
+				"_create_integration_request",
+				side_effect=lambda *_args: observed_users.append(frappe.session.user) or integration_request,
+			),
+			patch.object(ps_module, "_register_gateway_orphan_recovery"),
+		):
+			self.assertEqual(
+				settings.get_payment_url(
+					amount=100,
+					currency="CHF",
+					reference_doctype="Donation",
+					reference_docname="DONATION-DIRECT",
+				),
+				gateway["link"],
+			)
+
+		self.assertTrue(observed_users)
+		self.assertEqual(set(observed_users), {user_name})
+		self.assertEqual(frappe.session.user, previous_user)
+
+	def test_settlement_uses_integration_requests_owning_gateway_user(self):
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		first_user = _create_test_user()
+		second_user = _create_test_user()
+		first_settings = _ensure_settings(f"Automation-{frappe.generate_hash(length=8)}", first_user)
+		second_settings = _ensure_settings(f"Automation-{frappe.generate_hash(length=8)}", second_user)
+		seen_users = []
+		reference = Mock()
+		reference.run_method.side_effect = lambda *_args: seen_users.append(frappe.session.user)
+
+		with patch.object(ps_module.frappe, "get_doc", return_value=reference):
+			for owner, caller_gateway in (
+				(first_settings, second_settings),
+				(second_settings, first_settings),
+			):
+				ps_module._on_payment_authorized(
+					frappe._dict(
+						reference_doctype="Donation",
+						reference_docname="DONATION-TEST",
+						data=frappe.as_json({"payrexx_settings": owner}),
+					),
+					"Completed",
+					settings_name=caller_gateway,
+				)
+
+		self.assertEqual(seen_users, [first_user, second_user])
+
+	def test_chargeback_todo_uses_integration_requests_owning_gateway_user(self):
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		owner_user = _create_test_user()
+		other_user = _create_test_user()
+		owner_settings = _ensure_settings(f"Automation-{frappe.generate_hash(length=8)}", owner_user)
+		_ensure_settings(f"Automation-{frappe.generate_hash(length=8)}", other_user)
+		integration_request = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Completed",
+				"data": frappe.as_json({"payrexx_settings": owner_settings}),
+			}
+		).insert(ignore_permissions=True)
+
+		ps_module._mark_chargeback(integration_request.name, {"status": "chargeback", "id": 1})
+
+		self.assertEqual(
+			frappe.db.get_value(
+				"ToDo",
+				{
+					"reference_type": "Integration Request",
+					"reference_name": integration_request.name,
+					"description": ["like", f"{ps_module.CHARGEBACK_TODO_MARKER}%"],
+				},
+				"allocated_to",
+			),
+			owner_user,
+		)
+
+
 class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 	def setUp(self):
 		super().setUp()
@@ -2360,6 +2631,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 			"currency": "CHF",
 		}
 		with self.primary_connection(), self.secondary_connection():
+			settings_name = _ensure_settings()
 			frappe.get_doc(
 				{
 					"doctype": "Payment Request",
@@ -2384,6 +2656,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 						{
 							"payrexx_gateway_amount": 10000,
 							"payrexx_gateway_currency": "CHF",
+							"payrexx_settings": settings_name,
 						}
 					),
 				}
@@ -2507,19 +2780,21 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 		confirmed_transaction = {"id": 90501, "status": "confirmed"}
 		chargeback_transaction = {"id": 90502, "status": "chargeback"}
 		with self.primary_connection(), self.secondary_connection():
+			settings_name = _ensure_settings()
 			frappe.get_doc(
 				{
 					"doctype": "Integration Request",
 					"name": integration_request_name,
 					"integration_request_service": "Payrexx",
 					"status": "Queued",
-					"data": "{}",
+					"data": frappe.as_json({"payrexx_settings": settings_name}),
 				}
 			).db_insert()
 			frappe.db.commit()
 
 		try:
 			with self.primary_connection():
+				frappe.db.rollback()
 				stale_request = frappe.get_doc("Integration Request", integration_request_name)
 				self.assertEqual(stale_request.status, "Queued")
 
@@ -2539,9 +2814,9 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 				attempts = []
 				mark_locked_chargeback = ps_module._mark_locked_chargeback
 
-				def count_attempts(request_name, transaction=None):
+				def count_attempts(request_name, transaction=None, *, settings_name=None):
 					attempts.append((request_name, transaction))
-					return mark_locked_chargeback(request_name, transaction)
+					return mark_locked_chargeback(request_name, transaction, settings_name=settings_name)
 
 				with (
 					patch.object(
@@ -2662,7 +2937,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 							"status": "declined",
 							"invoices": [],
 						}
-						settings = frappe._dict(_client=lambda: client)
+						settings = frappe._dict(name=GATEWAY_NAME, _client=lambda: client)
 						attempts = []
 						reconcile_once = ps_module._reconcile_integration_request_once
 
@@ -2724,6 +2999,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 			"currency": "CHF",
 		}
 		with self.primary_connection(), self.secondary_connection():
+			_ensure_settings()
 			frappe.get_doc(
 				{
 					"doctype": "Integration Request",

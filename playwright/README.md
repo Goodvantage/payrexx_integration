@@ -48,6 +48,11 @@ npm run report
 | `pay_invoice_redirect.spec.ts` | Hits `/api/method/payrexx_integration.api.pay_invoice` with missing or invalid tokens, including unknown invoice names that do not pass token validation. Verifies the 403 paths. | Nothing extra. |
 | `booking_email.spec.ts` | Calls `Good Event Booking.create_sales_invoice`, then asserts the Email Queue contains a gateway-bound Payrexx `pay_invoice?si=…&gateway_name=…&token=…` URL when the active invoice-email provider renders one. The spec skips that assertion when the provider omits the URL. | `TEST_BOOKING_NAME` pointing at an existing eligible Good Event Booking with customer/contact email, plus Good Event installed. |
 
+CI creates only a dummy non-live `Sandbox` Payrexx Settings row and its standard
+Payment Gateway, starts and waits for the Frappe test site, then runs the first
+two app-owned specs. It does not install Good Event or run `booking_email.spec.ts`.
+Failure reports, traces, screenshots, video, and the web log are uploaded.
+
 ## What's *not* covered (yet)
 
 - A real round-trip to `api.payrexx.com` (sandbox or live). This needs a

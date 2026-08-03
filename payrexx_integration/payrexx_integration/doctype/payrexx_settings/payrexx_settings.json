@@ -13,6 +13,7 @@
   "column_break_creds",
   "api_secret",
   "webhook_signing_key",
+  "automation_user",
   "behavior_section",
   "supported_currencies",
   "psp",
@@ -70,6 +71,14 @@
    "fieldname": "webhook_signing_key",
    "fieldtype": "Password",
    "label": "Webhook Signing Key",
+   "reqd": 1
+  },
+  {
+   "description": "Enabled System User used for checkout, settlement, and accounting-review side effects owned by this gateway.",
+   "fieldname": "automation_user",
+   "fieldtype": "Link",
+   "label": "Automation User",
+   "options": "User",
    "reqd": 1
   },
   {

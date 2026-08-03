@@ -21,7 +21,7 @@ The app metadata exposes `/assets/payrexx_integration/images/payrexx-integration
 
 | DocType | Purpose |
 |---|---|
-| `Payrexx Settings` | Per-environment Payrexx credentials and gateway settings. |
+| `Payrexx Settings` | Per-environment Payrexx credentials, gateway settings, and required automation-user ownership. |
 | `Payment Gateway` | Upstream registry row `Payrexx-<gateway_name>`, created by the settings controller. |
 | `Payment Gateway Account` | Upstream ERPNext company/currency/payment-account bridge. Operators must create it after the gateway; it is not seeded by this app. |
 | `Integration Request` | Upstream provider-request audit and state record. |
@@ -42,10 +42,12 @@ control characters, IP literals, malformed DNS names, wildcard entries, and
 ports other than explicit HTTPS 443. `PayrexxSettings._client()` validates this
 destination before reading the Password field, and the client validates it
 again before constructing request headers. If an allowed custom API domain
-rejects the instance credentials with 401/403/404, the client retries the same
-request against trusted `api.payrexx.com`. This keeps instance API keys working
-when a checkout/login custom domain exists but the REST API still authenticates
-on Payrexx's default API domain.
+rejects a supported operation with 401/403, the client retries the same request
+against trusted `api.payrexx.com`. A 404 retries only for the credential probe
+or Gateway collection/create operation, where it can mean the custom API host
+is not provisioned. A 404 retrieving a concrete Gateway is authoritative and
+never falls back, preventing a missing custom-domain resource from being read
+from another API domain.
 
 ## Important Modules
 
@@ -53,6 +55,7 @@ on Payrexx's default API domain.
 |---|---|
 | `api.py` | Signed pay-by-email URL generation and `pay_invoice` redirect endpoint. |
 | `gateway_selection.py` | Generic, strict Payrexx Settings resolver for this app and downstream consumers. |
+| `session_utils.py` | Validates each owning settings row's enabled System User and restores the caller session after scoped privilege switching. |
 | `payrexx/payrexx_client.py` | Thin Payrexx REST client (`create_gateway`, `retrieve_gateway`, `ping_gateway`); host trust and credential-safe request execution. |
 | `payrexx/webhook_validator.py` | HMAC webhook signature validation. |
 | `doctype/payrexx_settings/payrexx_settings.py` | Settings controller, gateway creation, callback endpoint. |
@@ -119,9 +122,11 @@ flag only after Payment Request creation, the app-owned Integration Request, and
 complete checkout metadata all succeed. The app intentionally does not call
 core `create_request_log()`, because that helper unconditionally commits. Its
 own `_create_integration_request()` inserts the Queued row without transaction
-control; provider id/hash/link and canonical amount/currency are saved in that
-same caller transaction. Provider failures therefore roll back Payment Request
-and Integration Request state together rather than persisting an incomplete
+control. Before provider contact it stores the owning `payrexx_settings` and
+`payrexx_success_token_version` marker in the existing Integration Request data;
+provider id/hash/link and canonical amount/currency are then saved in that same
+caller transaction. Provider failures therefore roll back Payment Request and
+Integration Request state together rather than persisting an incomplete
 checkout.
 
 A provider Gateway cannot participate in the local database transaction. As
@@ -188,12 +193,18 @@ signing key can therefore stay blank until the webhook has been created in
 Payrexx.
 Payrexx sends JSON webhooks, so the callback reads `gateway_name` directly from
 the request query string before resolving the signing key.
-After signature verification, payment side effects run as the configured
-`Non Profit Settings.creation_user` when that DocType is installed, otherwise
-as `Administrator`. The `pay_invoice` redirect endpoint uses the same
-least-privilege resolution (`session_utils.as_automation_user`) for its lazy
-Payment Request creation — no guest path runs as a hardcoded Administrator
-when an automation user is configured. A confirmed Integration Request that
+After signature verification, payment side effects resolve the owning
+`Payrexx Settings.automation_user`. The configured user must exist, be enabled,
+and be a System User when the operation runs. Checkout uses the explicitly
+selected settings row; settlement and accounting-review ToDos use the
+Integration Request's `payrexx_settings`, with its existing `payment_gateway`
+metadata as the legacy ownership fallback. Missing or invalid configuration
+fails closed, and no path guesses `Administrator` or reads another app's
+settings. `session_utils.as_automation_user` always restores the original user,
+session id, and session data. The settings controller owns this context around
+source-extension validation, Integration Request writes, and provider setup, so
+direct ERPNext and downstream callers behave like `pay_invoice`; nested entry by
+`pay_invoice` does not restore the outer session early. A confirmed Integration Request that
 references a supported ERPNext Payment Request calls the standard
 `set_as_paid()` method under a row lock. This creates and submits one Payment
 Entry and lets ERPNext update the Payment Request status/outstanding amount and
@@ -286,6 +297,10 @@ Integration Request data (`payrexx_settings`), and a webhook verified with a
 different settings row's key (for example a Sandbox-signed webhook referencing
 a Live request) is logged and ignored. Requests created before this field
 existed fall back to the `payment_gateway` value recorded at creation.
+If a legacy request has neither binding on a multi-gateway site, only confirmed
+settlement is refused as ambiguous. Authenticated non-confirmed evidence,
+including chargebacks and provider failures, is still recorded using the
+settings row that verified the webhook.
 If a webhook is missing `referenceId`, references an unknown Integration
 Request, or references an Integration Request whose service is not `Payrexx`,
 the callback logs only a compact transaction summary
@@ -296,10 +311,22 @@ contain payer contact data.
 Success redirect endpoint:
 
 ```text
-GET /api/method/payrexx_integration.api.payment_success?ir=<Integration Request>&gateway_name=<Payrexx Settings name>
+GET /api/method/payrexx_integration.api.payment_success?ir=<Integration Request>&gateway_name=<Payrexx Settings name>&token=<hmac>
 ```
 
-Payrexx success redirects reconcile the Integration Request by fetching the
+Every newly created checkout marks its Integration Request with
+`payrexx_success_token_version = 1` and signs the return URL over
+`<ir>|<gateway_name>|payment_success` using the site's encryption key. The
+endpoint verifies supplied tokens before looking up the request, and a marked
+request requires the exact integer marker version, a valid token, and the exact
+owning gateway. Marker-key absence alone identifies legacy data; falsey,
+boolean, string, and unknown present values fail closed. Unknown,
+unsigned-marked, and otherwise invalid references return the same permission
+failure. Only unmarked Integration Requests keep compatibility with already
+issued unsigned legacy return URLs; newly marked requests have no broad
+unsigned fallback.
+
+After authentication, Payrexx success redirects reconcile the Integration Request by fetching the
 Gateway from Payrexx server-side. Webhooks remain the primary completion path,
 but the success return is a safe fallback because payment side effects run only
 when `invoices[].transactions[]` contains an actual `confirmed` transaction
@@ -368,7 +395,9 @@ Failed and preserves the first chargeback evidence.
 ## Security Model
 
 - Pay-by-email URLs are signed with an HMAC derived from the site's `encryption_key`.
+- New Payrexx success-return URLs are purpose-bound HMACs; only explicitly unmarked legacy Integration Requests accept unsigned returns.
 - Payrexx webhooks are validated with `X-Webhook-Signature`.
+- Every settings row owns a required enabled System User; payment and accounting-review side effects fail closed without one.
 - Webhook signing key and API secret are separate values.
 - API secrets are read and sent only after strict final-host validation; custom API hosts require an exact `payrexx_allowed_api_hosts` site-config entry.
 - The API secret never becomes a frame variable, argument, or object attribute on the request path. It is attached through a `requests` auth callable holding it in its closure, and requests are sent as session-prepared requests instead of through `frappe.integrations.utils.make_*_request`. Frappe logs the frame variables of a failing outbound request to Error Log (and Sentry when telemetry is on) and its sanitizer does not match an `x-api-key` header key, so any secret reachable from those frames would be stored in plaintext. The same request frame drops its reference to the POST payer payload before the network call.
@@ -453,7 +482,20 @@ npx playwright test
 The Playwright project covers current Payrexx Settings and pay-by-email endpoint
 behavior. Its optional booking-email spec accepts an existing eligible Good
 Event Booking through `TEST_BOOKING_NAME`; this app does not create cross-app
-event fixtures.
+event fixtures. CI runs only the two app-owned core specs after seeding a dummy
+non-live `Sandbox` Payrexx Settings row (which creates its Payment Gateway) and
+starting/waiting for the test site. Good Event is not installed or seeded for
+the optional spec; browser reports, traces, screenshots, and video are uploaded
+when the core phase fails.
+
+## Migration
+
+Patch `payrexx_integration.patches.v16_1.backfill_automation_user` runs after
+DocType synchronization. It copies `Non Profit Settings.creation_user` only
+when that legacy value names an enabled System User and only into empty existing
+Payrexx Settings rows. It never invents an Administrator fallback, never
+overwrites an explicit per-gateway user, and is idempotent. Rows left empty must
+be configured by an operator before payment work can continue.
 
 ## Related Docs
 

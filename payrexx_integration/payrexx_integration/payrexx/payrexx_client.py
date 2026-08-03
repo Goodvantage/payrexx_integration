@@ -74,15 +74,15 @@ class PayrexxClient:
 
 	def ping_gateway(self) -> dict:
 		"""GET /Gateway/0/ for a cheap credential check without creating checkout data."""
-		return self._get("Gateway/0/")
+		return self._get("Gateway/0/", retry_not_found=True)
 
 	# ----------------------------------------------------------------- internal
 
-	def _get(self, path: str) -> dict:
+	def _get(self, path: str, *, retry_not_found: bool = False) -> dict:
 		try:
 			return _execute_request("GET", self._url(path), authorize=self._authorize)
 		except Exception as exc:
-			if self._should_retry_default_domain(exc):
+			if self._should_retry_default_domain(exc, retry_not_found=retry_not_found):
 				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
 				return _execute_request("GET", fallback_url, authorize=self._authorize)
 			raise
@@ -91,18 +91,18 @@ class PayrexxClient:
 		try:
 			return _execute_request("POST", self._url(path), authorize=self._authorize, data=data)
 		except Exception as exc:
-			if self._should_retry_default_domain(exc):
+			if self._should_retry_default_domain(exc, retry_not_found=True):
 				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
 				return _execute_request("POST", fallback_url, authorize=self._authorize, data=data)
 			raise
 
-	def _should_retry_default_domain(self, exc: Exception) -> bool:
+	def _should_retry_default_domain(self, exc: Exception, *, retry_not_found: bool) -> bool:
 		if self.api_base_domain == DEFAULT_API_BASE_DOMAIN:
 			return False
 		if not isinstance(exc, HTTPError):
 			return False
 		status_code = getattr(exc.response, "status_code", None)
-		return status_code in {401, 403, 404}
+		return status_code in {401, 403} or (retry_not_found and status_code == 404)
 
 	def _url(
 		self,

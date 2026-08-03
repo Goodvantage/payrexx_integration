@@ -11,27 +11,39 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import frappe
+from frappe import _
+from frappe.model.document import Document
+from frappe.utils import cint, cstr
 
 
-def payment_authorization_user_name() -> str:
-	"""Least-privilege automation user for payment side effects.
+def is_valid_automation_user(user_name: str | None) -> bool:
+	user_name = cstr(user_name).strip()
+	if not user_name:
+		return False
+	user = frappe.db.get_value("User", user_name, ["enabled", "user_type"], as_dict=True)
+	return bool(user and cint(user.enabled) and user.user_type == "System User")
 
-	Uses the configured ``Non Profit Settings.creation_user`` when available,
-	falling back to Administrator. Both guest payment paths (pay-by-email
-	redirect and webhook authorization) resolve through this so neither runs
-	with more privilege than the other.
-	"""
-	if frappe.db.exists("DocType", "Non Profit Settings"):
-		creation_user = frappe.db.get_single_value("Non Profit Settings", "creation_user")
-		if creation_user and frappe.db.exists("User", creation_user):
-			return creation_user
 
-	return "Administrator"
+def payment_authorization_user_name(settings: str | Document) -> str:
+	"""Return the owning gateway's configured, enabled System User."""
+	settings = frappe.get_cached_doc("Payrexx Settings", settings) if isinstance(settings, str) else settings
+	user_name = cstr(settings.get("automation_user")).strip()
+	if not user_name:
+		frappe.throw(
+			_("Payrexx Settings {0} requires an Automation User.").format(settings.name),
+			frappe.ValidationError,
+		)
+	if not is_valid_automation_user(user_name):
+		frappe.throw(
+			_("Automation User {0} must be an enabled System User.").format(user_name),
+			frappe.ValidationError,
+		)
+	return user_name
 
 
 @contextmanager
-def as_automation_user(user_name: str | None = None):
-	automation_user = user_name or payment_authorization_user_name()
+def as_automation_user(settings: str | Document):
+	automation_user = payment_authorization_user_name(settings)
 	previous_user = frappe.session.user
 	previous_sid = getattr(frappe.session, "sid", None)
 	previous_data = getattr(frappe.session, "data", None)

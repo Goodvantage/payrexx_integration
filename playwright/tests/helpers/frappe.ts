@@ -1,11 +1,18 @@
 import { Page, APIRequestContext, expect } from "@playwright/test";
 
-/** Navigate to the desk URL and wait for the SPA to settle. */
-export async function gotoDesk(page: Page, route: string) {
-	await page.goto(route);
-	// Frappe is an SPA: shell loads first, then the form is rendered after a
-	// few XHRs. Wait until network goes idle so locators have something to bind.
-	await page.waitForLoadState("networkidle");
+/** Navigate straight to a Desk form and wait for it to render. */
+export async function gotoDesk(page: Page, doctype: string, name: string) {
+	// Frappe 16 serves the Desk SPA at /desk/<route> (/app/<route> 301s there).
+	// Never land on the bare /desk root: its workspace redirect can loop on a
+	// fresh CI site, and any page.evaluate/waitForFunction handle held across
+	// that window dies with "Execution context was destroyed". Deep-link the
+	// form route directly and wait with locators only — locator waits survive
+	// SPA re-navigations.
+	const slug = doctype.toLowerCase().replace(/ /g, "-");
+	await page.goto(`/desk/${slug}/${encodeURIComponent(name)}`, {
+		waitUntil: "domcontentloaded",
+	});
+	await expect(page.locator(".form-layout").first()).toBeVisible({ timeout: 30_000 });
 }
 
 /** Convenience GET against an API endpoint using the authed context. */
