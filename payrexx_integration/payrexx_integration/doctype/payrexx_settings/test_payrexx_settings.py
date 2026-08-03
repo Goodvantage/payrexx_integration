@@ -1415,6 +1415,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 						"payrexx_gateway_id": 999,
 						"payrexx_gateway_amount": int(payment_request.grand_total * 100),
 						"payrexx_gateway_currency": payment_request.currency,
+						"payrexx_settings": GATEWAY_NAME,
 					}
 				),
 			}
@@ -1463,6 +1464,31 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 		ir.reload()
 		self.assertEqual(ir.status, "Completed")
+
+	def test_callback_rejects_unbound_legacy_request_on_multi_gateway_site(self):
+		# A request with no stored gateway binding must not be completed on a
+		# site with several gateways: any row's key would verify the webhook,
+		# so a Sandbox-signed callback could settle a Live request.
+		_ensure_settings("OtherGateway")
+		ir = frappe.get_doc(
+			{
+				"doctype": "Integration Request",
+				"integration_request_service": "Payrexx",
+				"status": "Queued",
+				"data": json.dumps({"payrexx_gateway_id": 999}),
+			}
+		).insert(ignore_permissions=True)
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		transaction = {"id": 12345, "status": "confirmed", "amount": 10000, "currency": "CHF"}
+		result = ps_module._process_callback_transaction(GATEWAY_NAME, transaction, ir.name, "confirmed")
+
+		self.assertEqual(result, {"ok": True})
+		ir.reload()
+		self.assertEqual(ir.status, "Queued")
 
 	def test_confirmation_retries_whole_locked_unit_after_deadlock(self):
 		ir = frappe.get_doc(

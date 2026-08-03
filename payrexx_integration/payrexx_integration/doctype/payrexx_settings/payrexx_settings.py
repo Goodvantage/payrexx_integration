@@ -480,6 +480,18 @@ def _process_callback_transaction(
 	# webhook signed with one row's key (e.g. Sandbox) must not complete a
 	# request created by another row (e.g. Live).
 	expected_settings = ir_data.get("payrexx_settings") or _settings_name_from_request_data(ir_data)
+	if not expected_settings and _multiple_gateways_configured():
+		# Legacy request with no stored gateway binding: on a multi-gateway
+		# site any row's key would verify, so completion cannot be trusted.
+		# Fail closed; staff can backfill `payrexx_settings` on the request.
+		frappe.log_error(
+			title="Payrexx webhook unbound legacy request",
+			message=frappe.as_json(
+				_webhook_log_summary(transaction, reference_id, status)
+				| {"verified_with": settings_name}
+			),
+		)
+		return {"ok": True}
 	if expected_settings and expected_settings != settings_name:
 		frappe.log_error(
 			title="Payrexx webhook gateway mismatch",
@@ -610,10 +622,17 @@ def _reconcile_integration_request_once(
 
 	# The Integration Request's own gateway decides which credentials confirm
 	# the payment; the caller-supplied gateway_name is only a legacy fallback
-	# for requests that predate the stored gateway reference.
-	settings = _resolve_settings(
-		ir_data.get("payrexx_settings") or _settings_name_from_request_data(ir_data) or gateway_name
-	)
+	# for requests that predate the stored gateway reference — and only on a
+	# single-gateway site, where there is just one credential set anyway.
+	stored_settings = ir_data.get("payrexx_settings") or _settings_name_from_request_data(ir_data)
+	if not stored_settings and _multiple_gateways_configured():
+		frappe.log_error(
+			title="Payrexx reconcile unbound legacy request",
+			message=f"Integration Request {ir.name} has no stored gateway binding; "
+			"refusing caller-selected credentials on a multi-gateway site.",
+		)
+		return False
+	settings = _resolve_settings(stored_settings or gateway_name)
 	gateway = settings._client().retrieve_gateway(int(gateway_id))
 	transaction = _confirmed_transaction_from_gateway(gateway, ir.name)
 
@@ -626,6 +645,10 @@ def _reconcile_integration_request_once(
 	elif status in ("cancelled", "declined", "error", "expired"):
 		_mark_reconciliation_failure(ir.name, status)
 	return False
+
+
+def _multiple_gateways_configured() -> bool:
+	return frappe.db.count("Payrexx Settings") > 1
 
 
 def _settings_name_from_request_data(ir_data: dict) -> str | None:
