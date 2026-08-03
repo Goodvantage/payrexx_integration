@@ -3,12 +3,18 @@ import { Page, APIRequestContext, expect } from "@playwright/test";
 /** Navigate to the desk URL and wait for the SPA to settle. */
 export async function gotoDesk(page: Page, route: string) {
 	// A fresh API-authenticated session can still inherit the website home route.
-	await page.goto("/desk");
-	await page.waitForLoadState("networkidle");
-	await page.goto(route);
-	// Frappe is an SPA: shell loads first, then the form is rendered after a
-	// few XHRs. Wait until network goes idle so locators have something to bind.
-	await page.waitForLoadState("networkidle");
+	await page.goto("/desk", { waitUntil: "domcontentloaded" });
+	await waitForDesk(page);
+	await page.goto(route, { waitUntil: "domcontentloaded" });
+	await waitForDesk(page);
+}
+
+async function waitForDesk(page: Page) {
+	await page.waitForFunction(() => {
+		const user = (window as any).frappe?.boot?.user?.name;
+		return Boolean(user && user !== "Guest");
+	});
+	await expect(page.locator(".page-container:visible").first()).toBeVisible();
 }
 
 /** Convenience GET against an API endpoint using the authed context. */
