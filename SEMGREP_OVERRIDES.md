@@ -17,3 +17,10 @@
 - Rule: `frappe-setuser`
 - What it prevents: Unsafe privilege switching that can leave requests running under the wrong user.
 - Why this override is safe: `as_automation_user` is the single privilege-switch context manager for payment side effects. It requires the owning Payrexx Settings row's configured enabled System User, has no Administrator or cross-app fallback, and restores the original Frappe user, session id, and session data in `finally`.
+
+## `frappe-manual-commit` in Payrexx Settings concurrency tests
+
+- Rule: `frappe-manual-commit`
+- File: `payrexx_integration/payrexx_integration/doctype/payrexx_settings/test_payrexx_settings.py`
+- What it prevents: Manual commits that can bypass Frappe's request transaction lifecycle and leave partial business writes.
+- Why this override is safe: `TestPayrexxCurrentReadConcurrency.setUpClass` deliberately commits only its test-owned Payrexx Settings fixture so the primary and secondary database connections can both resolve the same automation user. The concurrency tests already manage and clean their committed test rows explicitly; no production request or DocType hook executes this code.

@@ -2,6 +2,9 @@ import { Page, APIRequestContext, expect } from "@playwright/test";
 
 /** Navigate to the desk URL and wait for the SPA to settle. */
 export async function gotoDesk(page: Page, route: string) {
+	// A fresh API-authenticated session can still inherit the website home route.
+	await page.goto("/desk");
+	await page.waitForLoadState("networkidle");
 	await page.goto(route);
 	// Frappe is an SPA: shell loads first, then the form is rendered after a
 	// few XHRs. Wait until network goes idle so locators have something to bind.
