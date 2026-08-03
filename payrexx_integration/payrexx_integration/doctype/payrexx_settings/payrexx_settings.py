@@ -519,8 +519,7 @@ def _process_callback_transaction(
 			frappe.log_error(
 				title="Payrexx webhook unbound legacy request",
 				message=frappe.as_json(
-					_webhook_log_summary(transaction, reference_id, status)
-					| {"verified_with": settings_name}
+					_webhook_log_summary(transaction, reference_id, status) | {"verified_with": settings_name}
 				),
 			)
 			return {"ok": True}
