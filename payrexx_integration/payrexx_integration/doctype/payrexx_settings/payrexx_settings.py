@@ -3,6 +3,7 @@
 
 import logging
 import time
+from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
 
@@ -1149,9 +1150,16 @@ def _mark_settlement_conflict(
 	)
 
 
-def _mark_chargeback(integration_request_name: str, transaction: dict | None = None) -> None:
+def _mark_chargeback(
+	integration_request_name: str,
+	transaction: dict | None = None,
+	*,
+	settings_name: str | None = None,
+) -> None:
 	"""Apply a chargeback atomically when called outside callback or reconciliation."""
-	_run_with_deadlock_retry(lambda: _mark_locked_chargeback(integration_request_name, transaction))
+	_run_with_deadlock_retry(
+		lambda: _mark_locked_chargeback(integration_request_name, transaction, settings_name=settings_name)
+	)
 
 
 def _mark_locked_chargeback(
@@ -1162,7 +1170,7 @@ def _mark_locked_chargeback(
 ) -> None:
 	integration_request = _get_current_locked_doc("Integration Request", integration_request_name)
 	ir_data = frappe.parse_json(integration_request.data) or {}
-	with _payment_authorization_user(integration_request, settings_name):
+	with _evidence_recording_user(integration_request, settings_name):
 		chargeback_recorded = _is_chargeback_recorded(integration_request, ir_data)
 		if transaction and not chargeback_recorded:
 			ir_data["payrexx_transaction"] = transaction
@@ -1199,7 +1207,7 @@ def _ensure_review_todo(
 	settings_name: str | None = None,
 ) -> None:
 	"""Idempotently create the High-priority review ToDo for an Integration Request."""
-	with _payment_authorization_user(integration_request, settings_name):
+	with _evidence_recording_user(integration_request, settings_name):
 		if frappe.db.exists(
 			"ToDo",
 			{
@@ -1229,3 +1237,28 @@ def _payment_authorization_user(integration_request, settings_name: str | None =
 	ir_data = frappe.parse_json(integration_request.get("data")) or {}
 	stored_settings = ir_data.get("payrexx_settings") or _settings_name_from_request_data(ir_data)
 	return as_automation_user(stored_settings or settings_name or _resolve_settings().name)
+
+
+def _evidence_recording_user(integration_request, settings_name: str | None = None):
+	"""Privilege switch for terminal-evidence writes (chargebacks, review ToDos).
+
+	Settlement stays fail-closed via ``_payment_authorization_user`` — money must
+	never move without the owning gateway's automation user. Recording chargeback
+	or conflict *evidence* is different: for a request with no stored gateway
+	binding on a site with zero or multiple Payrexx Settings rows, gateway
+	resolution is impossible, and throwing here would discard the evidence and
+	its review ToDo. Degrade instead: log the anomaly and record the evidence as
+	the current session user.
+	"""
+	try:
+		return _payment_authorization_user(integration_request, settings_name)
+	except frappe.ValidationError:
+		frappe.log_error(
+			title="Payrexx evidence recorded without gateway automation user",
+			message=(
+				f"Integration Request {integration_request.name}: no Payrexx Settings row "
+				"could be resolved (unbound request on a zero- or multi-gateway site). "
+				f"Terminal evidence was recorded as {frappe.session.user}.\n\n" + frappe.get_traceback()
+			),
+		)
+		return nullcontext()

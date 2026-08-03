@@ -2814,9 +2814,9 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 				attempts = []
 				mark_locked_chargeback = ps_module._mark_locked_chargeback
 
-				def count_attempts(request_name, transaction=None):
+				def count_attempts(request_name, transaction=None, *, settings_name=None):
 					attempts.append((request_name, transaction))
-					return mark_locked_chargeback(request_name, transaction)
+					return mark_locked_chargeback(request_name, transaction, settings_name=settings_name)
 
 				with (
 					patch.object(
