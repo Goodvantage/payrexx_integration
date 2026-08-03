@@ -480,17 +480,6 @@ def _process_callback_transaction(
 	# webhook signed with one row's key (e.g. Sandbox) must not complete a
 	# request created by another row (e.g. Live).
 	expected_settings = ir_data.get("payrexx_settings") or _settings_name_from_request_data(ir_data)
-	if not expected_settings and _multiple_gateways_configured():
-		# Legacy request with no stored gateway binding: on a multi-gateway
-		# site any row's key would verify, so completion cannot be trusted.
-		# Fail closed; staff can backfill `payrexx_settings` on the request.
-		frappe.log_error(
-			title="Payrexx webhook unbound legacy request",
-			message=frappe.as_json(
-				_webhook_log_summary(transaction, reference_id, status) | {"verified_with": settings_name}
-			),
-		)
-		return {"ok": True}
 	if expected_settings and expected_settings != settings_name:
 		frappe.log_error(
 			title="Payrexx webhook gateway mismatch",
@@ -521,6 +510,20 @@ def _process_callback_transaction(
 		return {"ok": True}
 
 	if status == "confirmed":
+		if not expected_settings and _multiple_gateways_configured():
+			# Legacy request with no stored gateway binding: on a multi-gateway
+			# site any row's key would verify, so completion cannot be trusted.
+			# Only settlement is refused - chargebacks and failure evidence
+			# above still apply. Staff can backfill `payrexx_settings` to
+			# re-enable settlement.
+			frappe.log_error(
+				title="Payrexx webhook unbound legacy request",
+				message=frappe.as_json(
+					_webhook_log_summary(transaction, reference_id, status)
+					| {"verified_with": settings_name}
+				),
+			)
+			return {"ok": True}
 		_complete_locked_integration_request(ir.name, transaction)
 	elif status in ("authorized", "reserved"):
 		ir_data["payrexx_transaction"] = transaction
