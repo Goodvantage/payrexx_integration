@@ -1112,28 +1112,11 @@ def _mark_settlement_conflict(integration_request, ir_data: dict, conflict: dict
 			"error": conflict["reason"],
 		}
 	)
-	with _payment_authorization_user():
-		if frappe.db.exists(
-			"ToDo",
-			{
-				"reference_type": "Integration Request",
-				"reference_name": integration_request.name,
-				"description": ["like", f"{SETTLEMENT_CONFLICT_TODO_MARKER}%"],
-			},
-		):
-			return
-		frappe.get_doc(
-			{
-				"doctype": "ToDo",
-				"status": "Open",
-				"priority": "High",
-				"allocated_to": frappe.session.user,
-				"assigned_by": frappe.session.user,
-				"reference_type": "Integration Request",
-				"reference_name": integration_request.name,
-				"description": f"{SETTLEMENT_CONFLICT_TODO_MARKER} {conflict['reason']}",
-			}
-		).insert(ignore_permissions=True)
+	_ensure_review_todo(
+		integration_request.name,
+		SETTLEMENT_CONFLICT_TODO_MARKER,
+		f"{SETTLEMENT_CONFLICT_TODO_MARKER} {conflict['reason']}",
+	)
 
 
 def _mark_chargeback(integration_request_name: str, transaction: dict | None = None) -> None:
@@ -1152,13 +1135,34 @@ def _mark_locked_chargeback(integration_request_name: str, transaction: dict | N
 		updates["data"] = frappe.as_json(ir_data)
 	integration_request.db_set(updates)
 
+	_ensure_review_todo(
+		integration_request.name,
+		CHARGEBACK_TODO_MARKER,
+		f"{CHARGEBACK_TODO_MARKER} "
+		+ _(
+			"Manual accounting reversal required. Review the linked settlement; "
+			"submitted ledger records were preserved."
+		),
+	)
+
+
+def _is_chargeback_recorded(integration_request, ir_data: dict | None = None) -> bool:
+	ir_data = ir_data if ir_data is not None else frappe.parse_json(integration_request.data) or {}
+	transaction = ir_data.get("payrexx_transaction") or {}
+	return (transaction.get("status") or "").lower() == "chargeback" or cstr(
+		integration_request.get("error")
+	) == CHARGEBACK_ERROR
+
+
+def _ensure_review_todo(integration_request_name: str, marker: str, description: str) -> None:
+	"""Idempotently create the High-priority review ToDo for an Integration Request."""
 	with _payment_authorization_user():
 		if frappe.db.exists(
 			"ToDo",
 			{
 				"reference_type": "Integration Request",
-				"reference_name": integration_request.name,
-				"description": ["like", f"{CHARGEBACK_TODO_MARKER}%"],
+				"reference_name": integration_request_name,
+				"description": ["like", f"{marker}%"],
 			},
 		):
 			return
@@ -1170,22 +1174,10 @@ def _mark_locked_chargeback(integration_request_name: str, transaction: dict | N
 				"allocated_to": frappe.session.user,
 				"assigned_by": frappe.session.user,
 				"reference_type": "Integration Request",
-				"reference_name": integration_request.name,
-				"description": f"{CHARGEBACK_TODO_MARKER} "
-				+ _(
-					"Manual accounting reversal required. Review the linked settlement; "
-					"submitted ledger records were preserved."
-				),
+				"reference_name": integration_request_name,
+				"description": description,
 			}
 		).insert(ignore_permissions=True)
-
-
-def _is_chargeback_recorded(integration_request, ir_data: dict | None = None) -> bool:
-	ir_data = ir_data if ir_data is not None else frappe.parse_json(integration_request.data) or {}
-	transaction = ir_data.get("payrexx_transaction") or {}
-	return (transaction.get("status") or "").lower() == "chargeback" or cstr(
-		integration_request.get("error")
-	) == CHARGEBACK_ERROR
 
 
 def _payment_authorization_user():
