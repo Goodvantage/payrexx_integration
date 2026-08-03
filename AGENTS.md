@@ -47,7 +47,7 @@ procedures), and the code. Record new or changed requirements in
 |---|---|
 | `gateway_selection.py` | Canonical strict resolver shared by native flows and downstream apps. Supports explicit selection, a caller-owned site-config key, and unambiguous single-row fallback. |
 | `payrexx_integration/payrexx_integration/doctype/payrexx_settings/` | The settings DocType. One row per environment (`Sandbox` / `Live`). `on_update` auto-creates the matching `Payment Gateway` row (`Payrexx-<gateway_name>`). |
-| `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client. **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The legacy `ApiSignature` body field is no longer used. Canonical `*.payrexx.com` API hosts are trusted by default; custom Platform hosts require exact `payrexx_allowed_api_hosts` site-config entries and are validated before secret access. |
+| `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client (`create_gateway`, `retrieve_gateway`, `ping_gateway`). **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The legacy `ApiSignature` body field is no longer used. Canonical `*.payrexx.com` API hosts are trusted by default; custom Platform hosts require exact `payrexx_allowed_api_hosts` site-config entries and are validated before secret access. The secret lives only in the closure of the `requests` auth callable — see "Never let the API secret become a variable" below. |
 | `payrexx_integration/payrexx_integration/payrexx/webhook_validator.py` | HMAC-SHA256 verification of `X-Webhook-Signature`. Tries base64 first, falls back to hex. The signing key is **separate** from the API secret (configured per webhook in the Payrexx dashboard). |
 | `api.py::payrexx_pay_url(sales_invoice, gateway_name=None)` | Jinja helper (registered via `hooks.py.jinja`). Resolves the gateway and returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
 | `api.py::pay_invoice(si=None, token=None, gateway_name=None)` | Whitelisted GET redirect endpoint. Verifies the invoice-and-gateway-bound HMAC token, locks/revalidates the wholly unpaid invoice and exact submitted/Requested Payment Request plus Integration Request checkout metadata, lazy-creates through ERPNext only when safe, and 302s to Payrexx. Because Frappe otherwise rolls back GET transactions, it sets `frappe.local.flags.commit` only after atomic local setup and checkout URL resolution. **All args remain optional kwargs** so missing-param requests return clean 403, not 500. |
@@ -177,8 +177,9 @@ After chargeback evidence exists, all non-chargeback statuses, including
 error, and the first chargeback transaction. Only duplicate chargeback delivery
 may re-enter the idempotent review-ToDo path.
 
-The integration creates hosted Gateways and reads Gateway/Transaction state. It
-does not expose capture, later-charge, void/cancel, or refund operations. Those
+The integration creates hosted Gateways and reads Gateway state (`create_gateway`,
+`retrieve_gateway`, `ping_gateway` — the whole client surface). It does not expose
+Gateway deletion, capture, later-charge, void/cancel, or refund operations. Those
 provider actions and their ERPNext accounting reversals are manual operational
 workflows until an explicit, tested contract is implemented.
 
@@ -218,6 +219,21 @@ the provider page human-operated, require provider `TEST` evidence, and disable
 
 ## Gotchas
 
+- **Never let the API secret become a variable.** Frappe logs the frame
+  variables of every failing outbound request (`frappe.log_error` →
+  `frappe.get_traceback(with_context=True)`, plus Sentry when telemetry is on),
+  and its sanitizer redacts only the exact dict keys
+  `password/passwd/secret/token/key/pwd` — `x-api-key` is not matched, and the
+  dump expands plain objects, so an attribute leaks exactly like a local. The
+  client therefore does **not** call
+  `frappe.integrations.utils.make_get_request`/`make_post_request` (they take
+  the header dict and the form body as ordinary arguments). It keeps the secret
+  in the closure of `_api_key_auth()` and sends a session-prepared request in
+  `_execute_request()`, which also drops its reference to the POST payer payload
+  before the network call. Response parsing and the error-reporting contract are
+  copied from `make_request`; keep them in sync if upstream changes. Regression
+  coverage: `tests/test_checkout_security.py::TestApiSecretNeverReachesLoggedTracebacks`
+  (audit finding V-H1, 2026-07-30).
 - **Settings save calls Payrexx live.** `validate()._ping()` hits
   `GET /Gateway/0/` to verify credentials. With bogus creds the save
   fails with "Payrexx rejected the API Secret". The ping is skipped when
@@ -274,7 +290,8 @@ the provider page human-operated, require provider `TEST` evidence, and disable
 
 ---
 
-## Recent commit
+## Release history
 
-- `f6d0499 feat: Payrexx payment gateway with email integration + tests` —
-  initial complete implementation.
+Version and release rationale live in `REQUIREMENTS.md` §4 ("Versioning"); the
+commit log is the source of truth for individual changes (`git log --oneline`).
+Do not restate specific commit hashes here — they go stale within a release.
