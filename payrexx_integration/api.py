@@ -106,7 +106,7 @@ def payrexx_pay_url(sales_invoice: str | None, gateway_name: str | None = None) 
 	try:
 		settings_name = resolve_payrexx_settings(gateway_name).name
 	except Exception:
-		frappe.log_error(frappe.get_traceback(), "Payrexx pay URL unavailable")
+		frappe.log_error(title="Payrexx pay URL unavailable", message=frappe.get_traceback())
 		return ""
 	params = {
 		"si": sales_invoice,
@@ -127,7 +127,7 @@ def safe_pay_url(sales_invoice: str | None, gateway_name: str | None = None) -> 
 	try:
 		return payrexx_pay_url(sales_invoice, gateway_name) or ""
 	except Exception:
-		frappe.log_error(frappe.get_traceback(), "Payrexx pay URL unavailable")
+		frappe.log_error(title="Payrexx pay URL unavailable", message=frappe.get_traceback())
 		return ""
 
 

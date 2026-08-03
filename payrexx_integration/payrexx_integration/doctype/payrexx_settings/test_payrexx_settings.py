@@ -46,7 +46,6 @@ def _ensure_settings(name: str = GATEWAY_NAME) -> str:
 			"api_base_domain": "payrexx.com",
 			"api_secret": "sk_test_dummy",
 			"webhook_signing_key": "whk_test_dummy",
-			"api_version": "v1.14",
 			"supported_currencies": "CHF,EUR,USD",
 		}
 	)

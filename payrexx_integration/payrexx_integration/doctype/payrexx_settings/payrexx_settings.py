@@ -139,7 +139,7 @@ class PayrexxSettings(Document):
 		except Exception:
 			if provider_contacted and gateway is None and integration_request:
 				_log_unknown_gateway_outcome(integration_request.name, self.name)
-			frappe.log_error(frappe.get_traceback(), "Payrexx get_payment_url")
+			frappe.log_error(title="Payrexx get_payment_url", message=frappe.get_traceback())
 			frappe.throw(_("Could not generate Payrexx payment URL"))
 
 	# ------------------------------------------------------------------ helpers
@@ -156,7 +156,6 @@ class PayrexxSettings(Document):
 			instance=self.instance_name,
 			# Never move this Password-field read before destination validation.
 			api_secret=self.get_password("api_secret"),
-			api_version=self.api_version or "v1.14",
 			api_base_domain=api_base_domain,
 		)
 
@@ -438,8 +437,8 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 
 		if not ref_id:
 			frappe.log_error(
-				frappe.as_json(_webhook_log_summary(txn, ref_id, status)),
-				"Payrexx webhook missing referenceId",
+				title="Payrexx webhook missing referenceId",
+				message=frappe.as_json(_webhook_log_summary(txn, ref_id, status)),
 			)
 			return {"ok": True}
 
@@ -449,7 +448,7 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 	except frappe.AuthenticationError:
 		raise
 	except Exception:
-		frappe.log_error(frappe.get_traceback(), "Payrexx callback error")
+		frappe.log_error(title="Payrexx callback error", message=frappe.get_traceback())
 		raise
 
 
@@ -462,16 +461,16 @@ def _process_callback_transaction(
 	"""Apply one authenticated callback attempt; deadlocks propagate to the public boundary."""
 	if not frappe.db.exists("Integration Request", reference_id):
 		frappe.log_error(
-			frappe.as_json(_webhook_log_summary(transaction, reference_id, status)),
-			"Payrexx webhook unknown reference",
+			title="Payrexx webhook unknown reference",
+			message=frappe.as_json(_webhook_log_summary(transaction, reference_id, status)),
 		)
 		return {"ok": True}
 
 	ir = _get_current_locked_doc("Integration Request", reference_id)
 	if ir.integration_request_service != "Payrexx":
 		frappe.log_error(
-			frappe.as_json(_webhook_log_summary(transaction, reference_id, status)),
-			"Payrexx webhook wrong Integration Request service",
+			title="Payrexx webhook wrong Integration Request service",
+			message=frappe.as_json(_webhook_log_summary(transaction, reference_id, status)),
 		)
 		return {"ok": True}
 
@@ -483,11 +482,11 @@ def _process_callback_transaction(
 	expected_settings = ir_data.get("payrexx_settings") or _settings_name_from_request_data(ir_data)
 	if expected_settings and expected_settings != settings_name:
 		frappe.log_error(
-			frappe.as_json(
+			title="Payrexx webhook gateway mismatch",
+			message=frappe.as_json(
 				_webhook_log_summary(transaction, reference_id, status)
 				| {"verified_with": settings_name, "expected": expected_settings}
 			),
-			"Payrexx webhook gateway mismatch",
 		)
 		return {"ok": True}
 
@@ -721,7 +720,7 @@ def _on_payment_authorized(integration_request, status) -> str | None:
 	except frappe.QueryDeadlockError:
 		raise
 	except Exception:
-		frappe.log_error(frappe.get_traceback(), "Payrexx on_payment_authorized")
+		frappe.log_error(title="Payrexx on_payment_authorized", message=frappe.get_traceback())
 		raise
 	return None
 
