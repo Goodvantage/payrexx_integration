@@ -734,6 +734,10 @@ class TestCheckoutRetryBoundary(UnitTestCase):
 
 
 class TestBrowserReturnTransactionBinding(UnitTestCase):
+	def setUp(self):
+		super().setUp()
+		self.enterContext(patch.dict(api.frappe.local.conf, {"encryption_key": "payrexx-test-signing-key"}))
+
 	def test_tampered_success_token_is_rejected_before_request_lookup(self):
 		with (
 			patch.object(api.frappe, "get_doc") as get_doc,

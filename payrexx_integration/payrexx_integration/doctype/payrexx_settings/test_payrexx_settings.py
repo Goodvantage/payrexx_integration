@@ -30,6 +30,8 @@ from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
 
+IGNORE_TEST_RECORD_DEPENDENCIES = ["User"]
+
 GATEWAY_NAME = "TestGW"
 SETTINGS_NAME_PREFIX = "Payrexx-Test-"
 
