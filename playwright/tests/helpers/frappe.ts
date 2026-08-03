@@ -14,7 +14,7 @@ async function waitForDesk(page: Page) {
 		const user = (window as any).frappe?.boot?.user?.name;
 		return Boolean(user && user !== "Guest");
 	});
-	await expect(page.locator(".page-container:visible").first()).toBeVisible();
+	await expect(page.locator(".page-container:visible, .desktop-wrapper:visible").first()).toBeVisible();
 }
 
 /** Convenience GET against an API endpoint using the authed context. */
