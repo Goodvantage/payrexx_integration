@@ -156,7 +156,6 @@ class PayrexxSettings(Document):
 			instance=self.instance_name,
 			# Never move this Password-field read before destination validation.
 			api_secret=self.get_password("api_secret"),
-			api_version=self.api_version or "v1.14",
 			api_base_domain=api_base_domain,
 		)
 
