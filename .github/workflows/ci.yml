@@ -105,7 +105,10 @@ jobs:
           frappe.init('test_site', sites_path='/home/runner/frappe-bench/sites')
           frappe.connect()
           from erpnext.setup.setup_wizard.setup_wizard import setup_complete
+          from frappe.desk.page.setup_wizard.setup_wizard import enable_setup_wizard_complete
           setup_complete(frappe._dict({'country': 'Switzerland', 'currency': 'CHF', 'company_name': 'Test Company', 'company_abbr': 'TC', 'chart_of_accounts': 'Standard', 'fy_start_date': '2026-01-01', 'fy_end_date': '2026-12-31'}))
+          enable_setup_wizard_complete('frappe')
+          enable_setup_wizard_complete('erpnext')
           frappe.db.commit()
           frappe.destroy()
           "

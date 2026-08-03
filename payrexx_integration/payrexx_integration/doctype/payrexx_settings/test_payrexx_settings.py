@@ -2469,13 +2469,6 @@ class TestPayrexxAutomationUser(IntegrationTestCase):
 
 
 class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
-	@classmethod
-	def setUpClass(cls):
-		super().setUpClass()
-		cls.settings_name = _ensure_settings()
-		# Concurrency tests switch connections, so their shared settings must be visible to both.
-		frappe.db.commit()  # nosemgrep: frappe-manual-commit
-
 	def setUp(self):
 		super().setUp()
 		if frappe.db.db_type == "sqlite":
@@ -2638,6 +2631,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 			"currency": "CHF",
 		}
 		with self.primary_connection(), self.secondary_connection():
+			settings_name = _ensure_settings()
 			frappe.get_doc(
 				{
 					"doctype": "Payment Request",
@@ -2662,6 +2656,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 						{
 							"payrexx_gateway_amount": 10000,
 							"payrexx_gateway_currency": "CHF",
+							"payrexx_settings": settings_name,
 						}
 					),
 				}
@@ -2785,13 +2780,14 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 		confirmed_transaction = {"id": 90501, "status": "confirmed"}
 		chargeback_transaction = {"id": 90502, "status": "chargeback"}
 		with self.primary_connection(), self.secondary_connection():
+			settings_name = _ensure_settings()
 			frappe.get_doc(
 				{
 					"doctype": "Integration Request",
 					"name": integration_request_name,
 					"integration_request_service": "Payrexx",
 					"status": "Queued",
-					"data": "{}",
+					"data": frappe.as_json({"payrexx_settings": settings_name}),
 				}
 			).db_insert()
 			frappe.db.commit()
@@ -3003,6 +2999,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 			"currency": "CHF",
 		}
 		with self.primary_connection(), self.secondary_connection():
+			_ensure_settings()
 			frappe.get_doc(
 				{
 					"doctype": "Integration Request",
