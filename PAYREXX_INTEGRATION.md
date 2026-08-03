@@ -120,6 +120,7 @@ row order or names such as `Live` and `Sandbox`.
 | `api_version` | Data, default `v1.14` | Bump without code change |
 | `api_secret` | Password, reqd | Sent as `x-api-key` header |
 | `webhook_signing_key` | Password, reqd | HMAC key for `X-Webhook-Signature` |
+| `automation_user` | Link (User), reqd | Owning enabled System User for checkout, settlement, and accounting-review side effects; no fallback user |
 | `supported_currencies` | Small Text, default `CHF,EUR,USD,GBP` | Comma list, validated per transaction |
 | `psp` | Small Text | Optional comma list of PSP IDs |
 | `validity_minutes` | Int | Optional gateway TTL |

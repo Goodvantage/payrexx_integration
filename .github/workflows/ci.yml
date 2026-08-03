@@ -112,3 +112,56 @@ jobs:
           bench --site test_site run-tests --app payrexx_integration
         env:
           TYPE: server
+
+      - name: Seed Sandbox browser fixture
+        working-directory: /home/runner/frappe-bench
+        run: |
+          /home/runner/frappe-bench/env/bin/python -c "
+          import frappe
+          frappe.init('test_site', sites_path='/home/runner/frappe-bench/sites')
+          frappe.connect()
+          frappe.flags.in_test = True
+          settings = frappe.get_doc('Payrexx Settings', 'Sandbox') if frappe.db.exists('Payrexx Settings', 'Sandbox') else frappe.new_doc('Payrexx Settings')
+          settings.update({'gateway_name': 'Sandbox', 'instance_name': 'ci-sandbox', 'api_base_domain': 'payrexx.com', 'api_secret': 'ci_not_live', 'webhook_signing_key': 'ci_not_live', 'automation_user': 'Administrator', 'supported_currencies': 'CHF'})
+          settings.save(ignore_permissions=True)
+          frappe.db.commit()
+          frappe.destroy()
+          "
+
+      - name: Install Playwright
+        working-directory: ${{ github.workspace }}/playwright
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run core Playwright specs
+        working-directory: /home/runner/frappe-bench
+        run: |
+          bench --site test_site serve --port 8000 > "$GITHUB_WORKSPACE/playwright/bench-web.log" 2>&1 &
+          web_pid=$!
+          trap 'kill $web_pid' EXIT
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:8000/api/method/ping > /dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl --fail --silent http://127.0.0.1:8000/api/method/ping > /dev/null
+          cd "$GITHUB_WORKSPACE/playwright"
+          npx playwright test tests/payrexx_settings.spec.ts tests/pay_invoice_redirect.spec.ts
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:8000
+          FRAPPE_USERNAME: Administrator
+          FRAPPE_PASSWORD: admin
+          TEST_PAYREXX_SETTINGS: Sandbox
+
+      - name: Upload Playwright failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: payrexx-playwright-failure
+          if-no-files-found: ignore
+          path: |
+            playwright/bench-web.log
+            playwright/playwright-report
+            playwright/test-results

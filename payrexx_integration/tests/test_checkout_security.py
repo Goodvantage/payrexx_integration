@@ -1,12 +1,14 @@
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import frappe
 import requests
 from frappe.tests import UnitTestCase
 from frappe.utils import CallbackManager
-from requests import Response
+from requests import HTTPError, Response
 
 from payrexx_integration import api
+from payrexx_integration.patches.v16_1 import backfill_automation_user
 from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
 	payrexx_settings as settings_module,
 )
@@ -66,6 +68,56 @@ def _integration_request_data(**overrides):
 	}
 	data.update(overrides)
 	return data
+
+
+class TestAutomationUserMigration(UnitTestCase):
+	def test_valid_legacy_user_only_backfills_empty_rows_once(self):
+		with (
+			patch.object(backfill_automation_user.frappe.db, "exists", return_value=True),
+			patch.object(
+				backfill_automation_user.frappe,
+				"get_meta",
+				return_value=Mock(has_field=Mock(return_value=True)),
+			),
+			patch.object(
+				backfill_automation_user.frappe.db,
+				"get_single_value",
+				return_value="automation@example.test",
+			),
+			patch.object(backfill_automation_user, "is_valid_automation_user", return_value=True),
+			patch.object(
+				backfill_automation_user.frappe,
+				"get_all",
+				side_effect=(["Live"], []),
+			),
+			patch.object(backfill_automation_user.frappe.db, "set_value") as set_value,
+		):
+			backfill_automation_user.execute()
+			backfill_automation_user.execute()
+
+		set_value.assert_called_once_with(
+			"Payrexx Settings",
+			"Live",
+			"automation_user",
+			"automation@example.test",
+			update_modified=False,
+		)
+
+	def test_invalid_legacy_user_does_not_create_an_administrator_fallback(self):
+		with (
+			patch.object(backfill_automation_user.frappe.db, "exists", return_value=True),
+			patch.object(
+				backfill_automation_user.frappe,
+				"get_meta",
+				return_value=Mock(has_field=Mock(return_value=True)),
+			),
+			patch.object(backfill_automation_user.frappe.db, "get_single_value", return_value=None),
+			patch.object(backfill_automation_user, "is_valid_automation_user", return_value=False),
+			patch.object(backfill_automation_user.frappe.db, "set_value") as set_value,
+		):
+			backfill_automation_user.execute()
+
+		set_value.assert_not_called()
 
 
 class TestPayrexxApiHostTrust(UnitTestCase):
@@ -136,6 +188,75 @@ class TestPayrexxApiHostTrust(UnitTestCase):
 			PayrexxClient(instance="demo", api_secret="secret", api_base_domain="attacker.example")
 
 		request.assert_not_called()
+
+	def test_gateway_retrieval_404_does_not_fall_back_to_default_domain(self):
+		response = Response()
+		response.status_code = 404
+		with (
+			patch(f"{CLIENT_MODULE}.frappe.conf", {"payrexx_allowed_api_hosts": ["api.pay.example"]}),
+			patch(f"{CLIENT_MODULE}._execute_request", side_effect=HTTPError(response=response)) as request,
+		):
+			client = PayrexxClient(
+				instance="demo",
+				api_secret="secret",
+				api_base_domain="pay.example",
+			)
+			with self.assertRaises(HTTPError):
+				client.retrieve_gateway(123)
+
+		request.assert_called_once()
+		self.assertIn("api.pay.example", request.call_args.args[1])
+
+	def test_gateway_retrieval_auth_rejection_still_falls_back(self):
+		for status_code in (401, 403):
+			with self.subTest(status_code=status_code):
+				response = Response()
+				response.status_code = status_code
+				with (
+					patch(
+						f"{CLIENT_MODULE}.frappe.conf",
+						{"payrexx_allowed_api_hosts": ["api.pay.example"]},
+					),
+					patch(
+						f"{CLIENT_MODULE}._execute_request",
+						side_effect=(
+							HTTPError(response=response),
+							{"status": "success", "data": [{"id": 123}]},
+						),
+					) as request,
+				):
+					client = PayrexxClient(
+						instance="demo",
+						api_secret="secret",
+						api_base_domain="pay.example",
+					)
+					self.assertEqual(client.retrieve_gateway(123)["id"], 123)
+
+				self.assertEqual(request.call_count, 2)
+				self.assertIn("api.payrexx.com", request.call_args_list[1].args[1])
+
+	def test_gateway_create_404_still_falls_back(self):
+		response = Response()
+		response.status_code = 404
+		with (
+			patch(f"{CLIENT_MODULE}.frappe.conf", {"payrexx_allowed_api_hosts": ["api.pay.example"]}),
+			patch(
+				f"{CLIENT_MODULE}._execute_request",
+				side_effect=(
+					HTTPError(response=response),
+					{"status": "success", "data": [{"id": 123}]},
+				),
+			) as request,
+		):
+			client = PayrexxClient(
+				instance="demo",
+				api_secret="secret",
+				api_base_domain="pay.example",
+			)
+			self.assertEqual(client.create_gateway({"amount": 100})["id"], 123)
+
+		self.assertEqual(request.call_count, 2)
+		self.assertIn("api.payrexx.com", request.call_args_list[1].args[1])
 
 
 class _StubProviderSession:
@@ -390,13 +511,20 @@ class TestAtomicCheckoutCreation(UnitTestCase):
 					"reference_doctype": "Payment Request",
 					"reference_docname": "PR-SECURITY-TEST",
 					"amount": 100,
-				}
+				},
+				"Live",
 			)
 
 		self.assertIs(created, document)
 		document.insert.assert_called_once_with(ignore_permissions=True)
 		commit.assert_not_called()
 		self.assertEqual(get_doc.call_args.args[0]["status"], "Queued")
+		request_data = frappe.parse_json(get_doc.call_args.args[0]["data"])
+		self.assertEqual(request_data["payrexx_settings"], "Live")
+		self.assertEqual(
+			request_data[settings_module.PAYREXX_SUCCESS_TOKEN_VERSION_KEY],
+			settings_module.PAYREXX_SUCCESS_TOKEN_VERSION,
+		)
 
 	def test_provider_failure_rolls_back_cleanly_and_retry_persists_complete_metadata(self):
 		settings = Mock()
@@ -429,6 +557,7 @@ class TestAtomicCheckoutCreation(UnitTestCase):
 		second_request.reference_docname = "PR-SECURITY-TEST"
 
 		with (
+			patch.object(settings_module, "as_automation_user", return_value=nullcontext()),
 			patch.object(
 				settings_module,
 				"_create_integration_request",
@@ -447,6 +576,7 @@ class TestAtomicCheckoutCreation(UnitTestCase):
 		commit.assert_not_called()
 
 		with (
+			patch.object(settings_module, "as_automation_user", return_value=nullcontext()),
 			patch.object(
 				settings_module,
 				"_create_integration_request",
@@ -604,6 +734,147 @@ class TestCheckoutRetryBoundary(UnitTestCase):
 
 
 class TestBrowserReturnTransactionBinding(UnitTestCase):
+	def test_tampered_success_token_is_rejected_before_request_lookup(self):
+		with (
+			patch.object(api.frappe, "get_doc") as get_doc,
+			self.assertRaises(frappe.PermissionError) as exc,
+		):
+			api.payment_success(
+				ir="IR-MARKED",
+				gateway_name="Live",
+				token="tampered",
+			)
+
+		self.assertEqual(str(exc.exception), "Invalid payment return")
+		get_doc.assert_not_called()
+
+	def test_success_return_does_not_expose_unknown_or_marked_references(self):
+		valid_token = api.sign_payment_success_reference("IR-UNKNOWN", "Live")
+		with (
+			patch.object(api.frappe, "get_doc", side_effect=frappe.DoesNotExistError),
+			self.assertRaises(frappe.PermissionError) as unknown,
+		):
+			api.payment_success(ir="IR-UNKNOWN", gateway_name="Live", token=valid_token)
+
+		marked_request = frappe._dict(
+			integration_request_service="Payrexx",
+			data=frappe.as_json(
+				{
+					settings_module.PAYREXX_SUCCESS_TOKEN_VERSION_KEY: 1,
+					"payrexx_settings": "Live",
+				}
+			),
+		)
+		with (
+			patch.object(api.frappe, "get_doc", return_value=marked_request),
+			self.assertRaises(frappe.PermissionError) as unsigned,
+		):
+			api.payment_success(ir="IR-MARKED", gateway_name="Live")
+
+		self.assertEqual(str(unknown.exception), str(unsigned.exception))
+
+	def test_success_token_cannot_select_another_gateway(self):
+		marked_request = frappe._dict(
+			integration_request_service="Payrexx",
+			data=frappe.as_json(
+				{
+					settings_module.PAYREXX_SUCCESS_TOKEN_VERSION_KEY: 1,
+					"payrexx_settings": "Live",
+				}
+			),
+		)
+		with (
+			patch.object(api.frappe, "get_doc", return_value=marked_request),
+			patch.object(settings_module, "reconcile_integration_request") as reconcile,
+			self.assertRaises(frappe.PermissionError),
+		):
+			api.payment_success(
+				ir="IR-MARKED",
+				gateway_name="Sandbox",
+				token=api.sign_payment_success_reference("IR-MARKED", "Sandbox"),
+			)
+
+		reconcile.assert_not_called()
+
+	def test_present_unsupported_success_marker_versions_fail_closed(self):
+		valid_token = api.sign_payment_success_reference("IR-MARKED", "Live")
+		for marker_version in (None, 0, "", 2, "1", True):
+			marked_request = frappe._dict(
+				integration_request_service="Payrexx",
+				data=frappe.as_json(
+					{
+						settings_module.PAYREXX_SUCCESS_TOKEN_VERSION_KEY: marker_version,
+						"payrexx_settings": "Live",
+					}
+				),
+			)
+			with (
+				self.subTest(marker_version=marker_version),
+				patch.object(api.frappe, "get_doc", return_value=marked_request),
+				patch.object(settings_module, "reconcile_integration_request") as reconcile,
+				self.assertRaises(frappe.PermissionError),
+			):
+				api.payment_success(
+					ir="IR-MARKED",
+					gateway_name="Live",
+					token=valid_token,
+				)
+			reconcile.assert_not_called()
+
+	def test_valid_marked_success_return_reconciles(self):
+		marked_request = Mock(
+			integration_request_service="Payrexx",
+			data=frappe.as_json(
+				{
+					settings_module.PAYREXX_SUCCESS_TOKEN_VERSION_KEY: 1,
+					"payrexx_settings": "Live",
+				}
+			),
+			status="Queued",
+		)
+		original_response = getattr(api.frappe.local, "response", None)
+		try:
+			api.frappe.local.response = {}
+			with (
+				patch.object(api.frappe, "get_doc", return_value=marked_request),
+				patch.object(
+					settings_module, "reconcile_integration_request", return_value=False
+				) as reconcile,
+				patch.object(api, "_payment_failed_redirect_url", return_value="/payment-failed"),
+			):
+				api.payment_success(
+					ir="IR-MARKED",
+					gateway_name="Live",
+					token=api.sign_payment_success_reference("IR-MARKED", "Live"),
+				)
+		finally:
+			api.frappe.local.response = original_response or {}
+
+		reconcile.assert_called_once_with("IR-MARKED", gateway_name="Live")
+
+	def test_unsigned_unmarked_legacy_success_return_remains_compatible(self):
+		legacy_request = Mock(
+			integration_request_service="Payrexx",
+			data="{}",
+			status="Queued",
+		)
+		original_response = getattr(api.frappe.local, "response", None)
+		try:
+			api.frappe.local.response = {}
+			with (
+				patch.object(api.frappe, "get_doc", return_value=legacy_request),
+				patch.object(
+					settings_module, "reconcile_integration_request", return_value=False
+				) as reconcile,
+				patch.object(api, "_payment_failed_redirect_url", return_value="/payment-failed"),
+			):
+				api.payment_success(ir="IR-LEGACY", gateway_name="Live")
+		finally:
+			api.frappe.local.response = original_response or {}
+
+		reconcile.assert_called_once_with("IR-LEGACY", gateway_name="Live")
+		legacy_request.reload.assert_called_once_with()
+
 	def test_confirmed_transaction_must_reference_expected_integration_request(self):
 		gateway = {
 			"referenceId": "IR-OTHER",

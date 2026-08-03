@@ -46,7 +46,7 @@ procedures), and the code. Record new or changed requirements in
 | File | Purpose |
 |---|---|
 | `gateway_selection.py` | Canonical strict resolver shared by native flows and downstream apps. Supports explicit selection, a caller-owned site-config key, and unambiguous single-row fallback. |
-| `payrexx_integration/payrexx_integration/doctype/payrexx_settings/` | The settings DocType. One row per environment (`Sandbox` / `Live`). `on_update` auto-creates the matching `Payment Gateway` row (`Payrexx-<gateway_name>`). |
+| `payrexx_integration/payrexx_integration/doctype/payrexx_settings/` | The settings DocType. One row per environment (`Sandbox` / `Live`), each with its own required automation user. `on_update` auto-creates the matching `Payment Gateway` row (`Payrexx-<gateway_name>`). |
 | `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client (`create_gateway`, `retrieve_gateway`, `ping_gateway`). **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The legacy `ApiSignature` body field is no longer used. Canonical `*.payrexx.com` API hosts are trusted by default; custom Platform hosts require exact `payrexx_allowed_api_hosts` site-config entries and are validated before secret access. The secret lives only in the closure of the `requests` auth callable — see "Never let the API secret become a variable" below. |
 | `payrexx_integration/payrexx_integration/payrexx/webhook_validator.py` | HMAC-SHA256 verification of `X-Webhook-Signature`. Tries base64 first, falls back to hex. The signing key is **separate** from the API secret (configured per webhook in the Payrexx dashboard). |
 | `api.py::payrexx_pay_url(sales_invoice, gateway_name=None)` | Jinja helper (registered via `hooks.py.jinja`). Resolves the gateway and returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
@@ -85,10 +85,14 @@ Settings row exists. The desk form's dashboard surfaces this URL so admins
 can paste it into the Payrexx webhook settings.
 Payrexx JSON webhook requests keep the query string in `frappe.request.args`,
 not in the whitelisted method kwargs, so the callback intentionally reads both.
-After signature verification, callback side effects run as the configured
-`Non Profit Settings.creation_user` when available, else `Administrator`, and
-transient `QueryDeadlockError` failures around `on_payment_authorized` are
-retried.
+After signature verification, settlement and accounting-review side effects run
+as the owning Payrexx Settings row's configured enabled System User. Missing,
+disabled, or Website users fail closed; there is no Administrator or cross-app
+settings fallback. Transient `QueryDeadlockError` failures around
+`on_payment_authorized` are retried.
+For unbound legacy Integration Requests on multi-gateway sites, refuse only
+`confirmed` settlement as ambiguous; record authenticated non-confirmed evidence
+under the settings row that verified the webhook.
 
 ### Success redirect URL (generated per Gateway)
 
@@ -96,9 +100,15 @@ retried.
 {{ host_name }}/api/method/payrexx_integration.api.payment_success
   ?ir=<Integration Request name>
   &gateway_name=<Payrexx Settings name>
+  &token=<HMAC bound to ir|gateway_name|payment_success>
 ```
 
-This endpoint is a fallback reconciliation path. It retrieves the Payrexx
+New Integration Requests carry `payrexx_success_token_version` in their existing
+metadata and require this token; only unmarked, already-issued legacy requests
+may return unsigned. Key absence alone means legacy; every present marker must
+equal the exact supported integer version. Authentication failures are checked before request lookup
+where possible and do not reveal whether a reference exists. This endpoint is a
+fallback reconciliation path. It retrieves the Payrexx
 Gateway server-side and only completes the Integration Request when the Gateway
 contains an actual confirmed transaction whose provider `referenceId` belongs
 to the expected Integration Request; Gateway status alone and cross-reference
@@ -141,9 +151,10 @@ For Payrexx Platform / partner accounts, split the checkout/login domain:
 `instance_name`. Add the exact final host (`api.pay.goodvantage.ch`) to the
 site-config JSON list `payrexx_allowed_api_hosts` before saving. URL-like values,
 IP literals, malformed hosts, wildcards, and non-HTTPS ports are rejected before
-the Password field is read. If an allowed custom API domain returns 401/403/404,
-the client retries the same request once against `api.payrexx.com` so instance
-API keys still work when only the checkout/login surface uses a custom domain.
+the Password field is read. A custom API domain's 401/403 response retries once
+against `api.payrexx.com` for every supported operation. A 404 retries only for
+the credential probe and Gateway creation, where it can indicate an
+unprovisioned custom API host; a concrete Gateway retrieval 404 is authoritative.
 
 Checkout creation must use the app-owned `_create_integration_request()` path,
 never core `create_request_log()` (it commits). Provider metadata and the
@@ -210,6 +221,10 @@ TEST_BOOKING_NAME=<booking> npx playwright test
 `TEST_BOOKING_NAME` must identify an existing eligible Good Event Booking
 created through Good Event's own fixtures or operator workflow. Payrexx
 Integration does not create cross-app event test data.
+CI seeds only a dummy non-live `Sandbox` Payrexx Settings/Payment Gateway pair,
+starts and waits for the site, and runs `payrexx_settings.spec.ts` plus
+`pay_invoice_redirect.spec.ts`; it does not install Good Event for the optional
+booking spec.
 
 Hosted sandbox settlement uses the separately documented protected CLI. Keep
 the provider page human-operated, require provider `TEST` evidence, and disable
@@ -238,6 +253,18 @@ the provider page human-operated, require provider `TEST` evidence, and disable
   `GET /Gateway/0/` to verify credentials. With bogus creds the save
   fails with "Payrexx rejected the API Secret". The ping is skipped when
   `frappe.flags.in_test` or `frappe.flags.in_install` is set.
+- **Automation user is gateway-owned and mandatory.** Every Payrexx Settings
+  row must name an enabled System User. Checkout, settlement, chargeback, and
+  settlement-conflict ToDo paths resolve that row from explicit checkout state
+  or Integration Request metadata and fail closed instead of guessing another
+  app's setting or Administrator. Keep the full settings-controller checkout
+  operation inside this context so direct downstream callers cannot bypass it;
+  nested `pay_invoice` entry is intentionally reentrant.
+- **New success returns are signed.** Keep
+  `payrexx_success_token_version` on new Integration Requests and include the
+  purpose-bound token in generated `payment_success` URLs. Do not broaden the
+  unsigned compatibility branch beyond requests where the marker key is absent,
+  and fail closed on every unsupported present value.
 - **The DocType uses `autoname: field:gateway_name`** — the doc name = the
   `gateway_name` field. Don't add an `autoname` patch that breaks this.
 - **Pay URL contains `&amp;` after rendering.** Tests asserting on the
@@ -274,6 +301,8 @@ the provider page human-operated, require provider `TEST` evidence, and disable
 - **Custom API hosts are opt-in.** Keep `api_base_domain` host-only and add the
   final `api.<base-domain>` hostname exactly to `payrexx_allowed_api_hosts`; do
   not weaken the parser or move `get_password("api_secret")` before validation.
+  Preserve operation-aware fallback: 401/403 may retry any supported operation,
+  but a 404 must not retry concrete Gateway retrieval.
 - **No URL hard-coding** — externally shared URLs go through
   `payrexx_integration.url_utils.get_public_url()`, which respects
   `host_name` without leaking the local bench port. The Playwright config is
