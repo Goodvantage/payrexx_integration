@@ -2473,6 +2473,8 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 	def setUpClass(cls):
 		super().setUpClass()
 		cls.settings_name = _ensure_settings()
+		# Concurrency tests switch connections, so their shared settings must be visible to both.
+		frappe.db.commit()
 
 	def setUp(self):
 		super().setUp()
