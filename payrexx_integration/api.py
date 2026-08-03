@@ -116,6 +116,21 @@ def payrexx_pay_url(sales_invoice: str | None, gateway_name: str | None = None) 
 	return get_public_url("/api/method/payrexx_integration.api.pay_invoice?" + urlencode(params))
 
 
+def safe_pay_url(sales_invoice: str | None, gateway_name: str | None = None) -> str:
+	"""Never-raise variant of :func:`payrexx_pay_url` for email/print rendering.
+
+	Consumer apps embed pay links while composing invoice and dunning
+	output; a Payrexx misconfiguration must degrade to "no link", never
+	break the document. This wrapper owns that fallback contract in one
+	place instead of each app hand-rolling its own try/except.
+	"""
+	try:
+		return payrexx_pay_url(sales_invoice, gateway_name) or ""
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "Payrexx pay URL unavailable")
+		return ""
+
+
 # -------------------------------------------------------------- redirect entry
 
 
