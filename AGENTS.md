@@ -189,10 +189,19 @@ error, and the first chargeback transaction. Only duplicate chargeback delivery
 may re-enter the idempotent review-ToDo path.
 
 The integration creates hosted Gateways and reads Gateway state (`create_gateway`,
-`retrieve_gateway`, `ping_gateway` — the whole client surface). It does not expose
+`retrieve_gateway`, `ping_gateway`), plus non-payment static QR codes
+(`create_qr_code`, `delete_qr_code` → `PayrexxSettings.create_static_qr` /
+`delete_static_qr`; see DOCUMENTATION.md "Static QR Codes") — the whole client
+surface. It does not expose
 Gateway deletion, capture, later-charge, void/cancel, or refund operations. Those
 provider actions and their ERPNext accounting reversals are manual operational
 workflows until an explicit, tested contract is implemented.
+
+Static-QR TWINT handoff: a TWINT-app scan appends `qr_code_session_id` and a
+return-app value to the scanned URL. Pass them into `get_payment_url` as
+`qr_code_session_id` / `return_app` — they are guest-controlled, sanitized, and
+dropped silently when invalid — and the method returns the Gateway `appLink`
+(deep link into TWINT) instead of the hosted `link` for that checkout.
 
 ---
 

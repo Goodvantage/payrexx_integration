@@ -272,7 +272,7 @@ def _run_concurrent_manual_payrexx_checkout(
 			},
 			update_modified=False,
 		)
-		frappe.db.commit()
+		frappe.db.commit()  # Publish the worker result for the concurrency assertion. # nosemgrep
 		return "created"
 	except frappe.QueryDeadlockError:
 		frappe.db.rollback()
@@ -2481,7 +2481,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 
 		frappe.db.rollback()
 		settings_name = _ensure_settings()
-		frappe.db.commit()
+		frappe.db.commit()  # Expose settings to the independent test connections. # nosemgrep
 		company = _test_company()
 		currency = frappe.db.get_value("Company", company, "default_currency")
 		invoice_name = f"PAYREXX-CONCURRENT-SINV-{frappe.generate_hash(length=10)}"
@@ -2541,7 +2541,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 					"reference_name": invoice_name,
 				}
 			).db_insert()
-		frappe.db.commit()
+		frappe.db.commit()  # Expose fixtures to the independent test connections. # nosemgrep
 
 		client = Mock()
 		client.create_gateway.return_value = {
@@ -2612,7 +2612,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 			)
 			frappe.db.delete("Payment Request", {"name": ["in", all_payment_request_names]})
 			frappe.db.delete("Sales Invoice", {"name": invoice_name})
-			frappe.db.commit()
+			frappe.db.commit()  # Persist cross-connection test cleanup. # nosemgrep
 
 	def test_concurrent_payment_entry_prevents_second_settlement_attempt(self):
 		from erpnext.accounts.doctype.payment_request.payment_request import PaymentRequest
@@ -2661,7 +2661,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 					),
 				}
 			).db_insert()
-			frappe.db.commit()
+			frappe.db.commit()  # Expose fixtures to the independent test connections. # nosemgrep
 
 		try:
 			with self.primary_connection():
@@ -2703,7 +2703,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 					{"status": "Paid", "outstanding_amount": 0},
 					update_modified=False,
 				)
-				frappe.db.commit()
+				frappe.db.commit()  # Publish the simulated concurrent settlement. # nosemgrep
 
 			with self.primary_connection():
 				attempts = []
@@ -2769,7 +2769,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 				frappe.db.delete("Payment Entry", {"name": payment_entry_name})
 				frappe.db.delete("Integration Request", {"name": integration_request_name})
 				frappe.db.delete("Payment Request", {"name": payment_request_name})
-				frappe.db.commit()
+				frappe.db.commit()  # Persist cross-connection test cleanup. # nosemgrep
 
 	def test_chargeback_boundary_retries_after_concurrent_completion(self):
 		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
@@ -2790,7 +2790,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 					"data": frappe.as_json({"payrexx_settings": settings_name}),
 				}
 			).db_insert()
-			frappe.db.commit()
+			frappe.db.commit()  # Expose fixtures to the independent test connections. # nosemgrep
 
 		try:
 			with self.primary_connection():
@@ -2808,7 +2808,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 					},
 					update_modified=False,
 				)
-				frappe.db.commit()
+				frappe.db.commit()  # Publish the simulated concurrent completion. # nosemgrep
 
 			with self.primary_connection():
 				attempts = []
@@ -2867,7 +2867,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 					},
 				)
 				frappe.db.delete("Integration Request", {"name": integration_request_name})
-				frappe.db.commit()
+				frappe.db.commit()  # Persist cross-connection test cleanup. # nosemgrep
 
 	def test_reconciliation_failure_preserves_concurrent_terminal_evidence(self):
 		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
@@ -2911,7 +2911,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 							"data": frappe.as_json(initial_data),
 						}
 					).db_insert()
-					frappe.db.commit()
+					frappe.db.commit()  # Expose fixtures to the independent test connections. # nosemgrep
 
 				try:
 					with self.primary_connection():
@@ -2929,7 +2929,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 							},
 							update_modified=False,
 						)
-						frappe.db.commit()
+						frappe.db.commit()  # Publish the simulated concurrent terminal state. # nosemgrep
 
 					with self.primary_connection():
 						client = Mock()
@@ -2984,7 +2984,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 							"Integration Request",
 							{"name": integration_request_name},
 						)
-						frappe.db.commit()
+						frappe.db.commit()  # Persist cross-connection test cleanup. # nosemgrep
 
 	def test_waiting_callback_observes_concurrently_completed_request(self):
 		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
@@ -3009,7 +3009,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 					"data": frappe.as_json({"payrexx_settings": GATEWAY_NAME}),
 				}
 			).db_insert()
-			frappe.db.commit()
+			frappe.db.commit()  # Expose fixtures to the independent test connections. # nosemgrep
 
 		try:
 			with self.primary_connection():
@@ -3032,7 +3032,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 					},
 					update_modified=False,
 				)
-				frappe.db.commit()
+				frappe.db.commit()  # Publish the simulated concurrent completion. # nosemgrep
 
 			waiting_transaction = {
 				"id": 92002,
@@ -3103,4 +3103,4 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 			with self.primary_connection(), self.secondary_connection():
 				frappe.db.rollback()
 				frappe.db.delete("Integration Request", {"name": integration_request_name})
-				frappe.db.commit()
+				frappe.db.commit()  # Persist cross-connection test cleanup. # nosemgrep

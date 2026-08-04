@@ -2,10 +2,11 @@
 # For license information, please see license.txt
 
 import logging
+import re
 import time
 from contextlib import nullcontext
 from decimal import Decimal, InvalidOperation
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import frappe
 from frappe import _
@@ -44,6 +45,9 @@ GATEWAY_ORPHAN_LOG_MARKER = "[Payrexx possible orphan Gateway]"
 PAYREXX_SUCCESS_TOKEN_VERSION_KEY = "payrexx_success_token_version"
 PAYREXX_SUCCESS_TOKEN_VERSION = 1
 DECIMAL_CONVERSION_ERRORS = (InvalidOperation, TypeError, ValueError)
+_QR_SESSION_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_QR_CODE_UUID_PATTERN = re.compile(r"^[A-Za-z0-9-]{8,64}$")
+_MAX_WEBSHOP_URL_LENGTH = 1000
 
 
 def _get_current_locked_doc(doctype: str, name: str) -> Document:
@@ -131,12 +135,18 @@ class PayrexxSettings(Document):
 				data["payrexx_checkout_url"] = gateway.get("link")
 				data["payrexx_gateway_amount"] = payload["amount"]
 				data["payrexx_gateway_currency"] = payload["currency"]
+				if gateway.get("appLink"):
+					data["payrexx_gateway_app_link"] = gateway["appLink"]
 				# Authoritative record of which settings row created this request —
 				# the webhook only accepts callbacks verified with this row's key.
 				data["payrexx_settings"] = self.name
 				integration_request.data = frappe.as_json(data)
 				integration_request.save(ignore_permissions=True)
 
+				# A TWINT static-QR scan must hand the donor back into the TWINT app;
+				# every other checkout redirects to the hosted payment page.
+				if payload.get("qrCodeSessionId") and gateway.get("appLink"):
+					return gateway["appLink"]
 				return gateway["link"]
 			except frappe.QueryDeadlockError:
 				if provider_contacted and gateway is None and integration_request:
@@ -147,6 +157,52 @@ class PayrexxSettings(Document):
 					_log_unknown_gateway_outcome(integration_request.name, self.name)
 				frappe.log_error(title="Payrexx get_payment_url", message=frappe.get_traceback())
 				frappe.throw(_("Could not generate Payrexx payment URL"))
+
+	# ---------------------------------------------------------- static QR codes
+
+	def create_static_qr(self, webshop_url: str) -> dict:
+		"""Create a permanent Payrexx static QR code pointing at ``webshop_url``.
+
+		Returns the provider payload: ``uuid``, ``webshopUrl``, ``png``, ``svg``
+		(the images are base64 data URIs). A plain camera scan opens the URL
+		unchanged; a TWINT-app scan opens it with ``qr_code_session_id`` plus
+		``returnAppScheme`` (iOS) or ``returnAppPackage`` (Android) appended.
+		The landing page must forward those into checkout creation via the
+		``qr_code_session_id`` / ``return_app`` kwargs of ``get_payment_url``.
+
+		Runs as the owning row's automation user like every other
+		settings-controller provider operation. Not whitelisted — callers own
+		permission checks.
+		"""
+		webshop_url = _validate_webshop_url(webshop_url)
+		with as_automation_user(self):
+			client = self._client()
+			try:
+				qr_code = client.create_qr_code(webshop_url)
+			except Exception:
+				frappe.log_error(title="Payrexx create_static_qr", message=frappe.get_traceback())
+				frappe.throw(_("Could not create Payrexx QR code"))
+			if not isinstance(qr_code, dict) or not qr_code.get("uuid"):
+				frappe.throw(_("Payrexx returned incomplete QR code metadata"))
+			return qr_code
+
+	def delete_static_qr(self, qr_code_uuid: str) -> None:
+		"""Delete a static QR code on Payrexx.
+
+		A provider-side 404 counts as deleted so a code removed in the Payrexx
+		dashboard cannot wedge local cleanup. Runs as the owning row's automation
+		user. Not whitelisted — callers own permission checks.
+		"""
+		qr_code_uuid = _validate_qr_code_uuid(qr_code_uuid)
+		with as_automation_user(self):
+			client = self._client()
+			try:
+				client.delete_qr_code(qr_code_uuid)
+			except Exception as exc:
+				if get_http_status(exc) == 404:
+					return
+				frappe.log_error(title="Payrexx delete_static_qr", message=frappe.get_traceback())
+				frappe.throw(_("Could not delete Payrexx QR code"))
 
 	# ------------------------------------------------------------------ helpers
 
@@ -268,6 +324,16 @@ class PayrexxSettings(Document):
 			for i, pid in enumerate(p.strip() for p in self.psp.split(",") if p.strip()):
 				payload[f"psp[{i}]"] = int(pid)
 
+		# Static-QR TWINT handoff: both values arrive as guest-controlled query
+		# parameters appended by the TWINT app, so invalid values are dropped
+		# silently — the checkout still works as a plain hosted page.
+		qr_code_session_id = _sanitize_qr_session_value(kwargs.get("qr_code_session_id"))
+		if qr_code_session_id:
+			payload["qrCodeSessionId"] = qr_code_session_id
+			return_app = _sanitize_qr_session_value(kwargs.get("return_app"))
+			if return_app:
+				payload["returnApp"] = return_app
+
 		return payload
 
 	def _return_url(self, kwargs: dict, kind: str, integration_request_name: str | None = None) -> str:
@@ -354,6 +420,45 @@ def _validate_created_gateway(gateway: dict) -> dict:
 	if not isinstance(gateway, dict) or any(not gateway.get(field) for field in ("id", "hash", "link")):
 		raise ValueError("Payrexx returned incomplete Gateway metadata")
 	return gateway
+
+
+def _sanitize_qr_session_value(value) -> str | None:
+	"""Return a provider-safe QR session value, or None to drop it.
+
+	``qr_code_session_id`` and the return-app value originate from the query
+	string of a guest request (the TWINT app appends them to the scanned URL).
+	They must never fail a checkout — without them the payment simply proceeds
+	as a plain hosted checkout.
+	"""
+	value = cstr(value).strip()
+	if not value or not _QR_SESSION_VALUE_PATTERN.fullmatch(value):
+		return None
+	return value
+
+
+def _validate_webshop_url(value) -> str:
+	url = cstr(value).strip()
+	if len(url) > _MAX_WEBSHOP_URL_LENGTH:
+		frappe.throw(_("Invalid QR code target URL"))
+	try:
+		parts = urlsplit(url)
+	except ValueError:
+		frappe.throw(_("Invalid QR code target URL"))
+	if (
+		parts.scheme not in ("http", "https")
+		or not parts.netloc
+		or parts.username is not None
+		or parts.password is not None
+	):
+		frappe.throw(_("Invalid QR code target URL"))
+	return url
+
+
+def _validate_qr_code_uuid(value) -> str:
+	qr_code_uuid = cstr(value).strip()
+	if not _QR_CODE_UUID_PATTERN.fullmatch(qr_code_uuid):
+		frappe.throw(_("Invalid Payrexx QR code UUID"))
+	return qr_code_uuid
 
 
 def _register_gateway_orphan_recovery(integration_request, gateway: dict, *, settings_name: str) -> None:
