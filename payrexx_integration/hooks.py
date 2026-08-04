@@ -15,9 +15,6 @@ required_apps = ["payments"]
 # With no provider registered, only Sales Invoice-backed Payment Requests are supported.
 payrexx_settlement_source_providers = []
 
-# Jinja
-# ----------
-
 jinja = {
 	"methods": [
 		"payrexx_integration.api.payrexx_pay_url",

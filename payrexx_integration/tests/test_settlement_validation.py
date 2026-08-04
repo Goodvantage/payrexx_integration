@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import frappe
@@ -194,7 +195,7 @@ class TestSettlementValidation(UnitTestCase):
 				"invoices": [],
 			}
 		)
-		settings = frappe._dict(_client=lambda: client)
+		settings = frappe._dict(name="Live", _client=lambda: client)
 		with (
 			patch(
 				"payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings.frappe.db.exists",
@@ -207,6 +208,16 @@ class TestSettlementValidation(UnitTestCase):
 			patch(
 				"payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings._resolve_settings",
 				return_value=settings,
+			),
+			patch(
+				"payrexx_integration.payrexx_integration.doctype.payrexx_settings."
+				"payrexx_settings._multiple_gateways_configured",
+				return_value=False,
+			),
+			patch(
+				"payrexx_integration.payrexx_integration.doctype.payrexx_settings."
+				"payrexx_settings._payment_authorization_user",
+				return_value=nullcontext(),
 			),
 			patch(
 				"payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings._complete_integration_request"

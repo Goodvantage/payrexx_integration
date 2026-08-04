@@ -10,10 +10,10 @@
   "gateway_name",
   "instance_name",
   "api_base_domain",
-  "api_version",
   "column_break_creds",
   "api_secret",
   "webhook_signing_key",
+  "automation_user",
   "behavior_section",
   "supported_currencies",
   "psp",
@@ -56,13 +56,6 @@
    "reqd": 1
   },
   {
-   "default": "v1.14",
-   "fieldname": "api_version",
-   "fieldtype": "Data",
-   "label": "API Version",
-   "reqd": 1
-  },
-  {
    "fieldname": "column_break_creds",
    "fieldtype": "Column Break"
   },
@@ -78,6 +71,14 @@
    "fieldname": "webhook_signing_key",
    "fieldtype": "Password",
    "label": "Webhook Signing Key",
+   "reqd": 1
+  },
+  {
+   "description": "Enabled System User used for checkout, settlement, and accounting-review side effects owned by this gateway.",
+   "fieldname": "automation_user",
+   "fieldtype": "Link",
+   "label": "Automation User",
+   "options": "User",
    "reqd": 1
   },
   {

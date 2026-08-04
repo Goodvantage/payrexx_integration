@@ -18,11 +18,28 @@ from payrexx_integration.payrexx_integration.payrexx.payrexx_client import (
 )
 
 GATEWAY_NAME = "StaticQRGW"
+AUTOMATION_USER = "Administrator"
 
 
-def _ensure_settings() -> str:
+def _ensure_settings(automation_user: str = AUTOMATION_USER) -> str:
+	"""Create the QR test gateway row (if missing) and return its name.
+
+	``automation_user`` is mandatory since 16.1.9 — every settings-controller
+	provider path runs inside ``as_automation_user``, so the fixture must name
+	an enabled System User or checkout and QR creation fail closed.
+	"""
 	if frappe.db.exists("Payrexx Settings", {"gateway_name": GATEWAY_NAME}):
-		return frappe.db.get_value("Payrexx Settings", {"gateway_name": GATEWAY_NAME}, "name")
+		settings_name = frappe.db.get_value("Payrexx Settings", {"gateway_name": GATEWAY_NAME}, "name")
+		if not frappe.db.get_value("Payrexx Settings", settings_name, "automation_user"):
+			frappe.db.set_value(
+				"Payrexx Settings",
+				settings_name,
+				"automation_user",
+				automation_user,
+				update_modified=False,
+			)
+			frappe.clear_document_cache("Payrexx Settings", settings_name)
+		return settings_name
 	return (
 		frappe.get_doc(
 			{
@@ -32,7 +49,7 @@ def _ensure_settings() -> str:
 				"api_base_domain": "payrexx.com",
 				"api_secret": "sk_test_dummy",
 				"webhook_signing_key": "whk_test_dummy",
-				"api_version": "v1.14",
+				"automation_user": automation_user,
 				"supported_currencies": "CHF,EUR",
 			}
 		)
@@ -172,6 +189,39 @@ class TestStaticQrSettings(IntegrationTestCase):
 
 		self.assertEqual(qr_code["uuid"], "08cc4152-993a-434b-937d-933359148ee8")
 		client.create_qr_code.assert_called_once_with("https://ngo.example.test/donate-campaign/x")
+
+	def test_static_qr_provider_calls_run_as_the_owning_automation_user(self):
+		"""QR creation is a settings-controller provider path — same user contract."""
+		user_name = f"payrexx-qr-{frappe.generate_hash(length=10)}@example.test"
+		user = frappe.get_doc(
+			{
+				"doctype": "User",
+				"email": user_name,
+				"first_name": "Payrexx QR",
+				"enabled": 1,
+				"user_type": "System User",
+				"send_welcome_email": 0,
+			}
+		)
+		user.append("roles", {"role": "System Manager"})
+		user.insert(ignore_permissions=True)
+
+		# The in-memory row is enough: as_automation_user reads the Document it is
+		# handed, so the shared fixture row is left untouched.
+		settings = self._settings()
+		settings.automation_user = user_name
+		previous_user = frappe.session.user
+
+		observed = []
+		client = Mock()
+		client.create_qr_code.side_effect = lambda _url: (
+			observed.append(frappe.session.user) or {"uuid": "08cc4152-993a-434b-937d-933359148ee8"}
+		)
+		with patch.object(type(settings), "_client", return_value=client):
+			settings.create_static_qr("https://ngo.example.test/donate-campaign/x")
+
+		self.assertEqual(observed, [user_name])
+		self.assertEqual(frappe.session.user, previous_user)
 
 	def test_create_static_qr_rejects_invalid_url_before_provider_contact(self):
 		settings = self._settings()

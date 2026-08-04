@@ -6,9 +6,10 @@ Payrexx Integration adds Payrexx hosted checkout support as a standalone app on 
 
 1. Open **Payrexx Settings**.
 2. Set **Gateway Name**, **Instance Name**, **API Base Domain**, **API Version**, and **API Secret**. There is no separate Environment field; use distinct Gateway Names such as `Sandbox` and `Live`.
-3. Review **Supported Currencies**, the optional **PSP Whitelist**, **Gateway Validity**, and redirect overrides.
-4. As soon as **Gateway Name** is filled, copy the callback URL shown on the unsaved form and create that webhook in Payrexx.
-5. Paste Payrexx's per-webhook key into the required **Webhook Signing Key** field, then save.
+3. Select an **Automation User** that is an enabled System User with only the ERPNext permissions needed to create/settle Payment Requests and receive accounting-review ToDos. Configure this independently for every gateway row.
+4. Review **Supported Currencies**, the optional **PSP Whitelist**, **Gateway Validity**, and redirect overrides.
+5. As soon as **Gateway Name** is filled, copy the callback URL shown on the unsaved form and create that webhook in Payrexx.
+6. Paste Payrexx's per-webhook key into the required **Webhook Signing Key** field, then save.
 
 The form shows one callback URL as soon as `gateway_name` is filled, even before
 the row can be saved. The URL uses the site's configured public `host_name` when
@@ -18,6 +19,13 @@ lines. Use that URL to create the Payrexx webhook, then paste the generated
 signing key back into **Webhook Signing Key**.
 
 On save, the controller verifies credentials unless running in tests/install and creates the corresponding `Payment Gateway` row named `Payrexx-<Gateway Name>`. Saving does not create the ERPNext Payment Gateway Account required for invoice payments.
+Checkout, settlement, chargeback, and accounting-review ToDo work fails closed
+if that row's Automation User is missing, disabled, or a Website User. The app
+does not fall back to Administrator or `Non Profit Settings`.
+During upgrade, the migration copies a valid enabled System User from legacy
+`Non Profit Settings.creation_user` into empty existing rows. It does not copy
+an invalid value or invent Administrator; configure any row that remains empty
+before resuming payment processing.
 
 For normal Payrexx accounts, keep `api_base_domain` as `payrexx.com`. For
 Payrexx Platform / partner accounts, split the login domain into instance and
@@ -45,10 +53,11 @@ allowlist contains the final host the client contacts
 (`api.pay.goodvantage.ch`). IP addresses and URL-like values such as
 `https://...`, credentials, paths, queries, and fragments are never accepted.
 
-If that custom API domain rejects an otherwise valid instance key, the client
-automatically retries on `api.payrexx.com`. This is useful when the checkout
-uses a partner/custom domain but Payrexx still authenticates API calls on the
-default API host.
+If that custom API domain rejects an otherwise valid instance key with 401/403,
+the client retries on `api.payrexx.com`. A 404 retries only for the credential
+probe or Gateway creation, where the custom API host may not be provisioned. A
+404 for a specific existing-checkout Gateway lookup does not fall back; verify
+the configured API domain and Gateway in Payrexx instead.
 
 ## 2. Create The Payment Gateway Account
 
@@ -145,8 +154,15 @@ Payrexx webhooks should still be configured. Unless an explicit success redirect
 override is set, every generated Gateway returns through:
 
 ```text
-GET https://<site>/api/method/payrexx_integration.api.payment_success?ir=<Integration Request>&gateway_name=<Payrexx Settings name>
+GET https://<site>/api/method/payrexx_integration.api.payment_success?ir=<Integration Request>&gateway_name=<Payrexx Settings name>&token=<hmac>
 ```
+
+New checkout return URLs are signed for the exact Integration Request, gateway,
+and `payment_success` purpose. Do not strip or edit any parameter. Only
+Integration Requests created before the success-token marker was introduced can
+use their already-issued unsigned legacy URL. The marker key must be absent for
+legacy compatibility; a present blank, zero, malformed, or unknown version is a
+configuration/data error and fails closed.
 
 That endpoint retrieves the Payrexx Gateway server-side and only marks the
 Integration Request complete when its invoices contain an actual confirmed
@@ -158,12 +174,16 @@ requests Frappe's end-of-request commit before redirecting; waiting results do
 not. A success page with unchanged accounting records indicates an outdated
 deployment that still rolled back the GET transaction.
 If Payrexx already reports the transaction as confirmed but the original webhook
-cannot be retried, open this normal fallback for the existing Integration
-Request instead of paying again:
+cannot be retried, use the exact signed success-return URL stored on that Payrexx
+Gateway instead of paying again:
 
 ```text
-https://<site>/api/method/payrexx_integration.api.payment_success?ir=<Integration-Request>&gateway_name=<Payrexx-Settings-name>
+https://<site>/api/method/payrexx_integration.api.payment_success?ir=<Integration-Request>&gateway_name=<Payrexx-Settings-name>&token=<original-token>
 ```
+
+Do not reconstruct a new marked request's URL without its original token. An
+unsigned manually built URL remains valid only for an unmarked legacy
+Integration Request.
 
 This is not a second payment. It retrieves the existing Gateway server-side and
 settles only after provider confirmation. Reopening the payment URL or creating
@@ -200,10 +220,11 @@ If saving Payrexx Settings fails:
 
 1. Confirm the instance name matches the first subdomain of the checkout/login domain.
 2. Confirm the API base domain is correct (`payrexx.com` for normal accounts, e.g. `pay.goodvantage.ch` for GoodVantage partner accounts).
-3. For a custom domain, confirm its exact final host is present in the `payrexx_allowed_api_hosts` JSON list, e.g. `api.pay.goodvantage.ch`. A 401/403/404 from an allowed custom API domain is retried once on `api.payrexx.com`.
-4. Confirm the API secret is current.
-5. Confirm outbound network access from the bench.
-6. Try saving in Sandbox first.
+3. For a custom domain, confirm its exact final host is present in the `payrexx_allowed_api_hosts` JSON list, e.g. `api.pay.goodvantage.ch`. A 401/403 retries once on `api.payrexx.com`; a 404 retries only for credential probing and Gateway creation, not a concrete Gateway retrieval.
+4. Confirm the Automation User is present, enabled, and a System User.
+5. Confirm the API secret is current.
+6. Confirm outbound network access from the bench.
+7. Try saving in Sandbox first.
 
 The app pings `GET /Gateway/0/`; a Payrexx JSON response with `status: error` can still mean credentials are accepted if the error is "gateway not found".
 
@@ -436,6 +457,11 @@ A plain phone-camera scan always works and opens the landing page directly.
 Deleting a QR code in the Payrexx dashboard does not break local cleanup —
 the app treats a provider 404 as already deleted.
 
+Like checkout creation, both calls run as the settings row's **Automation
+User**, so that field must name an enabled System User (§2) or QR creation and
+deletion fail with "Payrexx Settings … requires an Automation User." before
+Payrexx is contacted.
+
 ## 12. Run Tests
 
 ```bash
@@ -464,4 +490,4 @@ npm install
 npx playwright test
 ```
 
-The core Playwright specs cover Payrexx Settings and pay-by-email endpoint errors. The optional `booking_email.spec.ts` uses `TEST_BOOKING_NAME` for an existing eligible Good Event Booking; Payrexx Integration no longer seeds cross-app event records.
+The core Playwright specs cover Payrexx Settings and pay-by-email endpoint errors. CI seeds only a dummy non-live `Sandbox` Payrexx Settings/Payment Gateway pair, starts and waits for the test site, and runs those core specs with failure artifacts. The optional `booking_email.spec.ts` uses `TEST_BOOKING_NAME` for an existing eligible Good Event Booking; CI does not install or seed Good Event merely for that optional check.

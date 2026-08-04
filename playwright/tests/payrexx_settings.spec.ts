@@ -18,7 +18,7 @@ test.describe("Payrexx Settings — installed gateway", () => {
 		).not.toBeNull();
 
 		// 1. Form renders with the correct values
-		await gotoDesk(page, `/app/payrexx-settings/${SETTINGS_NAME}`);
+		await gotoDesk(page, "Payrexx Settings", SETTINGS_NAME);
 		await expect(
 			page.locator('input[data-fieldname="gateway_name"]').first(),
 		).toHaveValue(SETTINGS_NAME, { timeout: 30_000 });

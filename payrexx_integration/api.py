@@ -26,6 +26,8 @@ from payrexx_integration.gateway_selection import resolve_payrexx_settings
 from payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings import (
 	CHECKOUT_PROVIDER_CONTACT_FLAG,
 	DEADLOCK_MAX_ATTEMPTS,
+	PAYREXX_SUCCESS_TOKEN_VERSION,
+	PAYREXX_SUCCESS_TOKEN_VERSION_KEY,
 	_canonical_gateway_amount,
 	_get_active_payrexx_payment_requests,
 	_provider_gateway_amount,
@@ -85,6 +87,20 @@ def _verify(invoice_name: str, token: str, gateway_name: str | None = None) -> b
 	return verify_reference(invoice_name, token)
 
 
+def sign_payment_success_reference(integration_request: str, gateway_name: str) -> str:
+	return sign_reference(f"{integration_request}|{gateway_name}|payment_success")
+
+
+def _verify_payment_success_reference(
+	integration_request: str | None,
+	gateway_name: str | None,
+	token: str | None,
+) -> bool:
+	if not (integration_request and gateway_name and token):
+		return False
+	return verify_reference(f"{integration_request}|{gateway_name}|payment_success", token)
+
+
 # ---------------------------------------------------------------- jinja helper
 
 
@@ -106,7 +122,7 @@ def payrexx_pay_url(sales_invoice: str | None, gateway_name: str | None = None) 
 	try:
 		settings_name = resolve_payrexx_settings(gateway_name).name
 	except Exception:
-		frappe.log_error(frappe.get_traceback(), "Payrexx pay URL unavailable")
+		frappe.log_error(title="Payrexx pay URL unavailable", message=frappe.get_traceback())
 		return ""
 	params = {
 		"si": sales_invoice,
@@ -114,6 +130,21 @@ def payrexx_pay_url(sales_invoice: str | None, gateway_name: str | None = None) 
 		"token": _sign(sales_invoice, settings_name),
 	}
 	return get_public_url("/api/method/payrexx_integration.api.pay_invoice?" + urlencode(params))
+
+
+def safe_pay_url(sales_invoice: str | None, gateway_name: str | None = None) -> str:
+	"""Never-raise variant of :func:`payrexx_pay_url` for email/print rendering.
+
+	Consumer apps embed pay links while composing invoice and dunning
+	output; a Payrexx misconfiguration must degrade to "no link", never
+	break the document. This wrapper owns that fallback contract in one
+	place instead of each app hand-rolling its own try/except.
+	"""
+	try:
+		return payrexx_pay_url(sales_invoice, gateway_name) or ""
+	except Exception:
+		frappe.log_error(title="Payrexx pay URL unavailable", message=frappe.get_traceback())
+		return ""
 
 
 # -------------------------------------------------------------- redirect entry
@@ -155,7 +186,7 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 	# log clean when a customer clicks the email link multiple times.
 	# Runs as the configured least-privilege automation user (same resolution
 	# as the webhook path), never as a hardcoded Administrator.
-	with as_automation_user():
+	with as_automation_user(settings_name):
 		checkout_url = _run_checkout_with_deadlock_retry(lambda: _get_invoice_checkout_url(si, settings_name))
 
 	# Email links must remain GET requests, but successful first-click setup writes
@@ -167,17 +198,43 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])  # nosemgrep: guest-whitelisted-method
-def payment_success(ir: str | None = None, gateway_name: str | None = None) -> None:
+def payment_success(
+	ir: str | None = None,
+	gateway_name: str | None = None,
+	token: str | None = None,
+) -> None:
 	"""Reconcile a Payrexx success redirect, then send the customer to the final return URL."""
-	if not ir or not frappe.db.exists("Integration Request", ir):
-		frappe.throw(_("Payment reference not found"), frappe.DoesNotExistError)
+	if token and not _verify_payment_success_reference(ir, gateway_name, token):
+		frappe.throw(_("Invalid payment return"), frappe.PermissionError)
+	if not ir:
+		frappe.throw(_("Invalid payment return"), frappe.PermissionError)
+
+	try:
+		integration_request = frappe.get_doc("Integration Request", ir)
+	except frappe.DoesNotExistError:
+		frappe.throw(_("Invalid payment return"), frappe.PermissionError)
+	if integration_request.integration_request_service != "Payrexx":
+		frappe.throw(_("Invalid payment return"), frappe.PermissionError)
+
+	ir_data = frappe.parse_json(integration_request.data) or {}
+	if PAYREXX_SUCCESS_TOKEN_VERSION_KEY in ir_data:
+		marker_version = ir_data[PAYREXX_SUCCESS_TOKEN_VERSION_KEY]
+		if (
+			not isinstance(marker_version, int)
+			or isinstance(marker_version, bool)
+			or marker_version != PAYREXX_SUCCESS_TOKEN_VERSION
+		):
+			frappe.throw(_("Invalid payment return"), frappe.PermissionError)
+		stored_gateway = ir_data.get("payrexx_settings")
+		if not token or not stored_gateway or stored_gateway != gateway_name:
+			frappe.throw(_("Invalid payment return"), frappe.PermissionError)
 
 	from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
 		payrexx_settings,
 	)
 
 	reconciled = payrexx_settings.reconcile_integration_request(ir, gateway_name=gateway_name)
-	integration_request = frappe.get_doc("Integration Request", ir)
+	integration_request.reload()
 	if reconciled or integration_request.status == "Failed":
 		# Provider returns use GET, so Frappe would otherwise roll back the
 		# server-verified settlement or terminal provider status after redirecting.
