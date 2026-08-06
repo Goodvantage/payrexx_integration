@@ -40,6 +40,19 @@ def safe_return_url(redirect_to: str, error_label: str = "Unsafe payment redirec
 	return expanded
 
 
+def is_allowed_public_origin(url: str) -> bool:
+	"""True when ``url`` is an absolute HTTP(S) URL on an origin this site publishes.
+
+	Public wrapper around the allowlist ``safe_return_url`` enforces, so every
+	caller that has to bind a different kind of externally supplied absolute URL
+	to this site — the permanent static QR target, for example — shares one
+	definition of "an origin an operator published" instead of re-implementing
+	origin normalization.
+	"""
+	origin = _normalized_http_origin(cstr(url).strip())
+	return origin is not None and origin in _allowed_public_origins()
+
+
 def _allowed_public_origins() -> set[tuple[str, str, int]]:
 	"""Normalized origins an operator explicitly published through site config.
 

@@ -473,7 +473,25 @@ Prerequisites for the TWINT-app scan path (in the Payrexx dashboard):
 
 A plain phone-camera scan always works and opens the landing page directly.
 Deleting a QR code in the Payrexx dashboard does not break local cleanup —
-the app treats a provider 404 as already deleted.
+the app treats a provider 404 as already deleted, and that tolerated outcome no
+longer writes an Error Log row.
+
+The landing URL must be on an origin this site publishes: the site's
+`host_name`, or an app-owned site-config key ending in `_public_base_url` (§6).
+QR codes are permanent and printed, so an unconfigured, stale, or mistyped
+origin fails with "Invalid QR code target URL" **before** Payrexx is contacted
+instead of minting a code that points nowhere. If a downstream app's generation
+fails with that message, check that its public base is set and matches the
+landing URL exactly — scheme, hostname, and port:
+
+```bash
+cd frappe-bench
+bench --site <site> get-config host_name
+bench --site <site> get-config good_npo_public_base_url
+```
+
+An HTTPS base does not authorize an HTTP landing URL (and vice versa), and a
+non-default port must appear in both.
 
 Like checkout creation, both calls run as the settings row's **Automation
 User**, so that field must name an enabled System User (§2) or QR creation and

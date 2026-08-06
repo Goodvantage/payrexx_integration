@@ -2,7 +2,7 @@
 
 import ipaddress
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import frappe
@@ -88,9 +88,15 @@ class PayrexxClient:
 		"""
 		return _unwrap(self._post("QrCode/", data={"webshopUrl": webshop_url}))
 
-	def delete_qr_code(self, qr_code_uuid: str) -> None:
-		"""DELETE /QrCode/{uuid}/"""
-		resp = self._delete(f"QrCode/{qr_code_uuid}/")
+	def delete_qr_code(self, qr_code_uuid: str, *, expected_statuses: Collection[int] = ()) -> None:
+		"""DELETE /QrCode/{uuid}/
+
+		``expected_statuses`` names provider HTTP statuses the caller already
+		handles as a normal outcome (``delete_static_qr`` treats 404 as "already
+		deleted"). They are still raised — only the Error Log row is skipped, so
+		a tolerated outcome does not surface to staff as a failure.
+		"""
+		resp = self._delete(f"QrCode/{qr_code_uuid}/", expected_statuses=expected_statuses)
 		if isinstance(resp, dict) and resp.get("status") not in (None, "success"):
 			raise PayrexxAPIError(resp.get("message", "Unknown Payrexx error"))
 
@@ -114,16 +120,26 @@ class PayrexxClient:
 				return _execute_request("POST", fallback_url, authorize=self._authorize, data=data)
 			raise
 
-	def _delete(self, path: str) -> dict:
+	def _delete(self, path: str, *, expected_statuses: Collection[int] = ()) -> dict:
 		try:
-			return _execute_request("DELETE", self._url(path), authorize=self._authorize)
+			return _execute_request(
+				"DELETE",
+				self._url(path),
+				authorize=self._authorize,
+				expected_statuses=expected_statuses,
+			)
 		except Exception as exc:
 			# A concrete resource DELETE 404 is authoritative (the code is already
 			# gone), so it must not fall back to the canonical host — only 401/403
 			# may retry there. Mirrors the concrete Gateway retrieval rule.
 			if self._should_retry_default_domain(exc, retry_not_found=False):
 				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
-				return _execute_request("DELETE", fallback_url, authorize=self._authorize)
+				return _execute_request(
+					"DELETE",
+					fallback_url,
+					authorize=self._authorize,
+					expected_statuses=expected_statuses,
+				)
 			raise
 
 	def _should_retry_default_domain(self, exc: Exception, *, retry_not_found: bool) -> bool:
@@ -169,6 +185,7 @@ def _execute_request(
 	*,
 	authorize: Callable[[requests.PreparedRequest], requests.PreparedRequest],
 	data: dict | None = None,
+	expected_statuses: Collection[int] = (),
 ) -> dict | list | str | None:
 	"""Send one authenticated Payrexx request without leaking credentials or payer data.
 
@@ -177,6 +194,10 @@ def _execute_request(
 	become frame variables of framework code and are written verbatim into the
 	Error Log traceback it produces on failure. Response handling and the error
 	reporting contract are otherwise identical to ``make_request``.
+
+	``expected_statuses`` lets a caller declare provider HTTP statuses it handles
+	as a normal outcome; those are re-raised without an Error Log row. It is empty
+	by default, so every existing call site keeps logging exactly as before.
 	"""
 	headers = {"Accept": "application/json"}
 	if data is not None:
@@ -198,11 +219,16 @@ def _execute_request(
 		response = frappe.flags.integration_request = session.send(prepared_request, **environment_settings)
 		response.raise_for_status()
 		return _parse_response(response)
-	except Exception:
-		if frappe.flags.integration_request_doc:
-			frappe.flags.integration_request_doc.log_error()
-		else:
-			frappe.log_error()
+	except Exception as exc:
+		# Statuses the caller declared expected are a normal, handled outcome, not
+		# staff-visible breakage: re-raise them so the caller still decides, but
+		# without an Error Log row. ``exc`` only ever repr's as its own message, so
+		# binding it keeps the secret-safety contract above intact.
+		if get_http_status(exc) not in expected_statuses:
+			if frappe.flags.integration_request_doc:
+				frappe.flags.integration_request_doc.log_error()
+			else:
+				frappe.log_error()
 		raise
 
 
