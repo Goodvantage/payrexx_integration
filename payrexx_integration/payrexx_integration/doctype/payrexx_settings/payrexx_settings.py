@@ -24,7 +24,7 @@ from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
 from payrexx_integration.session_utils import as_automation_user, payment_authorization_user_name
-from payrexx_integration.url_utils import get_public_url, safe_return_url
+from payrexx_integration.url_utils import get_public_url, is_allowed_public_origin, safe_return_url
 
 DEADLOCK_MAX_ATTEMPTS = 3
 ACTIVE_PAYREXX_PAYMENT_REQUEST_STATUSES = (
@@ -48,6 +48,10 @@ DECIMAL_CONVERSION_ERRORS = (InvalidOperation, TypeError, ValueError)
 _QR_SESSION_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _QR_CODE_UUID_PATTERN = re.compile(r"^[A-Za-z0-9-]{8,64}$")
 _MAX_WEBSHOP_URL_LENGTH = 1000
+# A QR code already removed on the provider side is a normal deletion outcome,
+# not an error: tolerated by this controller and declared to the client so it
+# writes no Error Log row either.
+QR_DELETE_TOLERATED_STATUSES = (404,)
 
 
 def _get_current_locked_doc(doctype: str, name: str) -> Document:
@@ -190,16 +194,18 @@ class PayrexxSettings(Document):
 		"""Delete a static QR code on Payrexx.
 
 		A provider-side 404 counts as deleted so a code removed in the Payrexx
-		dashboard cannot wedge local cleanup. Runs as the owning row's automation
-		user. Not whitelisted — callers own permission checks.
+		dashboard cannot wedge local cleanup. That tolerated outcome is declared to
+		the client as well, so a normal "already gone" deletion writes no Error Log
+		row for staff to triage. Runs as the owning row's automation user. Not
+		whitelisted — callers own permission checks.
 		"""
 		qr_code_uuid = _validate_qr_code_uuid(qr_code_uuid)
 		with as_automation_user(self):
 			client = self._client()
 			try:
-				client.delete_qr_code(qr_code_uuid)
+				client.delete_qr_code(qr_code_uuid, expected_statuses=QR_DELETE_TOLERATED_STATUSES)
 			except Exception as exc:
-				if get_http_status(exc) == 404:
+				if get_http_status(exc) in QR_DELETE_TOLERATED_STATUSES:
 					return
 				frappe.log_error(title="Payrexx delete_static_qr", message=frappe.get_traceback())
 				frappe.throw(_("Could not delete Payrexx QR code"))
@@ -450,6 +456,14 @@ def _validate_webshop_url(value) -> str:
 		or parts.username is not None
 		or parts.password is not None
 	):
+		frappe.throw(_("Invalid QR code target URL"))
+	# A static QR is permanent and printed, so a stale or mistyped public base in
+	# the calling app would mint codes pointing at a foreign origin forever. Bind
+	# the target to an origin this site actually publishes — ``host_name`` or an
+	# operator-configured ``*_public_base_url`` — which is the same allowlist
+	# ``safe_return_url`` enforces and exactly what upstream apps build their
+	# public URLs from.
+	if not is_allowed_public_origin(url):
 		frappe.throw(_("Invalid QR code target URL"))
 	return url
 

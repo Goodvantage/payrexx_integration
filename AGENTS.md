@@ -203,6 +203,17 @@ Gateway deletion, capture, later-charge, void/cancel, or refund operations. Thos
 provider actions and their ERPNext accounting reversals are manual operational
 workflows until an explicit, tested contract is implemented.
 
+Static-QR targets are origin-bound, not merely scheme-checked: `create_static_qr`
+requires the URL's normalized origin to be one the operator published here
+(`host_name` or a `*_public_base_url` key), reusing
+`url_utils.is_allowed_public_origin` — the same allowlist as `safe_return_url`.
+Upstream apps resolve their own public base (good_npo: `good_npo_public_base_url`
+→ `good_demo_public_base_url` → `host_name`), so a URL they build passes only
+while that base is configured on the site; a permanent printed code can never
+point at a stale origin. QR deletion declares its tolerated 404 to the client
+(`expected_statuses`), so an already-deleted code produces no Error Log row while
+every undeclared status still logs.
+
 Static-QR TWINT handoff: a TWINT-app scan appends `qr_code_session_id` and a
 return-app value to the scanned URL. Pass them into `get_payment_url` as
 `qr_code_session_id` / `return_app` — they are guest-controlled, sanitized, and
@@ -229,6 +240,9 @@ bench --site <site> run-tests \
 
 bench --site <site> run-tests \
   --module payrexx_integration.tests.test_url_utils
+
+bench --site <site> run-tests \
+  --module payrexx_integration.tests.test_static_qr
 
 # Playwright e2e (core specs plus an optional existing-booking email check)
 cd playwright

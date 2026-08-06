@@ -393,6 +393,25 @@ method is whitelisted — downstream callers (e.g. Good NPO campaign QR
 generation) own permission checks. The target URL must be an absolute
 http(s) URL without userinfo; the UUID must match the provider's shape.
 
+The target must also live on an origin this site publishes: the canonical
+`host_name` origin or an operator-configured `*_public_base_url` origin, the
+same allowlist `safe_return_url` uses, shared through
+`url_utils.is_allowed_public_origin`. A static QR is permanent and printed, and
+the calling app resolves its own public base (Good NPO reads
+`good_npo_public_base_url`, then `good_demo_public_base_url`, then
+`host_name`), so a stale or mistyped value would otherwise mint permanent codes
+pointing at a foreign origin without either layer noticing. A campaign URL
+built from a configured `good_npo_public_base_url` passes; an unconfigured
+origin, an HTTP downgrade, or a different effective port fails closed before
+Payrexx is contacted with "Invalid QR code target URL".
+
+Because the controller treats a deletion 404 as "already deleted", it declares
+that status to the client as expected (`delete_qr_code(...,
+expected_statuses=(404,))`). The client re-raises it as before but writes no
+Error Log row, so a normal cleanup of an already-removed code produces no
+staff-visible error. The declaration is per call: every other request, and
+every undeclared status, is logged exactly as before.
+
 Like every other settings-controller provider path, both methods run inside
 `as_automation_user(self)`: a settings row without a valid, enabled System
 User as its Automation User fails closed before Payrexx is contacted, and the
@@ -450,6 +469,7 @@ Failed and preserves the first chargeback evidence.
 - Webhook signing key and API secret are separate values.
 - API secrets are read and sent only after strict final-host validation; custom API hosts require an exact `payrexx_allowed_api_hosts` site-config entry.
 - The API secret never becomes a frame variable, argument, or object attribute on the request path. It is attached through a `requests` auth callable holding it in its closure, and requests are sent as session-prepared requests instead of through `frappe.integrations.utils.make_*_request`. Frappe logs the frame variables of a failing outbound request to Error Log (and Sentry when telemetry is on) and its sanitizer does not match an `x-api-key` header key, so any secret reachable from those frames would be stored in plaintext. The same request frame drops its reference to the POST payer payload before the network call.
+- Static QR targets are bound to the same published-origin allowlist as payment return URLs, so a permanent printed code can never point at an unconfigured origin.
 - Checkout reuse requires current locked receivable state plus exact persisted provider metadata; a stored URL alone is never trusted.
 - A new Gateway is rejected while any other submitted active Payrexx Payment Request exists for the invoice; terminal and cancelled history is preserved.
 - Webhook diagnostics avoid logging full payer/payment payloads.
@@ -524,6 +544,9 @@ bench --site development16.localhost run-tests \
 
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_url_utils
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_static_qr
 ```
 
 ```bash
