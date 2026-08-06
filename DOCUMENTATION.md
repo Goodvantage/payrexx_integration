@@ -178,6 +178,18 @@ avoids leaking a local bench `webserver_port` such as `:8000`, or a temporary
 tunnel origin, into Payrexx checkout links and webhook instructions when the
 site is exposed through a reverse proxy or ngrok URL.
 
+Caller-supplied absolute return URLs are accepted only when their origin is the
+canonical `host_name` origin or an operator-configured `*_public_base_url`
+origin (`safe_return_url` in `url_utils.py`). Apps such as `good_npo` that
+serve the site under an additional public URL (for example a Tailscale tunnel
+on a development bench) advertise it through their own `<app>_public_base_url`
+site-config key. Origins are normalized as scheme, canonical hostname, and
+effective port (`https` = 443, `http` = 80). HTTPS configuration never trusts
+the corresponding HTTP origin; userinfo, malformed ports/origins, and
+scheme-relative values are rejected. Site config is operator-owned, so the
+allowlist expands only through an explicit deployment setting, never guest
+input.
+
 Webhook endpoint:
 
 ```text
@@ -509,6 +521,9 @@ bench --site development16.localhost run-tests \
 
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_hosted_qa
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_url_utils
 ```
 
 ```bash

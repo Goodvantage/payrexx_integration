@@ -214,6 +214,24 @@ webhook was configured with an offline tunnel URL. Update the webhook in the
 Payrexx dashboard to the current public `host_name` URL from **Payrexx
 Settings**.
 
+Downstream apps may deliberately expose the same site through an additional
+public origin and store it in an app-owned site-config key ending in
+`_public_base_url`. For example:
+
+```bash
+cd frappe-bench
+bench --site <site> set-config good_npo_public_base_url "https://donate.example.ch"
+bench --site <site> clear-cache
+```
+
+Every such key authorizes caller-supplied payment return URLs for that exact
+normalized origin: scheme, hostname, and effective port must match. An HTTPS
+value does not authorize HTTP, and a non-default port must be present in both
+the configuration and return URL. Values with credentials/userinfo, malformed
+ports, missing HTTP(S) schemes, or scheme-relative forms are ignored and cannot
+authorize a return. Use plain HTTP only for an intentional local-development
+origin. Restart long-lived web and worker processes after changing site config.
+
 ## 7. Troubleshoot A Failed Save
 
 If saving Payrexx Settings fails:
@@ -480,6 +498,9 @@ bench --site development16.localhost run-tests \
 
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_hosted_qa
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_url_utils
 ```
 
 Browser tests live in the Playwright project:

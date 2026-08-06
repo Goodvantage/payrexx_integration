@@ -23,15 +23,74 @@ def get_public_url(path: str = "") -> str:
 
 def safe_return_url(redirect_to: str, error_label: str = "Unsafe payment redirect URL") -> str:
 	target = cstr(redirect_to).strip()
-	parts = urlsplit(target)
+	try:
+		parts = urlsplit(target)
+	except ValueError:
+		frappe.throw(_(error_label), frappe.PermissionError)
+	if len(target) >= 2 and target[0] in "/\\" and target[1] in "/\\":
+		frappe.throw(_(error_label), frappe.PermissionError)
 	if parts.scheme or parts.netloc:
-		public_parts = urlsplit(get_public_url(""))
-		if parts.scheme in {"http", "https"} and parts.netloc == public_parts.netloc:
+		origin = _normalized_http_origin(target)
+		if origin and origin in _allowed_public_origins():
 			return target
 		frappe.throw(_(error_label), frappe.PermissionError)
-	return get_public_url(target)
+	expanded = get_public_url(target)
+	if _normalized_http_origin(expanded) not in _allowed_public_origins():
+		frappe.throw(_(error_label), frappe.PermissionError)
+	return expanded
+
+
+def _allowed_public_origins() -> set[tuple[str, str, int]]:
+	"""Normalized origins an operator explicitly published through site config.
+
+	The canonical public origin comes from ``host_name`` (or the request URL
+	fallback). Apps that expose the same site under an additional public URL —
+	a tunnel or a second domain — advertise it through ``*_public_base_url``
+	keys. Site config is operator-owned, never guest input, so trusting every
+	configured public base keeps the guest-input protection intact while
+	letting upstream apps hand over URLs built from their own public base.
+	"""
+	origins = set()
+	canonical = _normalized_http_origin(get_public_url(""))
+	if canonical:
+		origins.add(canonical)
+	for key, value in frappe.conf.items():
+		if not cstr(key).endswith("_public_base_url"):
+			continue
+		origin = _normalized_http_origin(cstr(value).strip().rstrip("/"))
+		if origin:
+			origins.add(origin)
+	return origins
+
+
+def _normalized_http_origin(url: str) -> tuple[str, str, int] | None:
+	if not url or any(
+		character.isspace() or ord(character) < 32 or ord(character) == 127 for character in url
+	):
+		return None
+	try:
+		parts = urlsplit(url)
+	except ValueError:
+		return None
+	if parts.scheme not in {"http", "https"} or not parts.netloc:
+		return None
+	if parts.username is not None or parts.password is not None:
+		return None
+	if "\\" in parts.netloc or parts.netloc.endswith(":"):
+		return None
+	try:
+		hostname = parts.hostname
+		port = parts.port
+	except ValueError:
+		return None
+	if not hostname or "%" in hostname or port == 0:
+		return None
+	try:
+		hostname = hostname.encode("idna").decode("ascii").lower()
+	except UnicodeError:
+		return None
+	return parts.scheme, hostname, port if port is not None else (443 if parts.scheme == "https" else 80)
 
 
 def _has_absolute_host(host_name: str) -> bool:
-	parts = urlsplit(host_name)
-	return bool(parts.scheme and parts.netloc)
+	return _normalized_http_origin(host_name) is not None

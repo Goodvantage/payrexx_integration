@@ -128,6 +128,12 @@ hard-coded.** In production, set `host_name` on the site (`bench --site <site>
 set-config host_name "https://kursverwaltung.example.ch"`) and the embedded
 URLs resolve correctly.
 
+Caller-supplied absolute return URLs may also use an operator-configured
+`*_public_base_url` origin. `safe_return_url()` compares normalized complete
+HTTP(S) origins (scheme, canonical hostname, and effective port); userinfo,
+malformed origins, scheme-relative forms, and HTTPS-to-HTTP downgrades fail
+closed.
+
 ---
 
 ## Payrexx API quick reference
@@ -220,6 +226,9 @@ bench --site <site> run-tests \
 
 bench --site <site> run-tests \
   --module payrexx_integration.tests.test_hosted_qa
+
+bench --site <site> run-tests \
+  --module payrexx_integration.tests.test_url_utils
 
 # Playwright e2e (core specs plus an optional existing-booking email check)
 cd playwright
