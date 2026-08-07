@@ -22,13 +22,16 @@ The app metadata exposes `/assets/payrexx_integration/images/payrexx-integration
 | DocType | Purpose |
 |---|---|
 | `Payrexx Settings` | Per-environment Payrexx credentials, gateway settings, and required automation-user ownership. |
+| `Payrexx Subscription Event` | Durable non-PII claim for one recurring installment, keyed deterministically by gateway and provider transaction identity. Service-written; System Manager and Accounts Manager can inspect it. |
 | `Payment Gateway` | Upstream registry row `Payrexx-<gateway_name>`, created by the settings controller. |
 | `Payment Gateway Account` | Upstream ERPNext company/currency/payment-account bridge. Operators must create it after the gateway; it is not seeded by this app. |
 | `Integration Request` | Upstream provider-request audit and state record. |
 
 Saving Payrexx Settings creates/updates the matching `Payment Gateway` row through the standard payments utility.
 Normal Payrexx accounts use `api_base_domain = "payrexx.com"`, producing API
-calls to `https://api.payrexx.com/...`. Payrexx Platform / partner accounts
+calls to `https://api.payrexx.com/v1.16/...`. The API version is deliberately
+pinned in code as `DEFAULT_API_VERSION`; there is no per-row `api_version`
+field. Payrexx Platform / partner accounts
 store only the first subdomain in `instance_name` and the remaining platform
 domain in `api_base_domain`; for example, `customer.pay.goodvantage.ch`
 uses `instance_name = "customer"` and
@@ -48,6 +51,17 @@ or Gateway collection/create operation, where it can mean the custom API host
 is not provisioned. A 404 retrieving a concrete Gateway is authoritative and
 never falls back, preventing a missing custom-domain resource from being read
 from another API domain.
+
+Payrexx enforces 600 requests per 5 minutes at the CDN edge. It answers `405`
+first and `403` once the limit is well exceeded, so neither status reads like a
+rate limit. Idempotent requests (GET, PUT, DELETE) retry with bounded exponential
+backoff on `405`/`429` and tolerate those statuses on intermediate attempts, so a
+call that recovers does not leave one Error Log row per attempt while a
+persistent limit still surfaces on the final attempt. `403` keeps its existing
+meaning (rejected API secret, and the custom-domain fallback trigger) and is not
+treated as a rate limit. A POST is never replayed: an edge rejection cannot be
+distinguished with certainty from a Gateway that was in fact created.
+The API version is pinned once as `DEFAULT_API_VERSION` (currently `v1.16`).
 
 ## Important Modules
 
@@ -205,6 +219,15 @@ signing key can therefore stay blank until the webhook has been created in
 Payrexx.
 Payrexx sends JSON webhooks, so the callback reads `gateway_name` directly from
 the request query string before resolving the signing key.
+The signature is HMAC-SHA256 over the raw body. Payrexx documents lowercase
+hexadecimal; the verifier decodes it and compares the digest bytes. Base64 is
+retained only as a compatibility form for previously observed/account-configured
+deliveries.
+The webhook's content type must be JSON in the Payrexx merchant account. The
+alternative "Normal (PHP-Post)" form encoding is authentic but not JSON; a
+delivery carrying a non-JSON content type is rejected — after the signature
+is verified — with an error naming the setting that produced it, rather than
+surfacing as a parse failure against a correctly signed request.
 After signature verification, payment side effects resolve the owning
 `Payrexx Settings.automation_user`. The configured user must exist, be enabled,
 and be a System User when the operation runs. Checkout uses the explicitly
@@ -289,11 +312,12 @@ snapshots explicitly and verify that a concurrent completion, Payment Entry,
 chargeback, settlement conflict, or competing manual checkout remains
 authoritative.
 Once an Integration Request is Completed, delayed or replayed webhook statuses
-such as `authorized`, `reserved`, `waiting`, provider failures, or `refunded`
-are ignored and cannot replace its confirmed transaction evidence. A verified
-`chargeback` is the only webhook status allowed to move a Completed request to
-Failed so the accounting-exception workflow still runs. Callback mapping is
-serialized on the Integration Request row. Once chargeback evidence exists,
+such as `authorized`, `reserved`, `waiting`, and provider failures are ignored
+and cannot replace its confirmed transaction evidence. Post-settlement refund
+and dispute statuses append reversal evidence while preserving Completed; a
+verified `chargeback` is the only webhook status allowed to move a Completed
+request to Failed. Callback mapping is serialized on the Integration Request
+row. Once chargeback evidence exists,
 all later non-chargeback statuses, including `confirmed`, are ignored and the
 Failed status, chargeback error, and first chargeback transaction remain
 unchanged. Duplicate chargebacks only repair/reuse the same review ToDo.
@@ -438,27 +462,157 @@ is never sent without a session id.
 
 ## Supported Payment Operations
 
-The payment client surface is exactly `create_gateway`, `retrieve_gateway`, and
-`ping_gateway`, plus the non-payment static QR helpers `create_qr_code` /
-`delete_qr_code` documented above: it creates hosted Gateways and retrieves
-Gateway state for Sales-Invoice-backed Payment Requests and explicitly owned
-extension sources.
-There is no Gateway deletion or standalone transaction lookup.
+The payment client surface is `create_gateway`, `retrieve_gateway`, and
+`ping_gateway`; the Subscription set `create_subscription`,
+`retrieve_subscription`, `list_subscriptions`, `update_subscription` and
+`cancel_subscription`; paged, time-bounded `list_transactions`; plus the
+non-payment static QR helpers `create_qr_code` / `delete_qr_code` documented
+above. There is no Gateway deletion.
+
+`create_subscription` is rarely usable: Payrexx requires a `userId` that only
+exists once the payer has transacted, so subscriptions are normally created by
+sending the payer through a Gateway built with `subscriptionState`.
+`list_subscriptions` sends `offset` and `limit` as query parameters, matching
+the official PHP SDK's GET transport. `list_transactions` uses the same query
+transport with the SDK's UTC greater-than/less-than, own-transactions, order,
+offset, and limit controls. Neither sends a GET JSON body.
+`update_subscription` changes the amount from the **next** interval, not the
+charge already taken. `cancel_subscription` is immediate and is the only
+cancellation the API offers — end-of-period notice exists solely in the
+merchant admin. A declared provider 404 is idempotent cancellation success; a
+HTTP-200 error envelope is still an error and never changes local schedule state.
 Webhook and success-return reconciliation settle only actual `confirmed`
 transactions; Gateway status alone cannot settle.
+A confirmed transaction Payrexx marks as simulated (`mode` other than `LIVE`, or
+`invoice.test` set when `mode` is absent) is refused with the terminal
+`test_transaction` settlement conflict unless the owning Payrexx Settings row
+enables **Allow TEST Transactions**. A test payment carries a valid signature and
+matches every amount, currency, and company check, so mode is the only evidence
+that separates it from real money. Enable the flag on sandbox gateways only;
+hosted sandbox acceptance requires it and `preflight` refuses to run without it.
+Browser-return reconciliation copies the parent Gateway invoice's reference,
+currency, and TEST marker into the selected transaction before applying this
+same gate; a transaction that omits its own `mode` cannot lose the parent marker.
 `authorized` and `reserved` callbacks record the Integration Request as
 `Authorized`, but this app has no later-charge or capture operation.
 `cancelled`, `declined`, `error`, and `expired` callbacks mark the request
 failed; they do not call Payrexx to cancel or void anything. `chargeback` has
-the accounting-exception workflow above. Refund initiation and ERPNext refund
-reconciliation are not implemented: a `refunded` or otherwise unknown webhook
-is stored while the Integration Request status remains unchanged. Provider-side
-refund/capture/cancellation and the corresponding accounting reversal therefore
-remain explicit manual procedures.
+the accounting-exception workflow above.
+
+Refunds are issued in the Payrexx dashboard; this app never initiates one and
+never posts the reversal. What it does is make the refund visible. A
+`refunded`, `partially-refunded`, `refund_pending`, or `disputed` webhook is
+appended to the Integration Request's `payrexx_reversals` list with its amount,
+currency, and originating transaction. It does not replace `payrexx_transaction`
+— that stays the record of what was collected — and it does not change the
+request status, because a refunded payment did settle and rewriting that to
+Failed would misstate the history reconciliation reads.
+
+Entries are keyed on the reversal transaction's own uuid/id, so Payrexx's
+up-to-ten retries record once while two genuine partial refunds record twice.
+Every reversal except `refund_pending` (no money has moved yet) raises a
+High-priority accounting-review ToDo carrying the amount, and leaves a comment
+on the paid document: the Payment Request's Sales Invoice directly, or whatever
+a `payrexx_refund_notice_providers` hook claims first — good_npo registers one
+for Donation. Chargeback and settlement-conflict terminality still win: a
+reversal arriving after either is ignored.
+
+Capture, cancellation, and the accounting reversal itself remain explicit
+manual procedures.
 These ordinary mappings apply only before completion. A Completed request keeps
 its confirmed state and evidence when any non-chargeback webhook is delayed or
 replayed. After a chargeback, every non-chargeback replay keeps the request
 Failed and preserves the first chargeback evidence.
+
+## Subscriptions
+
+This app owns no recurring domain concept. It knows how to create a subscription
+signup, how to read one back, and how to recognise the events one produces; what
+a recurring donation or membership *is* belongs to the app that registers
+`payrexx_subscription_event_providers`.
+
+**Routing.** Every assumption about webhook payload shape lives in
+`payrexx/webhook_payload.py`, and no other module reads a webhook dict by key.
+Payrexx's transaction webhook page documents a `transaction` envelope; its
+subscription webhook page shows a bare lifecycle object. Older observed /
+SDK-derived examples wrap that object under `subscription`, so both lifecycle
+forms are accepted. Strictly unmatched authenticated JSON is rejected rather
+than acknowledged. Lifecycle events settle nothing; transaction envelopes take
+the Integration Request path.
+
+This reconstructed shape remains a release-verification requirement, not a
+fixture-backed fact: before enabling subscription processing in production,
+capture signed lifecycle and recurring-charge deliveries from the operator's own
+Payrexx sandbox and compare them field-for-field with `webhook_payload.py`. Do not
+manufacture a local payload and treat it as provider evidence.
+Payrexx's managed-subscription guide currently says those subscriptions receive
+a subscription webhook *instead of* a transaction webhook, while the transaction
+webhook object page still documents a nested `subscription` field. The callback
+therefore never assumes the lifecycle body moved money: after it records status,
+it queues an after-commit provider pull scoped to the exact settings row,
+subscription id, and reference. That worker obtains the charge from
+`GET /Transaction/` and sends it through the same transaction callback path.
+Provider I/O never runs inside the webhook request. The per-settings **Enable
+Managed Subscriptions** switch defaults off and is the release gate: enable it
+only after signed sandbox lifecycle delivery and the recovered transaction have
+both been verified. Turning it off later blocks new mandates only; existing
+subscriptions continue reconciliation, amount changes, and cancellation.
+
+**The signup / installment split.** Payrexx echoes the same `referenceId` on
+every charge of a subscription, because it was set once when the Gateway was
+created. A monthly donor's twelfth payment therefore arrives pointing at the
+Integration Request that settled their first one. The split is made on that
+request's state, never on the reference:
+
+| Referenced request | Meaning | What happens |
+|---|---|---|
+| Any state but Completed | the signup charge | falls through to ordinary settlement, unchanged |
+| Completed, same transaction | a replay of the signup | ignored |
+| Completed, new transaction | a later installment | dispatched to the owning app; nothing settled here |
+| Missing | a later installment | dispatched to the owning app |
+
+Without that split, the settled request's own terminality would silently
+discard every payment after the first. The signup case deliberately returns
+control to the existing settlement path rather than reimplementing it, so a
+first charge and a one-off payment cannot drift apart.
+
+The referenced Integration Request is hydrated through a current `FOR UPDATE`
+read before this classification. A later recurring transaction locks or inserts
+one deterministically named `Payrexx Subscription Event`. That row advances
+monotonically by provider status: preliminary/failure states never consume a
+later confirmation, the documented `uncaptured` state is accepted, claimed
+same-status replays stop, and Unclaimed/Processing states retry after
+provider-hook repair. An ordinary unclaimed event persists that state and
+responds HTTP 503. If a provider raises after making partial writes, the callback
+rolls back the complete webhook transaction first, then writes a fresh Unclaimed
+row containing only subscription identity/status plus transaction id, status,
+time, amount, currency, mode, reference, and TEST evidence. Payer and Contact
+objects are deliberately excluded. This keeps partial provider effects out while
+leaving enough authenticated financial evidence for local replay after Payrexx
+stops retrying. A reversal of the signup transaction uses the ordinary
+Integration Request reversal path. A refund, dispute, or chargeback targeting a
+later installment instead gets its own durable event of type `Reversal`, retains
+the original transaction identifier in the sanitized evidence, and dispatches
+to the owning app without changing the shared signup Integration Request or its
+confirmed transaction. Event state and provider effects remain
+transaction-atomic on successful claims.
+
+TEST-mode installments are refused under the same per-gateway opt-in that
+governs one-off settlement.
+
+Lifecycle and installment hooks run as the owning Payrexx Settings row's enabled
+System User. **Reconciliation.** The daily scheduler enqueues one deduplicated
+long worker per settings row, including rows whose new-signup gate is off. Each
+worker first redrives every locally retained Unclaimed financial event, then
+queries real transactions in ascending time order, and finally re-reads
+subscriptions for lifecycle status. The initial transaction window is seven
+days. Successful windows persist a UTC cursor; later runs re-read six hours of
+overlap and catch up in windows of at most seven days. Pagination is capped at
+100 pages of 100 rows so a bad provider response cannot loop forever. A failed
+financial row prevents cursor advancement and is retried; already-claimed rows
+are idempotent. Every event/subscription has its own commit/rollback boundary,
+so one failure cannot starve later rows. The subscription list remains reporting
+only; only authenticated rows returned by `GET /Transaction/` settle money.
 
 ## Security Model
 
@@ -547,6 +701,15 @@ bench --site development16.localhost run-tests \
 
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_static_qr
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_rate_limit
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_refunds
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_subscriptions
 ```
 
 ```bash

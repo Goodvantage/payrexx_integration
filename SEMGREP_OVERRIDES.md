@@ -23,3 +23,9 @@
 - Rule: `frappe-manual-commit`
 - What it prevents: Application code committing partial transactions outside Frappe's request lifecycle.
 - Why this override is safe: These commits only occur in integration tests that open independent database connections to reproduce concurrent checkout and settlement races. Setup and simulated competing writes must commit so the other connection can observe them, while cleanup commits remove rows across those connections. No production request or document hook uses these commits.
+
+## `frappe-manual-commit` in subscription reconciliation workers
+
+- Rule: `frappe-manual-commit`
+- What it prevents: Application code committing partial transactions outside Frappe's request lifecycle.
+- Why this override is safe: `reconcile_subscriptions` and the lifecycle-triggered transaction recovery are background batch jobs, never request or DocType event hooks. They commit each durable event, provider transaction, and subscription status independently so one malformed provider row rolls back alone and cannot undo already recovered installments or starve later rows. The UTC cursor is committed only after its complete bounded transaction window has no failed rows.

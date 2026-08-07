@@ -19,6 +19,10 @@
   "psp",
   "column_break_behavior",
   "validity_minutes",
+  "allow_test_transactions",
+  "subscriptions_section",
+  "enable_managed_subscriptions",
+  "transaction_reconciliation_cursor",
   "redirect_section",
   "success_redirect_url",
   "failed_redirect_url",
@@ -109,6 +113,34 @@
    "fieldname": "validity_minutes",
    "fieldtype": "Int",
    "label": "Gateway Validity (minutes)"
+  },
+  {
+   "default": "0",
+   "description": "Settle payments Payrexx marks as TEST. Leave off for any gateway handling real money — a simulated payment would otherwise mark a real invoice or donation as paid. Enable only on a sandbox gateway.",
+   "fieldname": "allow_test_transactions",
+   "fieldtype": "Check",
+   "label": "Allow TEST Transactions"
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "subscriptions_section",
+   "fieldtype": "Section Break",
+   "label": "Managed Subscriptions"
+  },
+  {
+   "default": "0",
+   "description": "Allows new Payrexx-managed subscription checkouts through this gateway. Keep disabled until signed sandbox lifecycle and recovered transaction evidence have been verified. Existing subscriptions continue to reconcile when this is disabled.",
+   "fieldname": "enable_managed_subscriptions",
+   "fieldtype": "Check",
+   "label": "Enable Managed Subscriptions"
+  },
+  {
+   "description": "UTC high-water mark for the bounded transaction recovery sweep. The worker re-reads an overlap before this time on every run.",
+   "fieldname": "transaction_reconciliation_cursor",
+   "fieldtype": "Datetime",
+   "label": "Transaction Reconciliation Cursor (UTC)",
+   "no_copy": 1,
+   "read_only": 1
   },
   {
    "fieldname": "redirect_section",

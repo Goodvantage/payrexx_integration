@@ -47,8 +47,9 @@ procedures), and the code. Record new or changed requirements in
 |---|---|
 | `gateway_selection.py` | Canonical strict resolver shared by native flows and downstream apps. Supports explicit selection, a caller-owned site-config key, and unambiguous single-row fallback. |
 | `payrexx_integration/payrexx_integration/doctype/payrexx_settings/` | The settings DocType. One row per environment (`Sandbox` / `Live`), each with its own required automation user. `on_update` auto-creates the matching `Payment Gateway` row (`Payrexx-<gateway_name>`). |
-| `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client (`create_gateway`, `retrieve_gateway`, `ping_gateway`). **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The legacy `ApiSignature` body field is no longer used. Canonical `*.payrexx.com` API hosts are trusted by default; custom Platform hosts require exact `payrexx_allowed_api_hosts` site-config entries and are validated before secret access. The secret lives only in the closure of the `requests` auth callable — see "Never let the API secret become a variable" below. |
-| `payrexx_integration/payrexx_integration/payrexx/webhook_validator.py` | HMAC-SHA256 verification of `X-Webhook-Signature`. Tries base64 first, falls back to hex. The signing key is **separate** from the API secret (configured per webhook in the Payrexx dashboard). |
+| `payrexx_integration/payrexx_integration/doctype/payrexx_subscription_event/` | Durable, non-PII recurring-transaction state for installments and later-installment reversals. Its deterministic gateway/event key advances monotonically; claimed same-status replays stop, while Unclaimed states remain retryable from a sanitized financial payload. A raised provider rolls back fully before that Unclaimed row is retained, and the daily worker redrives it before transaction/status reconciliation. |
+| `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client for Gateway, Subscription, and static-QR operations. **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The API version is code-pinned at `v1.16`; it is not a settings field. The legacy `ApiSignature` body field is no longer used. Canonical `*.payrexx.com` API hosts are trusted by default; custom Platform hosts require exact `payrexx_allowed_api_hosts` site-config entries and are validated before secret access. The secret lives only in the closure of the `requests` auth callable — see "Never let the API secret become a variable" below. |
+| `payrexx_integration/payrexx_integration/payrexx/webhook_validator.py` | HMAC-SHA256 verification of `X-Webhook-Signature`. Verifies Payrexx's documented hex encoding first and retains base64 as an observed compatibility form. The signing key is **separate** from the API secret (configured per webhook in the Payrexx dashboard). |
 | `api.py::payrexx_pay_url(sales_invoice, gateway_name=None)` | Jinja helper (registered via `hooks.py.jinja`). Resolves the gateway and returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
 | `api.py::pay_invoice(si=None, token=None, gateway_name=None)` | Whitelisted GET redirect endpoint. Verifies the invoice-and-gateway-bound HMAC token, locks/revalidates the wholly unpaid invoice and exact submitted/Requested Payment Request plus Integration Request checkout metadata, lazy-creates through ERPNext only when safe, and 302s to Payrexx. Because Frappe otherwise rolls back GET transactions, it sets `frappe.local.flags.commit` only after atomic local setup and checkout URL resolution. **All args remain optional kwargs** so missing-param requests return clean 403, not 500. |
 | `hosted_qa.py` | Explicitly gated, System-Manager-and-Accounts-Manager-only, read-only hosted sandbox preflight and settlement evidence. Exact invoice/gateway targets come from site config; never add checkout creation, callback replay, or reconciliation here. |
@@ -85,6 +86,11 @@ Settings row exists. The desk form's dashboard surfaces this URL so admins
 can paste it into the Payrexx webhook settings.
 Payrexx JSON webhook requests keep the query string in `frappe.request.args`,
 not in the whitelisted method kwargs, so the callback intentionally reads both.
+Transaction deliveries use a `transaction` envelope. Subscription lifecycle
+deliveries accept both Payrexx's documented bare object and the older observed /
+SDK-derived `subscription` envelope. This compatibility is not proof of the
+owned account's delivery shape; signed sandbox captures remain mandatory before
+production subscription processing.
 After signature verification, settlement and accounting-review side effects run
 as the owning Payrexx Settings row's configured enabled System User. Missing,
 disabled, or Website users fail closed; there is no Administrator or cross-app
@@ -140,9 +146,9 @@ closed.
 
 | | |
 |---|---|
-| Base URL | `https://api.<api_base_domain>/v1.14/`; default `https://api.payrexx.com/v1.14/`; custom final hosts require exact `payrexx_allowed_api_hosts` entries |
+| Base URL | `https://api.<api_base_domain>/v1.16/`; default `https://api.payrexx.com/v1.16/`; custom final hosts require exact `payrexx_allowed_api_hosts` entries |
 | Auth | `x-api-key: <api_secret>` header |
-| Required query param | `?instance=<instance_name>` on every call |
+| Required query param | `?instance=<instance_name>` on every call; all GET filters and pagination are query parameters (never a GET JSON body) |
 | POST body format | `application/x-www-form-urlencoded` |
 | Response envelope | `{"status":"success", "data":[ … ]}` |
 | Amount unit | Canonical integer hundredths for supported two-decimal currencies (CHF 2.00 → `200`); other fraction units and sub-cent amounts are rejected |
@@ -160,7 +166,7 @@ IP literals, malformed hosts, wildcards, and non-HTTPS ports are rejected before
 the Password field is read. A custom API domain's 401/403 response retries once
 against `api.payrexx.com` for every supported operation. A 404 retries only for
 the credential probe and Gateway creation, where it can indicate an
-unprovisioned custom API host; a concrete Gateway retrieval 404 is authoritative.
+unprovisioned custom API host; every other retrieval or POST 404 is authoritative.
 
 Checkout creation must use the app-owned `_create_integration_request()` path,
 never core `create_request_log()` (it commits). Provider metadata and the
@@ -183,22 +189,26 @@ provider teardown to close this gap.
 | `waiting` | unchanged | In-progress; wait for next webhook |
 | `cancelled` / `declined` / `error` / `expired` | `Failed` | Records error string; no provider-side cancellation is initiated |
 | `chargeback` | `Failed` | Preserves submitted ledger rows and creates one accounting-review ToDo |
-| `refunded` or another unknown status | unchanged | Stores the transaction only; refund reconciliation is not implemented |
+| `refund_pending` | unchanged | Records reversal evidence; no accounting ToDo until the refund becomes final |
+| `refunded` / `partially-refunded` | unchanged | Records reversal evidence and creates one accounting-review ToDo; ledger reversal remains manual |
+| `disputed` | unchanged | Records reversal evidence and creates one accounting-review ToDo |
+| another unknown status | unchanged | Stores the transaction only |
 
-These mappings apply to requests that have not completed. Once Completed, all
-delayed or replayed non-chargeback statuses are ignored so neither the status nor
-the confirmed transaction evidence can be downgraded. A verified `chargeback`
-remains allowed and moves the request to Failed for accounting review.
+These mappings apply to requests that have not completed. Once Completed,
+delayed or replayed statuses are ignored except post-settlement reversal evidence
+(`chargeback`, `disputed`, and the three refund statuses), and none may replace
+the confirmed transaction evidence. A verified `chargeback` moves the request to
+Failed for accounting review; refunds and disputes preserve Completed.
 After chargeback evidence exists, all non-chargeback statuses, including
 `confirmed`, are terminally ignored; preserve Failed status, the chargeback
 error, and the first chargeback transaction. Only duplicate chargeback delivery
 may re-enter the idempotent review-ToDo path.
 
 The integration creates hosted Gateways and reads Gateway state (`create_gateway`,
-`retrieve_gateway`, `ping_gateway`), plus non-payment static QR codes
+`retrieve_gateway`, `ping_gateway`), exposes Subscription CRUD/reporting, and
+manages non-payment static QR codes
 (`create_qr_code`, `delete_qr_code` → `PayrexxSettings.create_static_qr` /
-`delete_static_qr`; see DOCUMENTATION.md "Static QR Codes") — the whole client
-surface. It does not expose
+`delete_static_qr`; see DOCUMENTATION.md "Static QR Codes"). It does not expose
 Gateway deletion, capture, later-charge, void/cancel, or refund operations. Those
 provider actions and their ERPNext accounting reversals are manual operational
 workflows until an explicit, tested contract is implemented.
@@ -244,6 +254,15 @@ bench --site <site> run-tests \
 bench --site <site> run-tests \
   --module payrexx_integration.tests.test_static_qr
 
+bench --site <site> run-tests \
+  --module payrexx_integration.tests.test_rate_limit
+
+bench --site <site> run-tests \
+  --module payrexx_integration.tests.test_refunds
+
+bench --site <site> run-tests \
+  --module payrexx_integration.tests.test_subscriptions
+
 # Playwright e2e (core specs plus an optional existing-booking email check)
 cd playwright
 npm install && npx playwright install chromium
@@ -286,8 +305,9 @@ the provider page human-operated, require provider `TEST` evidence, and disable
   fails with "Payrexx rejected the API Secret". The ping is skipped when
   `frappe.flags.in_test` or `frappe.flags.in_install` is set.
 - **Automation user is gateway-owned and mandatory.** Every Payrexx Settings
-  row must name an enabled System User. Checkout, settlement, chargeback, and
-  settlement-conflict ToDo paths resolve that row from explicit checkout state
+  row must name an enabled System User. Checkout, settlement, subscription
+  lifecycle/installment/reconciliation, chargeback, and settlement-conflict ToDo
+  paths resolve that row from explicit checkout state
   or Integration Request metadata and fail closed instead of guessing another
   app's setting or Administrator. Keep the full settings-controller checkout
   operation inside this context so direct downstream callers cannot bypass it;

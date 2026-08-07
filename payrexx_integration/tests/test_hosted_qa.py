@@ -40,6 +40,12 @@ class TestHostedPayrexxQA(IntegrationTestCase):
 	def setUp(self):
 		super().setUp()
 		self.settings_name = _ensure_settings()
+		# Hosted QA proves a TEST-mode payment settles end to end, which the
+		# settlement gate blocks unless the gateway declares itself a sandbox.
+		frappe.db.set_value(
+			"Payrexx Settings", self.settings_name, "allow_test_transactions", 1, update_modified=False
+		)
+		frappe.clear_document_cache("Payrexx Settings", self.settings_name)
 		self.invoice = _create_submitted_test_sales_invoice()
 		self.gateway = f"Payrexx-{self.settings_name}"
 		_ensure_test_payment_gateway_account(self.gateway, self.invoice)

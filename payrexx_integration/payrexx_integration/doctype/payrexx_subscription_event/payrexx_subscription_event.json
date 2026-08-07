@@ -1,0 +1,128 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:event_key",
+ "creation": "2026-08-07 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "event_key",
+  "event_type",
+  "payrexx_settings",
+  "subscription_id",
+  "reference_id",
+  "provider_event_id",
+  "provider_status",
+  "dispatch_status",
+  "processed_on",
+  "redrive_payload"
+ ],
+ "fields": [
+  {
+   "fieldname": "event_key",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Event Key",
+   "read_only": 1,
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "event_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Event Type",
+   "options": "Installment\nReversal",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "payrexx_settings",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Payrexx Settings",
+   "options": "Payrexx Settings",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "subscription_id",
+   "fieldtype": "Data",
+   "in_standard_filter": 1,
+   "label": "Subscription ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "reference_id",
+   "fieldtype": "Data",
+   "in_standard_filter": 1,
+   "label": "Reference ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "provider_event_id",
+   "fieldtype": "Data",
+   "in_standard_filter": 1,
+   "label": "Provider Event ID",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "provider_status",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Provider Status",
+   "read_only": 1
+  },
+  {
+   "fieldname": "dispatch_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Dispatch Status",
+   "options": "Processing\nClaimed\nUnclaimed",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "processed_on",
+   "fieldtype": "Datetime",
+   "label": "Processed On",
+   "read_only": 1
+  },
+  {
+   "fieldname": "redrive_payload",
+   "fieldtype": "Long Text",
+   "hidden": 1,
+   "label": "Redrive Payload",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-08-07 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Payrexx Integration",
+ "name": "Payrexx Subscription Event",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "export": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager"
+  },
+  {
+   "export": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Accounts Manager"
+  }
+ ],
+ "row_format": "Dynamic",
+ "search_fields": "subscription_id,reference_id,provider_event_id",
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "provider_event_id",
+ "track_changes": 0
+}

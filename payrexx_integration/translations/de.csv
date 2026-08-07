@@ -1,6 +1,5 @@
 Source Text,Translated Text
 API Base Domain,API-Basisdomain
-API Version,API-Version
 "API base domain for Payrexx platform accounts. Use payrexx.com for normal Payrexx instances, or e.g. pay.goodvantage.ch for customer.pay.goodvantage.ch.","API-Basisdomain für Payrexx-Plattformkonten. Für normale Payrexx-Instanzen payrexx.com verwenden, oder z. B. pay.goodvantage.ch für customer.pay.goodvantage.ch."
 API secret from Payrexx → Integrations → API & Plugins. Sent as the 'x-api-key' header.,API-Secret aus Payrexx → Integrationen → API & Plugins. Wird als Header 'x-api-key' gesendet.
 Behavior,Verhalten
@@ -41,3 +40,8 @@ Used to build the Payment Gateway name as 'Payrexx-{gateway_name}'. e.g. 'Live' 
 Webhook Signing Key,Webhook-Signaturschluessel
 Webhook URL for Payrexx:,Webhook-URL für Payrexx:
 "Your Payrexx instance subdomain. For customer.pay.goodvantage.ch, use customer here and pay.goodvantage.ch in API Base Domain.",Subdomain deiner Payrexx-Instanz. Für customer.pay.goodvantage.ch hier customer und in API Base Domain pay.goodvantage.ch verwenden.
+Allow TEST Transactions,TEST-Transaktionen erlauben
+Automation User,Automatisierungsbenutzer
+Enable Managed Subscriptions,Verwaltete Abonnemente aktivieren
+Managed Subscriptions,Verwaltete Abonnemente
+Transaction Reconciliation Cursor (UTC),Transaktionsabgleich-Cursor (UTC)

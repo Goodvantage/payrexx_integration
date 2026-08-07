@@ -307,6 +307,17 @@ def _validate_request(run_id: str):
 	invoice = frappe.get_doc("Sales Invoice", invoice_name)
 	settings.check_permission("read")
 	invoice.check_permission("read")
+	if not cint(settings.get("allow_test_transactions")):
+		# The whole hosted QA chain settles a TEST-mode payment on purpose, and
+		# settlement rejects those unless the gateway opts in. Say so here rather
+		# than letting the run fail later as an opaque settlement conflict.
+		frappe.throw(
+			_(
+				"Hosted Payrexx QA settles TEST payments. Enable 'Allow TEST Transactions' on "
+				"Payrexx Settings {0} — and only ever on a sandbox gateway."
+			).format(settings_name),
+			frappe.ValidationError,
+		)
 	return settings, invoice
 
 

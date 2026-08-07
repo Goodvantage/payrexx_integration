@@ -117,14 +117,21 @@ row order or names such as `Live` and `Sandbox`.
 | `gateway_name` | Data, unique, reqd | `Live`, `Sandbox`, … — used to build `Payrexx-{name}` |
 | `instance_name` | Data, reqd | Payrexx instance subdomain. For `customer.pay.goodvantage.ch`, use `customer` |
 | `api_base_domain` | Data, default `payrexx.com`, reqd | Host-only API base domain. Normal accounts use `payrexx.com`; platform accounts use the remaining domain, e.g. `pay.goodvantage.ch`, with exact final host allowlisting |
-| `api_version` | Data, default `v1.14` | Bump without code change |
 | `api_secret` | Password, reqd | Sent as `x-api-key` header |
 | `webhook_signing_key` | Password, reqd | HMAC key for `X-Webhook-Signature` |
 | `automation_user` | Link (User), reqd | Owning enabled System User for checkout, settlement, and accounting-review side effects; no fallback user |
 | `supported_currencies` | Small Text, default `CHF,EUR,USD,GBP` | Comma list, validated per transaction |
 | `psp` | Small Text | Optional comma list of PSP IDs |
 | `validity_minutes` | Int | Optional gateway TTL |
+| `allow_test_transactions` | Check, default off | Allows signed TEST payments to settle; sandbox only |
+| `enable_managed_subscriptions` | Check, default off | Allows new managed-subscription checkouts after signed sandbox verification; does not stop existing-mandate processing |
+| `transaction_reconciliation_cursor` | Datetime, read-only | UTC high-water mark for bounded transaction recovery; each run re-reads an overlap |
 | `success_redirect_url` / `failed_redirect_url` / `cancel_redirect_url` | Data | Optional global overrides; defaults bring success through the reconciliation endpoint and failed/cancelled returns to `/payment-failed`. Per-checkout `failed_redirect_to` / `cancel_redirect_to` kwargs override the generic failed/cancelled pages for branded flows. |
+
+The REST API version is code-pinned at `v1.16` through
+`payrexx_client.DEFAULT_API_VERSION`. It is intentionally not a settings field:
+an API-version change is an integration release that must pass the complete
+client and settlement suite rather than an unreviewed per-site toggle.
 
 Installation is in `README.md`; creating the settings row, the
 `Payment Gateway Account`, and the Payrexx webhook is in `HOW_TO.md` §1–§4.
@@ -145,9 +152,18 @@ here.
 | `POST` | `/Gateway/` | Create a hosted checkout. Returns `{id, link, hash, status}`. |
 | `GET` | `/Gateway/{id}/` | Look up a gateway and its `invoices[].transactions[]`. |
 | `GET` | `/Gateway/0/` | Credential ping — HTTP 200 with `status: error` means the credentials are valid. |
+| `POST` | `/Subscription/` | Create a subscription for an already-known Payrexx contact. Normal signup uses Gateway subscription parameters instead. |
+| `GET` | `/Subscription/` or `/Subscription/{id}/` | List or retrieve subscriptions; list pagination uses query parameters. |
+| `GET` | `/Transaction/` | Recover real transaction evidence by bounded UTC/query pagination. |
+| `PUT` | `/Subscription/{id}/` | Update future subscription terms. |
+| `DELETE` | `/Subscription/{id}/` | Cancel a subscription immediately. |
+| `POST` / `DELETE` | `/QrCode/` / `/QrCode/{uuid}/` | Create or delete a permanent static QR code. |
 
-That is the whole client surface: no Gateway deletion, capture, void, refund, or
-standalone transaction lookup (`REQUIREMENTS.md` REQ-PRX-BND-01).
+There is no Gateway deletion, capture, later charge, void, or refund initiation
+(`REQUIREMENTS.md` REQ-PRX-BND-01).
+Only Gateway creation may retry a custom-host POST 404 against the canonical
+host. Subscription and QR creation treat 404 as authoritative to avoid creating
+the same external resource on a second host.
 
 ### `POST /Gateway/` parameters emitted by this app
 
@@ -161,6 +177,9 @@ standalone transaction lookup (`REQUIREMENTS.md` REQ-PRX-BND-01).
 | `psp[0]`, `psp[1]`, … | no | Restrict to specific PSP IDs |
 | `fields[email][value]` | no | Customer prefill |
 | `validity` | no | Gateway TTL in minutes |
+| `subscriptionState` | no | Turns the Gateway into a subscription signup |
+| `subscriptionInterval` | with `subscriptionState` | Required validated billing interval |
+| `subscriptionPeriod` / `subscriptionCancellationInterval` | no | Sent only when the caller explicitly supplies them |
 
 ### Webhook payload (JSON content type)
 
@@ -183,10 +202,11 @@ standalone transaction lookup (`REQUIREMENTS.md` REQ-PRX-BND-01).
 }
 ```
 
-Payrexx delivers `X-Webhook-Signature` as a base64 HMAC-SHA256 digest of the raw
-body, keyed with the per-webhook signing key (separate from the API secret).
-`webhook_validator.verify_webhook_signature` checks base64 first and falls back
-to lowercase hex, because some accounts deliver hex.
+Payrexx documents `X-Webhook-Signature` as a lowercase-hex HMAC-SHA256 digest of
+the raw body, keyed with the per-webhook signing key (separate from the API
+secret). `webhook_validator.verify_webhook_signature` verifies hex first and
+retains base64 only as a compatibility representation for previously observed /
+account-configured deliveries.
 
 The `transaction.status` → `Integration Request.status` mapping, including the
 terminal-evidence and chargeback rules, is in `AGENTS.md` ("Status mapping") and
@@ -222,6 +242,11 @@ can confirm:
       ```
 - [ ] Completing a sandbox payment fires the webhook; the matching
       `Integration Request` flips to `Completed`.
+- [ ] A managed-subscription sandbox run captures the exact signed lifecycle
+      body. Compare it field-for-field with `webhook_payload.py`, then prove the
+      after-commit `GET /Transaction/` recovery settles the first charge and a
+      later charge creates exactly one installment. Only then enable **Enable
+      Managed Subscriptions** on that settings row.
 - [ ] Forging a request with a wrong `X-Webhook-Signature` is rejected
       (check `Error Log`).
 - [ ] A failed provider call (e.g. a deliberately wrong API secret) writes an

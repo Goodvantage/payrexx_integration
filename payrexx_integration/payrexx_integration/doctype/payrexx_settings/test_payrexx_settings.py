@@ -8,6 +8,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from threading import Barrier
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlparse
 
@@ -25,7 +26,10 @@ from payrexx_integration.api import (
 	sign_payment_success_reference,
 )
 from payrexx_integration.gateway_selection import resolve_payrexx_settings
-from payrexx_integration.payrexx_integration.payrexx.payrexx_client import PayrexxClient
+from payrexx_integration.payrexx_integration.payrexx.payrexx_client import (
+	DEFAULT_API_VERSION,
+	PayrexxClient,
+)
 from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
@@ -408,7 +412,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 			self.assertEqual(client.api_base_domain, "pay.goodvantage.ch")
 			self.assertEqual(
 				client._url("Gateway/0/"),
-				"https://api.pay.goodvantage.ch/v1.14/Gateway/0/?instance=customer",
+				f"https://api.pay.goodvantage.ch/{DEFAULT_API_VERSION}/Gateway/0/?instance=customer",
 			)
 
 	def test_settings_ping_uses_client(self):
@@ -734,17 +738,54 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 	# ----------------------------------------------------- webhook signature
 
-	def test_webhook_signature_base64(self):
+	def test_webhook_signature_base64_compatibility(self):
 		key = "whk_test_dummy"
 		body = b'{"transaction":{"id":1,"status":"confirmed"}}'
 		sig = base64.b64encode(hmac.new(key.encode("utf-8"), body, hashlib.sha256).digest()).decode("ascii")
 		self.assertTrue(verify_webhook_signature(body, sig, key))
 
-	def test_webhook_signature_hex_fallback(self):
+	def test_webhook_signature_documented_hex(self):
 		key = "whk_test_dummy"
 		body = b'{"transaction":{"id":1,"status":"confirmed"}}'
 		sig_hex = hmac.new(key.encode("utf-8"), body, hashlib.sha256).hexdigest()
 		self.assertTrue(verify_webhook_signature(body, sig_hex, key))
+
+	def test_form_encoded_webhook_body_names_the_merchant_setting(self):
+		"""A PHP-Post delivery is authentic but undecodable — say which setting caused it."""
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		original_request = getattr(frappe.local, "request", None)
+		try:
+			for content_type, should_throw in (
+				("application/x-www-form-urlencoded", True),
+				("application/json; charset=utf-8", False),
+				("", False),
+			):
+				frappe.local.request = SimpleNamespace(content_type=content_type)
+				if should_throw:
+					with self.assertRaises(frappe.ValidationError) as caught:
+						ps_module._reject_non_json_webhook_body()
+					self.assertIn("content type to JSON", str(caught.exception))
+				else:
+					ps_module._reject_non_json_webhook_body()
+		finally:
+			if original_request is None:
+				if hasattr(frappe.local, "request"):
+					delattr(frappe.local, "request")
+			else:
+				frappe.local.request = original_request
+
+	def test_webhook_signature_hex_is_case_and_whitespace_insensitive(self):
+		"""Hex casing is not a forgery: compare the decoded digest, not the string."""
+		key = "whk_test_dummy"
+		body = b'{"transaction":{"id":1,"status":"confirmed"}}'
+		sig_hex = hmac.new(key.encode("utf-8"), body, hashlib.sha256).hexdigest()
+		self.assertTrue(verify_webhook_signature(body, sig_hex.upper(), key))
+		self.assertTrue(verify_webhook_signature(body, f"  {sig_hex}\n", key))
+		self.assertFalse(verify_webhook_signature(body, "   ", key))
+		self.assertFalse(verify_webhook_signature(body, "not-hex-and-not-base64", key))
 
 	def test_webhook_signature_rejects_tampered(self):
 		key = "whk_test_dummy"
@@ -1306,10 +1347,17 @@ class TestPayrexxSettings(IntegrationTestCase):
 				)
 				integration_request.reload()
 				self.assertEqual(integration_request.status, expected_status)
-				self.assertEqual(
-					(frappe.parse_json(integration_request.data) or {})["payrexx_transaction"],
-					transaction,
-				)
+				stored = frappe.parse_json(integration_request.data) or {}
+				if status in ps_module.REFUND_STATUSES:
+					# A reversal is recorded beside the settlement evidence, never
+					# on top of it — `payrexx_transaction` stays the record of what
+					# was collected.
+					self.assertEqual(
+						[entry["status"] for entry in stored[ps_module.REVERSAL_DATA_KEY]], [status]
+					)
+					self.assertNotIn("payrexx_transaction", stored)
+				else:
+					self.assertEqual(stored["payrexx_transaction"], transaction)
 
 	def test_get_payment_url_records_owning_settings_on_integration_request(self):
 		"""The settings row that creates a checkout is recorded on the IR —

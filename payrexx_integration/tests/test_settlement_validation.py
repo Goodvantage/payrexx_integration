@@ -6,6 +6,7 @@ from frappe.tests import UnitTestCase
 
 from payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings import (
 	CHARGEBACK_ERROR,
+	_confirmed_transaction_from_gateway,
 	_is_chargeback_recorded,
 	_mark_reconciliation_failure,
 	_settlement_conflict,
@@ -50,6 +51,108 @@ class TestSettlementValidation(UnitTestCase):
 				{"payrexx_transaction": {"status": "confirmed"}},
 			)
 		)
+
+	@staticmethod
+	def _patched_get_value(*, allow_test_transactions: int):
+		"""Answer the gateway opt-in lookup; leave the currency fraction unit alone."""
+
+		def get_value(doctype, *args, **kwargs):
+			if doctype == "Payrexx Settings":
+				return allow_test_transactions
+			return 100
+
+		return patch(
+			"payrexx_integration.payrexx_integration.doctype.payrexx_settings."
+			"payrexx_settings.frappe.db.get_value",
+			side_effect=get_value,
+		)
+
+	def assertPassedTestModeGate(self, conflict):
+		"""The mode gate let this through; later checks are another test's business.
+
+		These stubs carry no Payment Request reference, so a transaction that
+		clears the gate still stops at `payment_request_reference_required`.
+		"""
+		if conflict is not None:
+			self.assertNotEqual(conflict["code"], "test_transaction")
+
+	def test_test_mode_transaction_is_rejected_unless_the_gateway_opts_in(self):
+		"""A simulated payment matches every other check, so mode is the only thing stopping it."""
+		integration_request = frappe._dict(reference_doctype=None)
+		ir_data = {"amount": 100, "currency": "CHF", "payrexx_settings": "Live"}
+		confirmed_test_payment = {
+			"status": "confirmed",
+			"mode": "TEST",
+			"amount": 10000,
+			"currency": "CHF",
+		}
+		with self._patched_get_value(allow_test_transactions=0):
+			self.assertEqual(
+				_settlement_conflict(integration_request, ir_data, confirmed_test_payment)["code"],
+				"test_transaction",
+			)
+
+		# Same payment, sandbox gateway: the opt-in lets it through to the
+		# ordinary amount/currency checks, which it passes.
+		with self._patched_get_value(allow_test_transactions=1):
+			self.assertPassedTestModeGate(
+				_settlement_conflict(integration_request, ir_data, confirmed_test_payment)
+			)
+
+	def test_live_transaction_is_unaffected_by_the_gate(self):
+		integration_request = frappe._dict(reference_doctype=None)
+		ir_data = {"amount": 100, "currency": "CHF", "payrexx_settings": "Live"}
+		with self._patched_get_value(allow_test_transactions=0):
+			self.assertPassedTestModeGate(
+				_settlement_conflict(
+					integration_request,
+					ir_data,
+					{"status": "confirmed", "mode": "LIVE", "amount": 10000, "currency": "CHF"},
+				)
+			)
+
+	def test_invoice_test_flag_is_honoured_when_mode_is_absent(self):
+		integration_request = frappe._dict(reference_doctype=None)
+		ir_data = {"amount": 100, "currency": "CHF", "payrexx_settings": "Live"}
+		with self._patched_get_value(allow_test_transactions=0):
+			self.assertEqual(
+				_settlement_conflict(
+					integration_request,
+					ir_data,
+					{"status": "confirmed", "amount": 10000, "invoice": {"currency": "CHF", "test": 1}},
+				)["code"],
+				"test_transaction",
+			)
+			# Neither marker present: undecidable, so settlement proceeds exactly
+			# as it did before the gate existed.
+			self.assertPassedTestModeGate(
+				_settlement_conflict(
+					integration_request,
+					ir_data,
+					{"status": "confirmed", "amount": 10000, "currency": "CHF"},
+				)
+			)
+
+	def test_browser_reconciliation_preserves_parent_invoice_test_evidence(self):
+		integration_request = frappe._dict(reference_doctype=None)
+		ir_data = {"amount": 100, "currency": "CHF", "payrexx_settings": "Live"}
+		gateway = {
+			"invoices": [
+				{
+					"referenceId": "IR-TEST",
+					"currency": "CHF",
+					"test": 1,
+					"transactions": [{"id": 1, "status": "confirmed", "amount": 10000}],
+				}
+			]
+		}
+
+		transaction = _confirmed_transaction_from_gateway(gateway, "IR-TEST")
+		with self._patched_get_value(allow_test_transactions=0):
+			self.assertEqual(
+				_settlement_conflict(integration_request, ir_data, transaction)["code"],
+				"test_transaction",
+			)
 
 	def test_confirmation_requires_provider_and_requested_amount_currency(self):
 		integration_request = frappe._dict(reference_doctype=None)

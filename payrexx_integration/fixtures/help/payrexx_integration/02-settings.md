@@ -16,13 +16,24 @@ Der **Payrexx Settings** Datensatz enthält die Zugangsdaten und das Verhalten f
 - **Gateway Name**: eindeutiger Name wie `Sandbox` oder `Live`; ein separates Environment-Feld gibt es nicht.
 - **Instance Name**: erster Teil der Payrexx Instanz, zum Beispiel `customer`.
 - **API Base Domain**: `payrexx.com` oder die Plattform-Domain, zum Beispiel `pay.goodvantage.ch`.
-- **API Version**: normalerweise `v1.14`.
 - **API Secret**: Schlüssel aus Payrexx für die API.
 - **Webhook Signing Key**: separater Schlüssel zur Prüfung eingehender Webhooks.
+- **Automation User**: aktiver System User für Checkout, Verbuchung und
+  Abstimmung dieses Gateways.
 - **Supported Currencies**: kommagetrennte Währungen, die dieser Gateway akzeptiert.
 - **PSP Whitelist**: optionale kommagetrennte Payrexx-PSP-IDs.
 - **Gateway Validity**: optionale Gültigkeit des Checkout-Links in Minuten.
+- **Allow TEST Transactions**: nur auf einem reinen Sandbox-Gateway aktivieren.
+- **Enable Managed Subscriptions**: standardmässig aus. Erst nach einem
+  signierten Sandbox-Test aktivieren, bei dem Lifecycle-Webhook,
+  Transaction-Recovery und ein Folgeeinzug nachgewiesen wurden. Das Abschalten
+  blockiert neue Mandate, aber nicht die Abstimmung bestehender Abonnemente.
+- **Transaction Reconciliation Cursor (UTC)**: schreibgeschützter Zeitstempel
+  des letzten vollständig erfolgreichen Transaction-Fensters.
 - **Redirect Overrides**: optionale globale Ziel-URLs für Erfolg, Fehler und Abbruch.
+
+Die API-Version ist in der App fest auf `v1.16` gesetzt und kann nicht pro
+Gateway geändert werden. Ein Versionswechsel erfolgt als getestetes App-Release.
 
 Payrexx-eigene API-Hosts unter `payrexx.com` sind standardmässig erlaubt. Eine
 Plattform-Domain wie `pay.goodvantage.ch` muss zusätzlich als exakter finaler

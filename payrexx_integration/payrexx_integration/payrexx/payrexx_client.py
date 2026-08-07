@@ -2,6 +2,7 @@
 
 import ipaddress
 import re
+import time
 from collections.abc import Callable, Collection
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -11,9 +12,19 @@ from frappe.utils import get_request_session
 from requests import HTTPError
 
 DEFAULT_API_BASE_DOMAIN = "payrexx.com"
+DEFAULT_API_VERSION = "v1.16"
 ALLOWED_API_HOSTS_CONFIG = "payrexx_allowed_api_hosts"
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+
+# Payrexx enforces 600 requests / 5 minutes at the CDN edge (AWS WAF). It
+# answers 405 first and only starts answering 403 once the limit is well
+# exceeded, so neither status reads like a rate limit and an immediate retry
+# deepens it. 403 is deliberately NOT treated as a rate limit here: it is the
+# same status Payrexx returns for a rejected API secret, and the custom-domain
+# fallback already depends on that meaning.
+RATE_LIMIT_STATUSES = frozenset({405, 429})
+_RATE_LIMIT_RETRY_DELAYS = (0.5, 1.5)
 
 
 class PayrexxAPIError(RuntimeError):
@@ -43,7 +54,7 @@ class PayrexxClient:
 		self,
 		instance: str,
 		api_secret: str,
-		api_version: str = "v1.14",
+		api_version: str = DEFAULT_API_VERSION,
 		api_base_domain: str | None = None,
 	):
 		if not instance:
@@ -65,6 +76,7 @@ class PayrexxClient:
 			self._post(
 				"Gateway/",
 				data=params,
+				retry_not_found=True,
 			)
 		)
 
@@ -100,27 +112,179 @@ class PayrexxClient:
 		if isinstance(resp, dict) and resp.get("status") not in (None, "success"):
 			raise PayrexxAPIError(resp.get("message", "Unknown Payrexx error"))
 
+	# ------------------------------------------------------------ Subscription
+
+	def create_subscription(self, params: dict) -> dict:
+		"""POST /Subscription/
+
+		Rarely usable in practice: Payrexx requires ``userId``, the id of a
+		contact that only exists once the payer has transacted. Subscriptions are
+		normally created by sending the payer through a Gateway built with
+		``subscriptionState``; this exists for the case where the contact is
+		already known.
+		"""
+		return _unwrap(self._post("Subscription/", data=params))
+
+	def retrieve_subscription(self, subscription_id: int) -> dict:
+		"""GET /Subscription/{id}/"""
+		return _unwrap(self._get(f"Subscription/{subscription_id}/"))
+
+	def list_subscriptions(self, *, offset: int | None = None, limit: int | None = None) -> list[dict]:
+		"""GET /Subscription/ — every subscription on the instance, newest ordering left to Payrexx."""
+		pagination = {}
+		if offset is not None:
+			pagination["offset"] = int(offset)
+		if limit is not None:
+			pagination["limit"] = int(limit)
+		return _unwrap_list(self._get("Subscription/", query=pagination or None))
+
+	def list_transactions(
+		self,
+		*,
+		datetime_utc_greater_than: str,
+		datetime_utc_less_than: str,
+		my_transactions_only: bool = True,
+		order_by_time: str = "ASC",
+		offset: int | None = None,
+		limit: int | None = None,
+	) -> list[dict]:
+		"""GET /Transaction/ using the official SDK's bounded query filters."""
+		query = {
+			"filterDatetimeUtcGreaterThan": datetime_utc_greater_than,
+			"filterDatetimeUtcLessThan": datetime_utc_less_than,
+			"filterMyTransactionsOnly": int(bool(my_transactions_only)),
+			"orderByTime": order_by_time,
+		}
+		if offset is not None:
+			query["offset"] = int(offset)
+		if limit is not None:
+			query["limit"] = int(limit)
+		return _unwrap_list(self._get("Transaction/", query=query))
+
+	def update_subscription(self, subscription_id: int, params: dict) -> dict:
+		"""PUT /Subscription/{id}/ — amount/currency/purpose/vatRate.
+
+		Payrexx applies a new amount from the next payment interval, not to the
+		charge already taken.
+		"""
+		return _unwrap(self._put(f"Subscription/{subscription_id}/", data=params))
+
+	def cancel_subscription(self, subscription_id: int, *, expected_statuses: Collection[int] = ()) -> dict:
+		"""DELETE /Subscription/{id}/ — immediate, and the only cancellation the API offers.
+
+		Absent from Payrexx's published API reference but exercised by their own
+		PHP SDK's examples. End-of-period cancellation (the ``in_notice`` state)
+		exists only in the merchant admin.
+		"""
+		try:
+			response = self._delete(f"Subscription/{subscription_id}/", expected_statuses=expected_statuses)
+		except HTTPError as exc:
+			if get_http_status(exc) == 404 and 404 in expected_statuses:
+				return {"status": "success", "already_gone": True}
+			raise
+		if response is None:
+			return {"status": "success"}
+		if not isinstance(response, dict) or response.get("status") != "success":
+			message = response.get("message", "Unknown Payrexx error") if isinstance(response, dict) else None
+			raise PayrexxAPIError(message or "Unknown Payrexx error")
+		return response
+
 	# ----------------------------------------------------------------- internal
 
-	def _get(self, path: str, *, retry_not_found: bool = False) -> dict:
+	def _get(
+		self,
+		path: str,
+		*,
+		retry_not_found: bool = False,
+		query: dict | None = None,
+		json_data: dict | None = None,
+	) -> dict:
+		return self._send_idempotent(
+			lambda tolerated: self._get_once(
+				path,
+				retry_not_found=retry_not_found,
+				query=query,
+				json_data=json_data,
+				expected_statuses=tolerated,
+			)
+		)
+
+	def _get_once(
+		self,
+		path: str,
+		*,
+		retry_not_found: bool,
+		query: dict | None = None,
+		json_data: dict | None = None,
+		expected_statuses: Collection[int] = (),
+	) -> dict:
 		try:
-			return _execute_request("GET", self._url(path), authorize=self._authorize)
+			return _execute_request(
+				"GET",
+				self._url(path, query),
+				authorize=self._authorize,
+				json_data=json_data,
+				expected_statuses=expected_statuses,
+			)
 		except Exception as exc:
 			if self._should_retry_default_domain(exc, retry_not_found=retry_not_found):
-				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
-				return _execute_request("GET", fallback_url, authorize=self._authorize)
+				fallback_url = self._url(path, query, api_base_domain=DEFAULT_API_BASE_DOMAIN)
+				return _execute_request(
+					"GET",
+					fallback_url,
+					authorize=self._authorize,
+					json_data=json_data,
+					expected_statuses=expected_statuses,
+				)
 			raise
 
-	def _post(self, path: str, *, data: dict) -> dict:
+	def _put(self, path: str, *, data: dict) -> dict:
+		# PUT is idempotent by definition here — setting an amount twice leaves
+		# the same amount — so unlike POST it is safe to replay under a rate limit.
+		return self._send_idempotent(
+			lambda tolerated: self._put_once(path, data=data, expected_statuses=tolerated)
+		)
+
+	def _put_once(self, path: str, *, data: dict, expected_statuses: Collection[int] = ()) -> dict:
+		try:
+			return _execute_request(
+				"PUT",
+				self._url(path),
+				authorize=self._authorize,
+				data=data,
+				expected_statuses=expected_statuses,
+			)
+		except Exception as exc:
+			if self._should_retry_default_domain(exc, retry_not_found=False):
+				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
+				return _execute_request(
+					"PUT",
+					fallback_url,
+					authorize=self._authorize,
+					data=data,
+					expected_statuses=expected_statuses,
+				)
+			raise
+
+	def _post(self, path: str, *, data: dict, retry_not_found: bool = False) -> dict:
+		# Deliberately not rate-limit-retried. A POST that was rejected at the
+		# edge almost certainly never reached Payrexx, but "almost certainly" is
+		# not a basis for replaying a call that creates a Gateway — the orphan
+		# recovery path exists because an unknown create outcome is expensive.
 		try:
 			return _execute_request("POST", self._url(path), authorize=self._authorize, data=data)
 		except Exception as exc:
-			if self._should_retry_default_domain(exc, retry_not_found=True):
+			if self._should_retry_default_domain(exc, retry_not_found=retry_not_found):
 				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
 				return _execute_request("POST", fallback_url, authorize=self._authorize, data=data)
 			raise
 
 	def _delete(self, path: str, *, expected_statuses: Collection[int] = ()) -> dict:
+		return self._send_idempotent(
+			lambda tolerated: self._delete_once(path, expected_statuses=[*expected_statuses, *tolerated])
+		)
+
+	def _delete_once(self, path: str, *, expected_statuses: Collection[int] = ()) -> dict:
 		try:
 			return _execute_request(
 				"DELETE",
@@ -141,6 +305,27 @@ class PayrexxClient:
 					expected_statuses=expected_statuses,
 				)
 			raise
+
+	def _send_idempotent(self, operation: Callable[[Collection[int]], dict]) -> dict:
+		"""Run an idempotent request, backing off when Payrexx's edge rate-limits it.
+
+		Only GET, PUT, and DELETE come through here: all are safe to repeat, and the
+		reconciliation sweep that iterates subscriptions is exactly the caller
+		that will meet the limit as donor count grows.
+
+		Intermediate attempts declare the rate-limit statuses expected so a call
+		that eventually succeeds does not leave an Error Log row per attempt. The
+		final attempt tolerates nothing extra, so a persistent rate limit still
+		surfaces to staff exactly as any other provider failure would.
+		"""
+		for delay in _RATE_LIMIT_RETRY_DELAYS:
+			try:
+				return operation(RATE_LIMIT_STATUSES)
+			except Exception as exc:
+				if get_http_status(exc) not in RATE_LIMIT_STATUSES:
+					raise
+				time.sleep(delay)
+		return operation(())
 
 	def _should_retry_default_domain(self, exc: Exception, *, retry_not_found: bool) -> bool:
 		if self.api_base_domain == DEFAULT_API_BASE_DOMAIN:
@@ -185,6 +370,7 @@ def _execute_request(
 	*,
 	authorize: Callable[[requests.PreparedRequest], requests.PreparedRequest],
 	data: dict | None = None,
+	json_data: dict | None = None,
 	expected_statuses: Collection[int] = (),
 ) -> dict | list | str | None:
 	"""Send one authenticated Payrexx request without leaking credentials or payer data.
@@ -205,11 +391,12 @@ def _execute_request(
 
 	session = get_request_session()
 	prepared_request = session.prepare_request(
-		requests.Request(method=method, url=url, headers=headers, data=data, auth=authorize)
+		requests.Request(method=method, url=url, headers=headers, data=data, json=json_data, auth=authorize)
 	)
 	# The body is now sealed inside the prepared request, which does not expose it
 	# to traceback frame dumps. Drop this frame's own reference to the payer data.
 	data = None
+	json_data = None
 	# ``Session.request()`` merges proxy, CA-bundle, and client-certificate settings
 	# from the environment before sending; ``Session.send()`` does not. Replicate it
 	# so proxied and custom-CA deployments behave exactly as they did.
@@ -246,10 +433,33 @@ def _parse_response(response: requests.Response) -> dict | list | str | None:
 
 def _unwrap(resp: dict) -> dict:
 	"""Payrexx wraps ok responses as {status: 'success', data: [obj]}."""
+	return next(iter(_unwrap_list(resp)), {})
+
+
+def _unwrap_list(resp: dict) -> list[dict]:
+	"""The same envelope, for endpoints that legitimately return many rows."""
 	if not resp or resp.get("status") != "success":
 		raise PayrexxAPIError((resp or {}).get("message", "Unknown Payrexx error"))
-	data = resp.get("data") or []
-	return data[0] if data else {}
+	return resp.get("data") or []
+
+
+_SUBSCRIPTION_INTERVAL = re.compile(r"^P(\d{1,3})([MY])$")
+
+
+def validate_subscription_interval(value, label: str) -> str:
+	"""Accept only the ISO-8601 durations this integration actually supports.
+
+	Payrexx takes anything PHP's ``DateInterval`` parses, but these strings end
+	up in a signed provider payload built partly from operator and caller input,
+	so the accepted set is the one the product offers — monthly, quarterly,
+	yearly — rather than everything the provider would tolerate.
+	"""
+	candidate = str(value or "").strip().upper()
+	if not _SUBSCRIPTION_INTERVAL.fullmatch(candidate):
+		raise ValueError(
+			f"{label} must be an ISO-8601 duration in months or years, such as P1M, P3M or P1Y; got {value!r}"
+		)
+	return candidate
 
 
 def _normalize_api_base_domain(value: str | None) -> str:

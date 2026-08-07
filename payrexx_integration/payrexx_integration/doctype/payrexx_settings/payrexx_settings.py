@@ -1,24 +1,29 @@
 # Copyright (c) 2026, Goodvantage GmbH and contributors
 # For license information, please see license.txt
 
+import hashlib
+import json
 import logging
 import re
 import time
 from contextlib import nullcontext
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode, urlsplit
 
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import call_hook_method, cint, cstr, flt, now_datetime
+from frappe.utils import call_hook_method, cint, cstr, flt, get_datetime, now_datetime
 from payments.utils import create_payment_gateway
 
 from payrexx_integration.gateway_selection import resolve_payrexx_settings
+from payrexx_integration.payrexx_integration.payrexx import webhook_payload
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import (
 	PayrexxClient,
 	_normalize_api_base_domain,
 	get_http_status,
+	validate_subscription_interval,
 )
 from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
@@ -36,10 +41,49 @@ ACTIVE_PAYREXX_PAYMENT_REQUEST_STATUSES = (
 CHECKOUT_PROVIDER_CONTACT_FLAG = "payrexx_checkout_provider_contacted"
 CHARGEBACK_TODO_MARKER = "[Payrexx chargeback]"
 CHARGEBACK_ERROR = "Payrexx status: chargeback"
+REFUND_TODO_MARKER = "[Payrexx refund]"
+DISPUTE_TODO_MARKER = "[Payrexx dispute]"
+REVERSAL_DATA_KEY = "payrexx_reversals"
+REFUND_NOTICE_PROVIDER_HOOK = "payrexx_refund_notice_providers"
+REFUND_STATUSES = ("refunded", "partially-refunded", "refund_pending")
+# Statuses that describe what happened *after* a payment settled. They must
+# reach a Completed request — that is the only state a refund can follow — while
+# every other delayed or replayed status stays ignored.
+POST_SETTLEMENT_STATUSES = frozenset({"chargeback", "disputed", *REFUND_STATUSES})
 SETTLEMENT_CONFLICT_TODO_MARKER = "[Payrexx settlement conflict]"
 SETTLEMENT_CONFLICT_DATA_KEY = "payrexx_settlement_conflict"
 SETTLEMENT_CONFLICT_VERSION = 1
 SETTLEMENT_SOURCE_PROVIDER_HOOK = "payrexx_settlement_source_providers"
+SUBSCRIPTION_EVENT_PROVIDER_HOOK = "payrexx_subscription_event_providers"
+SUBSCRIPTION_EVENT_DOCTYPE = "Payrexx Subscription Event"
+# One provider transaction can be delivered repeatedly as its status advances.
+# Confirmed is the highest financial state; failures may still advance to it if
+# the provider later succeeds, while delayed preliminary states never downgrade
+# a terminal observation.
+SUBSCRIPTION_INSTALLMENT_STATUS_STAGE = {
+	"waiting": 10,
+	"authorized": 20,
+	"reserved": 20,
+	"uncaptured": 30,
+	"cancelled": 30,
+	"declined": 30,
+	"error": 30,
+	"expired": 30,
+	"confirmed": 40,
+}
+SUBSCRIPTION_INSTALLMENT_STATUSES = frozenset(SUBSCRIPTION_INSTALLMENT_STATUS_STAGE)
+SUBSCRIPTION_REVERSAL_STATUS_STAGE = {
+	"refund_pending": 10,
+	"refunded": 20,
+	"partially-refunded": 20,
+	"disputed": 20,
+	"chargeback": 20,
+}
+TRANSACTION_RECONCILIATION_INITIAL_LOOKBACK = timedelta(days=7)
+TRANSACTION_RECONCILIATION_OVERLAP = timedelta(hours=6)
+TRANSACTION_RECONCILIATION_MAX_WINDOW = timedelta(days=7)
+TRANSACTION_RECONCILIATION_PAGE_SIZE = 100
+TRANSACTION_RECONCILIATION_MAX_PAGES = 100
 GATEWAY_RECOVERY_LOG_MARKER = "[Payrexx Gateway recovery]"
 GATEWAY_ORPHAN_LOG_MARKER = "[Payrexx possible orphan Gateway]"
 PAYREXX_SUCCESS_TOKEN_VERSION_KEY = "payrexx_success_token_version"
@@ -52,6 +96,10 @@ _MAX_WEBSHOP_URL_LENGTH = 1000
 # not an error: tolerated by this controller and declared to the client so it
 # writes no Error Log row either.
 QR_DELETE_TOLERATED_STATUSES = (404,)
+
+
+class SubscriptionEventDispatchError(RuntimeError):
+	"""An installment provider failed after the webhook was authenticated."""
 
 
 def _get_current_locked_doc(doctype: str, name: str) -> Document:
@@ -330,6 +378,17 @@ class PayrexxSettings(Document):
 			for i, pid in enumerate(p.strip() for p in self.psp.split(",") if p.strip()):
 				payload[f"psp[{i}]"] = int(pid)
 
+		if kwargs.get("subscription_state"):
+			if not cint(self.get("enable_managed_subscriptions")):
+				frappe.throw(
+					_(
+						"Managed subscriptions are disabled for Payrexx gateway {0}. "
+						"Enable them only after signed sandbox verification."
+					).format(self.name),
+					frappe.ValidationError,
+				)
+			payload.update(_subscription_gateway_payload(kwargs))
+
 		# Static-QR TWINT handoff: both values arrive as guest-controlled query
 		# parameters appended by the TWINT app, so invalid values are dropped
 		# silently — the checkout still works as a plain hosted page.
@@ -426,6 +485,37 @@ def _validate_created_gateway(gateway: dict) -> dict:
 	if not isinstance(gateway, dict) or any(not gateway.get(field) for field in ("id", "hash", "link")):
 		raise ValueError("Payrexx returned incomplete Gateway metadata")
 	return gateway
+
+
+def _subscription_gateway_payload(kwargs: dict) -> dict:
+	"""Turn a checkout into a subscription signup.
+
+	Unlike the QR handoff below, an invalid value here is never dropped
+	silently: a subscription created on the wrong interval bills the payer
+	wrongly for as long as it runs, so a bad interval must fail the checkout
+	rather than quietly become a one-off payment or a different cadence.
+
+	``subscriptionPeriod`` and ``subscriptionCancellationInterval`` are sent
+	only when supplied. There is no default: the values Payrexx accepts for an
+	open-ended subscription are the least documented part of this contract, and
+	guessing one here would be indistinguishable from a deliberate choice.
+	"""
+	try:
+		payload = {
+			"subscriptionState": True,
+			"subscriptionInterval": validate_subscription_interval(
+				kwargs.get("subscription_interval"), "subscription_interval"
+			),
+		}
+		for key, provider_key in (
+			("subscription_period", "subscriptionPeriod"),
+			("subscription_cancellation_interval", "subscriptionCancellationInterval"),
+		):
+			if kwargs.get(key):
+				payload[provider_key] = validate_subscription_interval(kwargs.get(key), key)
+	except ValueError as exc:
+		frappe.throw(cstr(exc), frappe.ValidationError)
+	return payload
 
 
 def _sanitize_qr_session_value(value) -> str | None:
@@ -544,7 +634,7 @@ def get_webhook_url(gateway_name: str | None = None) -> str:
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])  # nosemgrep: guest-whitelisted-method
-def callback(gateway_name: str | None = None) -> dict[str, bool]:
+def callback(gateway_name: str | None = None) -> dict[str, bool | str]:
 	"""
 	Configure the following URL in Payrexx -> Webhooks for each gateway:
 
@@ -554,6 +644,10 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 	The gateway_name query param is required when more than one Payrexx Settings
 	row exists, so we know which signing key to verify against.
 	"""
+	settings = None
+	txn = {}
+	ref_id = ""
+	status = ""
 	try:
 		raw_body = frappe.request.get_data() or b""
 		signature = frappe.get_request_header("X-Webhook-Signature", "")
@@ -562,13 +656,37 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 		if not verify_webhook_signature(raw_body, signature, settings.get_password("webhook_signing_key")):
 			frappe.throw(_("Invalid Payrexx webhook signature"), frappe.AuthenticationError)
 
+		# Checked only after the body is authenticated, so an unverified request
+		# learns nothing about how we parse it.
+		_reject_non_json_webhook_body()
+
 		body = frappe.parse_json(raw_body.decode("utf-8") if raw_body else "{}") or {}
-		txn = body.get("transaction") or {}
-		invoice = txn.get("invoice") or {}
-		ref_id = invoice.get("referenceId") or txn.get("referenceId")
-		status = (txn.get("status") or "").lower()
+
+		# A subscription lifecycle delivery carries no transaction and settles no
+		# money; it reports what happened to the instruction.
+		if webhook_payload.is_subscription_event(body):
+			return _process_callback_subscription(settings.name, webhook_payload.subscription_of(body))
+
+		txn = webhook_payload.transaction_of(body)
+		if not txn:
+			frappe.throw(
+				_(
+					"Payrexx delivered an unsupported JSON webhook shape. Expected a transaction "
+					"envelope or a subscription lifecycle object."
+				),
+				frappe.ValidationError,
+			)
+		ref_id = webhook_payload.reference_id(txn)
+		status = webhook_payload.transaction_status(txn)
 
 		if not ref_id:
+			# A recurring transaction can still be correlated by its provider
+			# subscription id. Do not acknowledge a financial event merely because
+			# its optional reference is absent.
+			if webhook_payload.embedded_subscription(txn):
+				return _run_with_deadlock_retry(
+					lambda: _process_callback_transaction(settings.name, txn, "", status)
+				)
 			frappe.log_error(
 				title="Payrexx webhook missing referenceId",
 				message=frappe.as_json(_webhook_log_summary(txn, ref_id, status)),
@@ -578,6 +696,22 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 		return _run_with_deadlock_retry(
 			lambda: _process_callback_transaction(settings.name, txn, ref_id, status)
 		)
+	except SubscriptionEventDispatchError:
+		# The provider may have written documents or registered callbacks before it
+		# failed. Roll back the complete webhook transaction first, then retain only
+		# a sanitized, locally replayable Unclaimed event in the fresh transaction.
+		frappe.db.rollback()
+		with as_automation_user(settings):
+			_persist_unclaimed_subscription_event(settings.name, txn, ref_id, status)
+		frappe.local.response["http_status_code"] = 503
+		frappe.log_error(
+			title="Payrexx subscription charge provider failed",
+			message=frappe.as_json(
+				_subscription_log_summary(webhook_payload.embedded_subscription(txn))
+				| {"reference": ref_id or None}
+			),
+		)
+		return {"ok": False, "error": "subscription_event_unclaimed"}
 	except frappe.AuthenticationError:
 		raise
 	except Exception:
@@ -585,21 +719,95 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 		raise
 
 
+def _reject_non_json_webhook_body() -> None:
+	"""Fail a form-encoded delivery with the setting that produced it.
+
+	A Payrexx webhook can be configured to deliver "Normal (PHP-Post)" form
+	encoding instead of JSON. That body is not JSON and never will be, so it is
+	worth naming the merchant-account setting rather than letting it surface as
+	a parse error against an authentic, correctly-signed request.
+	"""
+	# Read from the request object the raw body came from, not the header
+	# helper, so body and content type can never describe different requests.
+	content_type = cstr(getattr(getattr(frappe, "request", None), "content_type", "")).lower()
+	if content_type and "json" not in content_type:
+		frappe.throw(
+			_(
+				"Payrexx delivered this webhook as {0}. Set the webhook's content type to JSON "
+				"in the Payrexx merchant account (Webhooks -> edit -> content type)."
+			).format(content_type.split(";")[0]),
+			frappe.ValidationError,
+		)
+
+
+def _process_callback_subscription(settings_name: str, subscription: dict) -> dict[str, bool]:
+	"""Report a subscription lifecycle change to whoever owns the instruction.
+
+	This app has no concept of a recurring donation or a membership, so it does
+	not interpret the status — it hands the event to the owning app and records
+	nothing of its own. No money moves on these deliveries.
+	"""
+	if (
+		not webhook_payload.subscription_id(subscription)
+		or webhook_payload.subscription_status(subscription) not in webhook_payload.SUBSCRIPTION_STATUSES
+	):
+		frappe.throw(
+			_("The Payrexx subscription lifecycle payload is missing a supported id or status."),
+			frappe.ValidationError,
+		)
+	with as_automation_user(settings_name):
+		if not _dispatch_subscription_event("status", subscription=subscription, settings_name=settings_name):
+			frappe.log_error(
+				title="Payrexx subscription event unclaimed",
+				message=frappe.as_json(_subscription_log_summary(subscription)),
+			)
+	_enqueue_subscription_transaction_reconciliation(settings_name, subscription)
+	return {"ok": True}
+
+
 def _process_callback_transaction(
 	settings_name: str,
 	transaction: dict,
 	reference_id: str,
 	status: str,
-) -> dict[str, bool]:
+) -> dict[str, bool | str]:
 	"""Apply one authenticated callback attempt; deadlocks propagate to the public boundary."""
-	if not frappe.db.exists("Integration Request", reference_id):
+	subscription = webhook_payload.embedded_subscription(transaction)
+	if reference_id:
+		try:
+			# Classification of a recurring charge must use the same current row read
+			# that owns the callback mutation. A preliminary scalar read can retain a
+			# stale REPEATABLE READ snapshot and discard an installment that raced the
+			# signup settlement.
+			ir = _get_current_locked_doc("Integration Request", reference_id)
+		except frappe.DoesNotExistError:
+			ir = None
+	else:
+		ir = None
+	if not ir:
+		if subscription:
+			if status in POST_SETTLEMENT_STATUSES:
+				return _process_subscription_reversal(
+					settings_name,
+					transaction,
+					subscription,
+					reference_id,
+					status,
+				)
+			return _process_subscription_charge(
+				settings_name,
+				transaction,
+				subscription,
+				reference_id,
+				status,
+				integration_request=None,
+			)
 		frappe.log_error(
 			title="Payrexx webhook unknown reference",
 			message=frappe.as_json(_webhook_log_summary(transaction, reference_id, status)),
 		)
 		return {"ok": True}
 
-	ir = _get_current_locked_doc("Integration Request", reference_id)
 	if ir.integration_request_service != "Payrexx":
 		frappe.log_error(
 			title="Payrexx webhook wrong Integration Request service",
@@ -622,6 +830,33 @@ def _process_callback_transaction(
 			),
 		)
 		return {"ok": True}
+	if (
+		subscription
+		and status in POST_SETTLEMENT_STATUSES
+		and not _subscription_reversal_targets_signup(ir_data, transaction, status)
+	):
+		return _process_subscription_reversal(
+			settings_name,
+			transaction,
+			subscription,
+			reference_id,
+			status,
+		)
+
+	# Refunds, disputes, and chargebacks belong to the established reversal
+	# state machine. Sending them through the installment hook first would hide
+	# accounting evidence behind a durable charge claim.
+	if subscription and status not in POST_SETTLEMENT_STATUSES:
+		handled = _process_subscription_charge(
+			settings_name,
+			transaction,
+			subscription,
+			reference_id,
+			status,
+			integration_request=ir,
+		)
+		if handled is not None:
+			return handled
 	# Chargeback evidence is terminal. Only an authentic duplicate chargeback
 	# may re-enter its idempotent ToDo repair path.
 	if _is_chargeback_recorded(ir, ir_data):
@@ -636,9 +871,11 @@ def _process_callback_transaction(
 			_mark_locked_chargeback(ir.name, transaction, settings_name=settings_name)
 		return {"ok": True}
 
-	# Confirmation is terminal except for a later chargeback. Ignore delayed
-	# provider states without replacing the confirmed transaction evidence.
-	if ir.status == "Completed" and status != "chargeback":
+	# Confirmation is terminal except for what happens to the money afterwards:
+	# a chargeback, a dispute, or a refund Payrexx issued from its own dashboard.
+	# Every other delayed or replayed state is ignored without replacing the
+	# confirmed transaction evidence.
+	if ir.status == "Completed" and status not in POST_SETTLEMENT_STATUSES:
 		return {"ok": True}
 
 	if status == "confirmed" and not expected_settings and _multiple_gateways_configured():
@@ -660,6 +897,8 @@ def _process_callback_transaction(
 			ir.save(ignore_permissions=True)
 		elif status == "chargeback":
 			_mark_locked_chargeback(ir.name, transaction, settings_name=settings_name)
+		elif status in REFUND_STATUSES or status == "disputed":
+			_record_reversal_evidence(ir, ir_data, transaction, status, settings_name=settings_name)
 		elif status in ("cancelled", "declined", "error", "expired"):
 			ir_data["payrexx_transaction"] = transaction
 			ir.data = frappe.as_json(ir_data)
@@ -802,11 +1041,18 @@ def _confirmed_transaction_from_gateway(gateway: dict, expected_reference: str) 
 			amount = transaction.get("amount")
 			if amount is None:
 				amount = invoice.get("amount", gateway.get("amount"))
+			transaction_invoice = transaction.get("invoice") or {}
+			invoice_evidence = {
+				key: transaction_invoice[key] if key in transaction_invoice else invoice.get(key)
+				for key in ("referenceId", "currency", "test")
+				if key in transaction_invoice or key in invoice
+			}
 			return {
 				**transaction,
 				"referenceId": provider_reference,
 				"amount": amount,
 				"currency": transaction.get("currency") or invoice.get("currency") or gateway.get("currency"),
+				"invoice": invoice_evidence,
 			}
 	return {}
 
@@ -1027,7 +1273,41 @@ def _conflict(code: str, reason: str, evidence: dict | None = None) -> dict:
 	return {"code": code, "reason": reason, "evidence": evidence or {}}
 
 
+def _transaction_is_test(transaction: dict) -> bool:
+	"""Whether Payrexx marks this as a simulated payment.
+
+	``mode`` is the authoritative marker (``LIVE`` / ``TEST``); ``invoice.test``
+	carries the same fact as 1/0. When neither field is present we cannot tell,
+	and answering "not a test" keeps accounts that omit them settling exactly as
+	they did before.
+	"""
+	mode = cstr(transaction.get("mode")).strip().upper()
+	if mode:
+		return mode != "LIVE"
+	return cint((transaction.get("invoice") or {}).get("test")) == 1
+
+
+def _gateway_allows_test_transactions(ir_data: dict) -> bool:
+	settings_name = ir_data.get("payrexx_settings") or _settings_name_from_request_data(ir_data)
+	if not settings_name:
+		return False
+	return bool(frappe.db.get_value("Payrexx Settings", settings_name, "allow_test_transactions"))
+
+
 def _settlement_conflict(integration_request, ir_data: dict, transaction: dict) -> dict | None:
+	# A simulated payment moves no money. It is signed with the same key as a
+	# real one and matches every amount/currency/company check below, so without
+	# this gate a TEST transaction settles a real document.
+	if _transaction_is_test(transaction) and not _gateway_allows_test_transactions(ir_data):
+		return _conflict(
+			"test_transaction",
+			_("The provider confirmation is a TEST payment and this gateway settles live payments only."),
+			{
+				"mode": cstr(transaction.get("mode")).strip() or None,
+				"invoice_test": (transaction.get("invoice") or {}).get("test"),
+			},
+		)
+
 	provider_amount = transaction.get("amount")
 	provider_currency = transaction.get("currency")
 	provider_invoice = transaction.get("invoice") or {}
@@ -1308,6 +1588,852 @@ def _mark_locked_chargeback(
 		),
 		settings_name=settings_name,
 	)
+
+
+def _subscription_reversal_targets_signup(ir_data: dict, transaction: dict, status: str) -> bool:
+	settled = ir_data.get("payrexx_transaction") or {}
+	if not settled:
+		return False
+	original_transaction = _reversed_transaction_key(transaction, status)
+	return bool(original_transaction and original_transaction == _provider_event_key(settled))
+
+
+def _reversed_transaction_key(transaction: dict, status: str) -> str:
+	original = cstr(
+		transaction.get("originalTransactionUuid") or transaction.get("originalTransactionId")
+	).strip()
+	if original:
+		return original
+	if status in ("chargeback", "disputed"):
+		return cstr(transaction.get("uuid") or transaction.get("id")).strip()
+	return ""
+
+
+def _process_subscription_reversal(
+	settings_name: str,
+	transaction: dict,
+	subscription: dict,
+	reference_id: str,
+	status: str,
+) -> dict[str, bool | str]:
+	"""Dispatch a later-installment reversal without mutating its signup request."""
+	if status not in SUBSCRIPTION_REVERSAL_STATUS_STAGE:
+		frappe.throw(
+			_("Unsupported Payrexx subscription reversal status: {0}").format(status or _("blank")),
+			frappe.ValidationError,
+		)
+	with as_automation_user(settings_name):
+		if not webhook_payload.is_live(transaction) and not _gateway_allows_test_transactions(
+			{"payrexx_settings": settings_name}
+		):
+			frappe.log_error(
+				title="Payrexx subscription reversal ignored (TEST mode)",
+				message=frappe.as_json(_subscription_log_summary(subscription) | {"reference": reference_id}),
+			)
+			return {"ok": True}
+
+		event = _prepare_subscription_reversal_event(
+			settings_name, subscription, transaction, reference_id, status
+		)
+		if not event:
+			return {"ok": True}
+		try:
+			claimed = _dispatch_subscription_event(
+				"reversal",
+				subscription=subscription,
+				transaction=transaction,
+				reference_id=reference_id,
+				status=status,
+				settings_name=settings_name,
+			)
+		except frappe.QueryDeadlockError:
+			raise
+		except Exception:
+			frappe.logger("payrexx_integration").exception("Payrexx subscription reversal provider failed")
+			raise SubscriptionEventDispatchError from None
+		event.db_set(
+			{
+				"dispatch_status": "Claimed" if claimed else "Unclaimed",
+				"processed_on": now_datetime(),
+			}
+		)
+		if not claimed:
+			frappe.log_error(
+				title="Payrexx subscription reversal unclaimed",
+				message=frappe.as_json(_subscription_log_summary(subscription) | {"reference": reference_id}),
+			)
+			if getattr(frappe.local, "request", None):
+				frappe.local.response["http_status_code"] = 503
+			return {"ok": False, "error": "subscription_event_unclaimed"}
+	return {"ok": True}
+
+
+def _process_subscription_charge(
+	settings_name: str,
+	transaction: dict,
+	subscription: dict,
+	reference_id: str,
+	status: str,
+	*,
+	integration_request: Document | None,
+) -> dict[str, bool | str] | None:
+	"""Decide whether a subscription charge is the signup or a later installment.
+
+	Payrexx echoes the same ``referenceId`` on every charge, because it was set
+	once when the Gateway was created. So a monthly donor's twelfth payment
+	arrives pointing at the Integration Request that settled their first one.
+	Without this split, that request's own terminality would silently discard
+	eleven real payments.
+
+	The rule is the request's state, not the reference:
+
+	* no request, or a Completed one — a later installment. The owning app
+	  records it; this app settles nothing, because the checkout it was created
+	  for is long finished.
+	* any other state — the signup charge itself. Returns ``None`` so the
+	  ordinary settlement path runs untouched, including every terminal guard.
+
+	Returning ``None`` is what keeps one-off behaviour and first-charge
+	behaviour identical: there is no second settlement implementation.
+	"""
+	if integration_request and integration_request.status != "Completed":
+		return None
+	if status not in SUBSCRIPTION_INSTALLMENT_STATUSES:
+		frappe.throw(
+			_("Unsupported Payrexx subscription transaction status: {0}").format(status or _("blank")),
+			frappe.ValidationError,
+		)
+
+	# Guard the boundary between the two: a replay of the signup charge, after
+	# that charge settled, must not be recorded a second time as an installment.
+	if integration_request:
+		settled = (frappe.parse_json(integration_request.data) or {}).get("payrexx_transaction") or {}
+		if settled and _provider_event_key(settled) == _provider_event_key(transaction):
+			return {"ok": True}
+
+	with as_automation_user(settings_name):
+		if not webhook_payload.is_live(transaction) and not _gateway_allows_test_transactions(
+			{"payrexx_settings": settings_name}
+		):
+			frappe.log_error(
+				title="Payrexx subscription charge ignored (TEST mode)",
+				message=frappe.as_json(_subscription_log_summary(subscription) | {"reference": reference_id}),
+			)
+			return {"ok": True}
+
+		event = _prepare_subscription_installment_event(
+			settings_name, subscription, transaction, reference_id, status
+		)
+		if not event:
+			return {"ok": True}
+
+		try:
+			claimed = _dispatch_subscription_event(
+				"charge",
+				subscription=subscription,
+				transaction=transaction,
+				reference_id=reference_id,
+				status=status,
+				settings_name=settings_name,
+			)
+		except frappe.QueryDeadlockError:
+			raise
+		except Exception:
+			frappe.logger("payrexx_integration").exception("Payrexx subscription charge provider failed")
+			raise SubscriptionEventDispatchError from None
+		event.db_set(
+			{
+				"dispatch_status": "Claimed" if claimed else "Unclaimed",
+				"processed_on": now_datetime(),
+			}
+		)
+		if not claimed:
+			frappe.log_error(
+				title="Payrexx subscription charge unclaimed",
+				message=frappe.as_json(_subscription_log_summary(subscription) | {"reference": reference_id}),
+			)
+			# Persist the Unclaimed state but return a retryable HTTP response. Raising
+			# here would roll the durable row back with the request and remove the
+			# operator-visible redrive state we just recorded.
+			if getattr(frappe.local, "request", None):
+				frappe.local.response["http_status_code"] = 503
+			return {"ok": False, "error": "subscription_event_unclaimed"}
+	return {"ok": True}
+
+
+def _prepare_subscription_installment_event(
+	settings_name: str,
+	subscription: dict,
+	transaction: dict,
+	reference_id: str,
+	status: str,
+) -> Document | None:
+	"""Lock or insert the monotonic durable state for one recurring transaction.
+
+	A claimed replay of the same status is terminal. A later provider status may
+	advance the row, and any Unclaimed/Processing status is retryable. The row and
+	provider effects remain in one transaction.
+	"""
+	return _prepare_subscription_financial_event(
+		settings_name,
+		subscription,
+		transaction,
+		reference_id,
+		status,
+		event_type="Installment",
+		event_key_type="charge",
+		status_stages=SUBSCRIPTION_INSTALLMENT_STATUS_STAGE,
+	)
+
+
+def _prepare_subscription_reversal_event(
+	settings_name: str,
+	subscription: dict,
+	transaction: dict,
+	reference_id: str,
+	status: str,
+) -> Document | None:
+	return _prepare_subscription_financial_event(
+		settings_name,
+		subscription,
+		transaction,
+		reference_id,
+		status,
+		event_type="Reversal",
+		event_key_type="reversal",
+		status_stages=SUBSCRIPTION_REVERSAL_STATUS_STAGE,
+	)
+
+
+def _prepare_subscription_financial_event(
+	settings_name: str,
+	subscription: dict,
+	transaction: dict,
+	reference_id: str,
+	status: str,
+	*,
+	event_type: str,
+	event_key_type: str,
+	status_stages: dict[str, int],
+) -> Document | None:
+	provider_event_id = _provider_event_key(transaction)
+	event_key = hashlib.sha256(
+		f"{settings_name}\x00{event_key_type}\x00{provider_event_id}".encode()
+	).hexdigest()
+	redrive_payload = frappe.as_json(_subscription_redrive_payload(subscription, transaction))
+	try:
+		event = _get_current_locked_doc(SUBSCRIPTION_EVENT_DOCTYPE, event_key)
+	except frappe.DoesNotExistError:
+		event = None
+	if event:
+		if not _subscription_event_status_advances(event, status, status_stages):
+			return None
+		event.db_set(
+			{
+				"provider_status": status,
+				"dispatch_status": "Processing",
+				"processed_on": None,
+				"redrive_payload": redrive_payload,
+			}
+		)
+		return event
+	try:
+		return frappe.get_doc(
+			{
+				"doctype": SUBSCRIPTION_EVENT_DOCTYPE,
+				"event_key": event_key,
+				"event_type": event_type,
+				"payrexx_settings": settings_name,
+				"subscription_id": webhook_payload.subscription_id(subscription),
+				"reference_id": reference_id,
+				"provider_event_id": provider_event_id,
+				"provider_status": status,
+				"dispatch_status": "Processing",
+				"redrive_payload": redrive_payload,
+			}
+		).insert(ignore_permissions=True)
+	except frappe.DuplicateEntryError:
+		# A concurrent callback won the insert. Re-read its committed current state:
+		# a Claimed same-status winner is terminal, while an Unclaimed winner must
+		# not let this request answer 200 and stop provider retries.
+		event = _get_current_locked_doc(SUBSCRIPTION_EVENT_DOCTYPE, event_key)
+		if not _subscription_event_status_advances(event, status, status_stages):
+			return None
+		event.db_set(
+			{
+				"provider_status": status,
+				"dispatch_status": "Processing",
+				"processed_on": None,
+				"redrive_payload": redrive_payload,
+			}
+		)
+		return event
+
+
+def _subscription_installment_status_advances(event: Document, status: str) -> bool:
+	return _subscription_event_status_advances(event, status, SUBSCRIPTION_INSTALLMENT_STATUS_STAGE)
+
+
+def _subscription_event_status_advances(
+	event: Document,
+	status: str,
+	status_stages: dict[str, int],
+) -> bool:
+	previous = cstr(event.get("provider_status")).strip().lower()
+	if not previous:
+		return True
+	if previous == status:
+		return event.get("dispatch_status") != "Claimed"
+	if event.get("event_type") == "Reversal" and previous != "refund_pending":
+		return False
+	return status_stages[status] >= status_stages.get(previous, -1)
+
+
+def _subscription_redrive_payload(subscription: dict, transaction: dict) -> dict:
+	"""Persist only the non-PII financial evidence an owning hook needs to retry."""
+	invoice = transaction.get("invoice") or {}
+	return {
+		"subscription": {
+			"id": webhook_payload.subscription_id(subscription),
+			"status": webhook_payload.subscription_status(subscription),
+			"valid_until": webhook_payload.subscription_next_payment(subscription),
+			"paymentInterval": webhook_payload.subscription_interval(subscription),
+		},
+		"transaction": {
+			"uuid": transaction.get("uuid"),
+			"id": transaction.get("id"),
+			"status": webhook_payload.transaction_status(transaction),
+			"mode": transaction.get("mode"),
+			"time": transaction.get("time"),
+			"amount": transaction.get("amount"),
+			"currency": transaction.get("currency"),
+			"originalTransactionId": transaction.get("originalTransactionId"),
+			"originalTransactionUuid": transaction.get("originalTransactionUuid"),
+			"invoice": {
+				"referenceId": invoice.get("referenceId"),
+				"currency": invoice.get("currency"),
+				"test": invoice.get("test"),
+			},
+		},
+	}
+
+
+def _persist_unclaimed_subscription_event(
+	settings_name: str,
+	transaction: dict,
+	reference_id: str,
+	status: str,
+) -> None:
+	subscription = webhook_payload.embedded_subscription(transaction)
+	prepare_event = (
+		_prepare_subscription_reversal_event
+		if status in SUBSCRIPTION_REVERSAL_STATUS_STAGE
+		else _prepare_subscription_installment_event
+	)
+	event = prepare_event(settings_name, subscription, transaction, reference_id, status)
+	if event:
+		event.db_set({"dispatch_status": "Unclaimed", "processed_on": now_datetime()})
+
+
+def _redrive_unclaimed_subscription_events(
+	settings: Document,
+	*,
+	commit_each: bool = False,
+) -> dict[str, int]:
+	"""Replay locally retained financial events before status reconciliation."""
+	event_names = frappe.get_all(
+		SUBSCRIPTION_EVENT_DOCTYPE,
+		filters={"payrexx_settings": settings.name, "dispatch_status": "Unclaimed"},
+		pluck="name",
+		order_by="creation asc",
+	)
+	retried = claimed = failed = 0
+	for event_name in event_names:
+		retried += 1
+		savepoint = f"payrexx_subscription_redrive_{retried}"
+		if not commit_each:
+			frappe.db.savepoint(savepoint)
+		try:
+			was_claimed = _redrive_subscription_event(event_name, settings.name)
+		except frappe.QueryDeadlockError:
+			raise
+		except frappe.QueryTimeoutError:
+			raise
+		except Exception:
+			failed += 1
+			if commit_each:
+				frappe.db.rollback()
+			else:
+				frappe.db.rollback(save_point=savepoint)
+			frappe.log_error(
+				title="Payrexx subscription event redrive failed",
+				message=frappe.as_json({"event": event_name, "gateway": settings.name}),
+			)
+			if commit_each:
+				frappe.db.commit()  # nosemgrep: frappe-manual-commit
+			continue
+		else:
+			if was_claimed:
+				claimed += 1
+			if commit_each:
+				frappe.db.commit()  # nosemgrep: frappe-manual-commit
+			else:
+				frappe.db.release_savepoint(savepoint)
+	return {"retried": retried, "claimed": claimed, "failed": failed}
+
+
+def _redrive_subscription_event(event_name: str, settings_name: str) -> bool:
+	event = _get_current_locked_doc(SUBSCRIPTION_EVENT_DOCTYPE, event_name)
+	if event.dispatch_status != "Unclaimed" or event.payrexx_settings != settings_name:
+		return False
+	payload = frappe.parse_json(event.redrive_payload) or {}
+	subscription = payload.get("subscription") or {}
+	transaction = payload.get("transaction") or {}
+	payload_provider_id = cstr(transaction.get("uuid") or transaction.get("id")).strip()
+	if (
+		webhook_payload.subscription_id(subscription) != cstr(event.subscription_id)
+		or (payload_provider_id and payload_provider_id != event.provider_event_id)
+		or webhook_payload.transaction_status(transaction) != event.provider_status
+	):
+		frappe.throw(_("Payrexx subscription event {0} has invalid redrive evidence.").format(event.name))
+
+	event.db_set({"dispatch_status": "Processing", "processed_on": None})
+	dispatch_event = "reversal" if event.event_type == "Reversal" else "charge"
+	claimed = _dispatch_subscription_event(
+		dispatch_event,
+		subscription=subscription,
+		transaction=transaction,
+		reference_id=event.reference_id,
+		status=event.provider_status,
+		settings_name=settings_name,
+	)
+	event.db_set(
+		{
+			"dispatch_status": "Claimed" if claimed else "Unclaimed",
+			"processed_on": now_datetime(),
+		}
+	)
+	return claimed
+
+
+def _enqueue_subscription_transaction_reconciliation(settings_name: str, subscription: dict) -> None:
+	"""Recover the charge behind a lifecycle webhook after this request commits."""
+	subscription_id = webhook_payload.subscription_id(subscription)
+	reference_id = webhook_payload.reference_id(subscription)
+	job_scope = hashlib.sha256(
+		f"{settings_name}\x00{subscription_id}\x00{reference_id}".encode()
+	).hexdigest()[:24]
+	frappe.enqueue(
+		"payrexx_integration.payrexx_integration.doctype.payrexx_settings."
+		"payrexx_settings.reconcile_subscription_transactions",
+		queue="long",
+		timeout=900,
+		job_id=f"payrexx-subscription-transactions:{job_scope}",
+		deduplicate=True,
+		enqueue_after_commit=True,
+		gateway_name=settings_name,
+		subscription_id=subscription_id,
+		reference_id=reference_id,
+	)
+
+
+def reconcile_subscription_transactions(
+	gateway_name: str,
+	subscription_id: str,
+	reference_id: str = "",
+) -> dict[str, int]:
+	"""Recover recent transactions for one lifecycle webhook without inline provider I/O."""
+	settings = _resolve_settings(gateway_name)
+	window_end = _utc_now()
+	window_start = window_end - TRANSACTION_RECONCILIATION_INITIAL_LOOKBACK
+	with as_automation_user(settings):
+		return _reconcile_settings_transactions(
+			settings,
+			window_start=window_start,
+			window_end=window_end,
+			subscription_id=subscription_id,
+			reference_id=reference_id,
+			commit_each=not frappe.flags.in_test,
+		)
+
+
+def _reconcile_settings_transactions_with_cursor(
+	settings: Document,
+	*,
+	commit_each: bool,
+) -> dict[str, int]:
+	now_utc = _utc_now()
+	cursor = _utc_datetime(settings.get("transaction_reconciliation_cursor"))
+	if cursor and cursor <= now_utc:
+		window_start = cursor - TRANSACTION_RECONCILIATION_OVERLAP
+		window_end = min(now_utc, cursor + TRANSACTION_RECONCILIATION_MAX_WINDOW)
+	else:
+		window_end = now_utc
+		window_start = window_end - TRANSACTION_RECONCILIATION_INITIAL_LOOKBACK
+
+	result = _reconcile_settings_transactions(
+		settings,
+		window_start=window_start,
+		window_end=window_end,
+		commit_each=commit_each,
+	)
+	if not result["failed"]:
+		settings.db_set("transaction_reconciliation_cursor", window_end, update_modified=False)
+		if commit_each:
+			frappe.db.commit()  # nosemgrep: frappe-manual-commit
+	return result
+
+
+def _reconcile_settings_transactions(
+	settings: Document,
+	*,
+	window_start,
+	window_end,
+	subscription_id: str = "",
+	reference_id: str = "",
+	commit_each: bool = False,
+) -> dict[str, int]:
+	"""Page through real provider transactions and replay only subscription money."""
+	client = settings._client()
+	target_subscription = cstr(subscription_id).strip()
+	target_reference = cstr(reference_id).strip()
+	seen = processed = failed = 0
+	offset = 0
+	for page_number in range(1, TRANSACTION_RECONCILIATION_MAX_PAGES + 1):
+		page = client.list_transactions(
+			datetime_utc_greater_than=_utc_query_value(window_start),
+			datetime_utc_less_than=_utc_query_value(window_end),
+			my_transactions_only=True,
+			order_by_time="ASC",
+			offset=offset,
+			limit=TRANSACTION_RECONCILIATION_PAGE_SIZE,
+		)
+		if not page:
+			break
+		for transaction in page:
+			if not isinstance(transaction, dict):
+				continue
+			subscription = webhook_payload.embedded_subscription(transaction)
+			if not subscription:
+				continue
+			transaction_subscription = webhook_payload.subscription_id(subscription)
+			transaction_reference = webhook_payload.reference_id(transaction)
+			if target_subscription and transaction_subscription != target_subscription:
+				continue
+			if target_reference and transaction_reference != target_reference:
+				continue
+
+			seen += 1
+			savepoint = f"payrexx_transaction_reconciliation_{seen}"
+			if not commit_each:
+				frappe.db.savepoint(savepoint)
+			try:
+				result = _process_callback_transaction(
+					settings.name,
+					transaction,
+					transaction_reference,
+					webhook_payload.transaction_status(transaction),
+				)
+			except (frappe.QueryDeadlockError, frappe.QueryTimeoutError):  # fmt: skip
+				raise
+			except Exception:
+				failed += 1
+				if commit_each:
+					frappe.db.rollback()
+				else:
+					frappe.db.rollback(save_point=savepoint)
+				frappe.log_error(
+					title="Payrexx transaction reconciliation event failed",
+					message=frappe.as_json(
+						_webhook_log_summary(
+							transaction,
+							transaction_reference,
+							webhook_payload.transaction_status(transaction),
+						)
+						| {"gateway": settings.name}
+					),
+				)
+			else:
+				if result.get("ok") is True:
+					processed += 1
+				else:
+					failed += 1
+				if not commit_each:
+					frappe.db.release_savepoint(savepoint)
+			if commit_each:
+				frappe.db.commit()  # nosemgrep: frappe-manual-commit
+
+		if len(page) < TRANSACTION_RECONCILIATION_PAGE_SIZE:
+			break
+		if page_number == TRANSACTION_RECONCILIATION_MAX_PAGES:
+			frappe.throw(
+				_("Payrexx transaction reconciliation exceeded its bounded page limit."),
+				frappe.ValidationError,
+			)
+		offset += TRANSACTION_RECONCILIATION_PAGE_SIZE
+	return {"seen": seen, "processed": processed, "failed": failed}
+
+
+def _utc_now() -> datetime:
+	return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _utc_datetime(value) -> datetime | None:
+	if not value:
+		return None
+	parsed = get_datetime(value)
+	if parsed.tzinfo:
+		return parsed.astimezone(UTC).replace(tzinfo=None)
+	return parsed
+
+
+def _utc_query_value(value) -> str:
+	parsed = _utc_datetime(value)
+	if not parsed:
+		raise ValueError("A UTC transaction reconciliation boundary is required")
+	return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def enqueue_subscription_reconciliation() -> dict[str, int]:
+	"""Queue one deduplicated reconciliation worker per Payrexx Settings row."""
+	settings_names = frappe.get_all("Payrexx Settings", pluck="name", order_by="name asc")
+	for settings_name in settings_names:
+		frappe.enqueue(
+			"payrexx_integration.payrexx_integration.doctype.payrexx_settings."
+			"payrexx_settings.reconcile_subscriptions",
+			queue="long",
+			timeout=3600,
+			job_id=f"payrexx-subscription-reconciliation:{settings_name}",
+			deduplicate=True,
+			gateway_name=settings_name,
+		)
+	return {"gateways": len(settings_names)}
+
+
+def reconcile_subscriptions(gateway_name: str) -> dict[str, int]:
+	"""Recover one gateway's transactions and replay current subscription state.
+
+	Webhook delivery is not a guarantee. A subscription that silently stops —
+	because a delivery was lost while our site was down past Payrexx's retry
+	window — is invisible revenue loss, so the provider is asked directly rather
+	than trusted to have told us.
+
+	The transaction pass processes authenticated provider records, while the
+	subscription list remains a status-only reporting pass.
+	"""
+	settings = _resolve_settings(gateway_name)
+	commit_each = not frappe.flags.in_test
+	with as_automation_user(settings):
+		_redrive_unclaimed_subscription_events(settings, commit_each=commit_each)
+		_reconcile_settings_transactions_with_cursor(settings, commit_each=commit_each)
+		return _reconcile_settings_subscriptions(
+			settings,
+			commit_each=commit_each,
+			redrive_unclaimed=False,
+		)
+
+
+def _reconcile_settings_subscriptions(
+	settings: Document,
+	*,
+	commit_each: bool = False,
+	redrive_unclaimed: bool = True,
+) -> dict[str, int]:
+	"""Replay the current subscription state for one explicitly owned gateway."""
+	# Payrexx rate-limits at the edge (600 / 5 min) and the client backs off, but
+	# the sweep is still the caller most likely to meet it — page rather than
+	# pull the whole instance in one request.
+	with as_automation_user(settings):
+		if redrive_unclaimed:
+			_redrive_unclaimed_subscription_events(settings, commit_each=commit_each)
+		client = settings._client()
+		seen, claimed, failed = 0, 0, 0
+		offset, page_size = 0, 100
+		while True:
+			page = client.list_subscriptions(offset=offset, limit=page_size)
+			if not page:
+				break
+			for subscription in page:
+				seen += 1
+				savepoint = f"payrexx_subscription_reconciliation_{seen}"
+				if not commit_each:
+					frappe.db.savepoint(savepoint)
+				try:
+					was_claimed = _dispatch_subscription_event(
+						"status", subscription=subscription, settings_name=settings.name
+					)
+				except Exception:
+					failed += 1
+					if commit_each:
+						frappe.db.rollback()
+					else:
+						frappe.db.rollback(save_point=savepoint)
+					frappe.log_error(
+						title="Payrexx subscription reconciliation event failed",
+						message=frappe.as_json(
+							_subscription_log_summary(subscription) | {"gateway": settings.name}
+						),
+					)
+					if commit_each:
+						frappe.db.commit()  # nosemgrep: frappe-manual-commit
+					continue
+				else:
+					if was_claimed:
+						claimed += 1
+					if commit_each:
+						frappe.db.commit()  # nosemgrep: frappe-manual-commit
+					else:
+						frappe.db.release_savepoint(savepoint)
+			if len(page) < page_size:
+				break
+			offset += page_size
+
+	if seen and not claimed:
+		# Every subscription unclaimed means the owning app is missing or its
+		# hook is misconfigured — not that nothing changed.
+		frappe.log_error(
+			title="Payrexx subscription reconciliation claimed nothing",
+			message=frappe.as_json({"gateway": settings.name, "subscriptions": seen}),
+		)
+	return {"subscriptions": seen, "claimed": claimed, "failed": failed}
+
+
+def _dispatch_subscription_event(event: str, **context) -> bool:
+	"""Hand a subscription event to the app that owns the instruction."""
+	for provider in frappe.get_hooks(SUBSCRIPTION_EVENT_PROVIDER_HOOK):
+		if frappe.get_attr(provider)(event=event, **context) is True:
+			return True
+	return False
+
+
+def _subscription_log_summary(subscription: dict) -> dict:
+	"""Non-PII evidence only, matching the transaction webhook log contract."""
+	return {
+		"subscription": webhook_payload.subscription_id(subscription),
+		"status": webhook_payload.subscription_status(subscription),
+		"valid_until": webhook_payload.subscription_next_payment(subscription),
+		"interval": webhook_payload.subscription_interval(subscription),
+	}
+
+
+def _provider_event_key(transaction: dict) -> str:
+	"""Stable identity for one provider event, so a replayed delivery is not re-recorded.
+
+	A refund is its own transaction with its own id, which is what makes two
+	genuine partial refunds distinguishable from ten deliveries of one. When the
+	provider sends neither id nor uuid, a digest of the payload keeps replays
+	idempotent — Payrexx retries the same body, so the same body means the same
+	event.
+	"""
+	identifier = cstr(transaction.get("uuid") or transaction.get("id") or "").strip()
+	if identifier:
+		return identifier
+	payload = json.dumps(transaction, sort_keys=True, default=str)
+	return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _record_reversal_evidence(
+	integration_request,
+	ir_data: dict,
+	transaction: dict,
+	status: str,
+	*,
+	settings_name: str | None = None,
+) -> None:
+	"""Record a provider-side refund or dispute as evidence. Posts nothing to the ledger.
+
+	Refunds are issued in the Payrexx dashboard, so ERPNext's job is to show that
+	it happened and put it in front of accounting — not to reverse anything by
+	itself. The entry is appended to its own list and never overwrites
+	``payrexx_transaction``: the original confirmed settlement stays the record
+	of what was collected, and the reversal sits beside it.
+
+	The Integration Request status is deliberately left alone. A refunded payment
+	did settle; rewriting it to Failed would misstate the history that
+	reconciliation reads.
+	"""
+	key = _provider_event_key(transaction)
+	reversals = ir_data.setdefault(REVERSAL_DATA_KEY, [])
+	invoice = transaction.get("invoice") or {}
+	new_values = {
+		"key": key,
+		"status": status,
+		"amount": transaction.get("amount"),
+		"currency": cstr(invoice.get("currency") or transaction.get("currency")).upper() or None,
+		"original_transaction": transaction.get("originalTransactionId")
+		or transaction.get("originalTransactionUuid"),
+		"recorded_at": now_datetime(),
+	}
+	entry = next((item for item in reversals if item.get("key") == key), None)
+	if entry:
+		if entry.get("status") == status:
+			return
+		if entry.get("status") != "refund_pending":
+			return
+		# The provider commonly advances one refund transaction from pending to
+		# its final status. Update that event in place, then raise the notification
+		# exactly once; treating the key as wholly terminal would lose the final
+		# accounting alert.
+		entry.update(new_values)
+	else:
+		entry = new_values
+		reversals.append(entry)
+	with _evidence_recording_user(integration_request, settings_name):
+		integration_request.db_set({"data": frappe.as_json(ir_data)})
+
+	# A pending refund has not moved money yet; there is nothing for accounting
+	# to act on until it lands, and a ToDo now would only be noise.
+	if status == "refund_pending":
+		return
+
+	is_dispute = status == "disputed"
+	marker = f"{DISPUTE_TODO_MARKER if is_dispute else REFUND_TODO_MARKER} {key}"
+	if is_dispute:
+		description = _("Payer disputed this payment. A chargeback may follow; review the settlement.")
+	else:
+		description = _(
+			"Payrexx refunded this payment ({0}). Post the accounting reversal manually — "
+			"no ledger entry was changed."
+		).format(_reversal_amount_label(entry))
+	_ensure_review_todo(integration_request, marker, f"{marker} {description}", settings_name=settings_name)
+	_add_reversal_notice(integration_request, entry, description, settings_name=settings_name)
+
+
+def _reversal_amount_label(entry: dict) -> str:
+	"""Provider amounts are in the currency's smallest unit."""
+	amount = entry.get("amount")
+	if amount is None:
+		return cstr(entry.get("status"))
+	return f"{entry.get('currency') or ''} {flt(amount) / 100:.2f}".strip()
+
+
+def _add_reversal_notice(
+	integration_request,
+	entry: dict,
+	description: str,
+	*,
+	settings_name: str | None = None,
+) -> None:
+	"""Leave the evidence where finance actually looks: on the paid document.
+
+	Extensions own their own reference types (a Donation is not this app's
+	business), so a registered provider handling the reference wins. The standard
+	Payment Request -> Sales Invoice chain is handled here, because this app
+	already understands it.
+	"""
+	with _evidence_recording_user(integration_request, settings_name):
+		for provider in frappe.get_hooks(REFUND_NOTICE_PROVIDER_HOOK):
+			if frappe.get_attr(provider)(integration_request=integration_request, reversal=entry) is True:
+				return
+
+		if integration_request.reference_doctype != "Payment Request":
+			return
+		invoice_name = frappe.db.get_value(
+			"Payment Request", integration_request.reference_docname, "reference_name"
+		)
+		if not invoice_name or not frappe.db.exists("Sales Invoice", invoice_name):
+			return
+		frappe.get_doc("Sales Invoice", invoice_name).add_comment("Comment", description)
 
 
 def _is_chargeback_recorded(integration_request, ir_data: dict | None = None) -> bool:

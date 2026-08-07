@@ -5,11 +5,12 @@ Payrexx Integration adds Payrexx hosted checkout support as a standalone app on 
 ## 1. Create Payrexx Settings
 
 1. Open **Payrexx Settings**.
-2. Set **Gateway Name**, **Instance Name**, **API Base Domain**, **API Version**, and **API Secret**. There is no separate Environment field; use distinct Gateway Names such as `Sandbox` and `Live`.
+2. Set **Gateway Name**, **Instance Name**, **API Base Domain**, and **API Secret**. There is no separate Environment field; use distinct Gateway Names such as `Sandbox` and `Live`. The API version is pinned by the app at `v1.16` and is not editable per gateway.
 3. Select an **Automation User** that is an enabled System User with only the ERPNext permissions needed to create/settle Payment Requests and receive accounting-review ToDos. Configure this independently for every gateway row.
 4. Review **Supported Currencies**, the optional **PSP Whitelist**, **Gateway Validity**, and redirect overrides.
-5. As soon as **Gateway Name** is filled, copy the callback URL shown on the unsaved form and create that webhook in Payrexx.
-6. Paste Payrexx's per-webhook key into the required **Webhook Signing Key** field, then save.
+5. Leave **Allow TEST Transactions** off on every gateway that handles real money. Turn it on only for a sandbox gateway: it lets Payrexx's simulated payments settle documents, which is required for hosted sandbox acceptance and dangerous anywhere else.
+6. As soon as **Gateway Name** is filled, copy the callback URL shown on the unsaved form and create that webhook in Payrexx.
+7. Paste Payrexx's per-webhook key into the required **Webhook Signing Key** field, then save.
 
 The form shows one callback URL as soon as `gateway_name` is filled, even before
 the row can be saved. The URL uses the site's configured public `host_name` when
@@ -82,6 +83,8 @@ POST https://<site>/api/method/payrexx_integration.payrexx_integration.doctype.p
 ```
 
 Use the Payrexx dashboard's webhook signing key as the app's webhook signing key. This is separate from the API secret.
+
+Set the webhook's **content type to JSON**. Payrexx also offers "Normal (PHP-Post)" form encoding, which this app does not decode; a delivery sent that way is rejected with an error naming this setting, so if you see that message the fix is here rather than in the app.
 
 The `gateway_name` query value must be the exact **Payrexx Settings document
 name**, not a generic environment label. For example, a settings row named
@@ -385,9 +388,132 @@ automatically. Repeated chargeback callbacks do not create additional ToDos.
 
 ### Unsupported Provider Operations
 
-This app does not initiate captures of `reserved` transactions, later charges of `authorized` transactions, checkout cancellation/voids, or refunds. It also does not reconcile a `refunded` webhook into ERPNext accounting; an unknown/refunded status is stored on the Integration Request without completing or reversing it. Perform the provider action in Payrexx and post the approved ERPNext reversal manually. Do not infer a refund from a failed/chargeback Integration Request or cancel submitted Payment Entries automatically.
+This app does not initiate captures of `reserved` transactions, later charges of
+`authorized` transactions, checkout cancellation/voids, or refunds. It records
+provider refund/dispute webhooks as evidence and accounting-review work, but
+posts no ERPNext reversal. Perform the provider action in Payrexx and post the
+approved ERPNext reversal manually. Do not infer a refund from a failed or
+chargeback Integration Request, and never cancel submitted Payment Entries
+automatically.
 
-## 10. Run Hosted Sandbox Settlement Acceptance
+## 10. Handle A Refund Issued In Payrexx
+
+Refunds are made in the Payrexx dashboard. ERPNext does not initiate them and
+does not post the reversal — it shows you that one happened.
+
+When Payrexx sends the refund webhook, the app:
+
+1. Records the refund on the Integration Request (amount, currency, and the
+   transaction it reverses), leaving the original settlement evidence intact.
+2. Opens a High-priority ToDo naming the refunded amount.
+3. Comments on the paid document — the Sales Invoice, or the Donation for
+   Good NPO donations.
+
+The Integration Request stays **Completed**: the payment really did settle, and
+the refund is a later event, not a retraction of that fact.
+
+**You still have to post the accounting reversal manually.** Nothing in the
+ledger changes automatically: no Payment Entry is cancelled or created, the
+invoice keeps its paid status, and a Donation keeps `paid`. Work the ToDo,
+post the reversal your accounting policy requires, then close it.
+
+Partial refunds appear as separate entries and separate ToDos, one per refund.
+A `refund_pending` status is recorded but raises no ToDo — nothing has moved
+yet; the ToDo appears when the refund lands. A `disputed` status raises its own
+ToDo and may be followed by a chargeback, which has its own workflow (§9).
+
+## 11. Set Up A Subscription Checkout
+
+Subscriptions are created by sending the payer through a normal hosted checkout
+that carries subscription parameters — not by calling `POST /Subscription/`,
+which needs a Payrexx contact id that does not exist until the payer has paid
+once.
+
+Pass these to `get_payment_url` alongside the usual arguments:
+
+| Argument | Required | Example | Notes |
+|---|---|---|---|
+| `subscription_state` | yes | `True` | Turns the checkout into a signup |
+| `subscription_interval` | yes | `P1M` | Monthly `P1M`, quarterly `P3M`, yearly `P1Y` |
+| `subscription_period` | no | `P1Y` | Total duration; omitted if not passed |
+| `subscription_cancellation_interval` | no | `P1M` | Notice period; omitted if not passed |
+
+Only months and years are accepted. **An invalid interval fails the checkout** —
+it is not dropped the way an invalid QR parameter is, because a subscription
+created on the wrong cadence bills the payer wrongly for as long as it runs.
+
+No default period is sent. If your account needs one, pass it explicitly; the
+values Payrexx accepts for an open-ended subscription are not well documented,
+so confirm against your own account rather than assuming.
+
+Prerequisites in the Payrexx dashboard:
+
+1. The account must be on **Payrexx Pay** for TWINT subscriptions. An
+   external-PSP TWINT connection cannot do recurring payments.
+2. Subscription webhooks must point at the same callback URL as transaction
+   webhooks (§3), with content type JSON.
+
+The matching **Payrexx Settings** row also has **Enable Managed
+Subscriptions**, which defaults off. Before switching it on:
+
+1. Use that row's sandbox account to complete one managed subscription signup.
+2. Capture and verify the signed lifecycle delivery against
+   `payrexx/webhook_payload.py`.
+3. Confirm that the lifecycle-triggered transaction recovery creates/settles the
+   exact first Donation or invoice from a real `GET /Transaction/` result.
+4. Confirm a later sandbox charge creates exactly one installment.
+
+Do not enable the switch from a manufactured callback. Turning it off later is
+safe for incident containment: it removes monthly from new public signups and
+the provider rejects direct new subscription checkouts, while existing mandates
+continue to reconcile and can still be changed or cancelled.
+
+After signup, Payrexx owns the schedule. It decides when to charge and retries
+failures per the account's dunning settings. Changing an amount takes effect
+from the next interval; cancelling over the API is immediate.
+
+Every recurring transaction is tracked by a deterministic **Payrexx Subscription
+Event** before the owning-app hook runs. Its status advances monotonically, so a
+`waiting` or `authorized` delivery cannot consume a later `confirmed` delivery.
+A claimed same-status replay is ignored; an **Unclaimed** event retries when the
+same webhook is replayed after the provider hook is repaired. Unclaimed financial
+events return an error to Payrexx rather than a false success. If the owning hook
+raises, its partial writes are rolled back and the event retains only non-personal
+financial evidence needed for replay. Refunds, disputes, and chargebacks use the
+normal accounting-review reversal path.
+
+All lifecycle, installment, reversal, and reconciliation hooks run as that
+gateway's configured Automation User. A lifecycle webhook queues scoped
+transaction recovery only after the callback commits, so provider I/O does not
+consume Payrexx's webhook timeout. The daily scheduler queues one deduplicated
+worker per Settings row and commits/rolls back each financial event and
+subscription separately, so one bad row or Sandbox gateway cannot starve Live
+reconciliation. It runs even when new managed subscriptions are disabled.
+
+The worker redrives all Unclaimed events, then retrieves real subscription
+transactions through a bounded UTC cursor window with a six-hour overlap, then
+runs the status-only subscription list sweep. The cursor advances only when the
+transaction window has no failed rows. After repairing a provider hook, you may
+run that gateway immediately:
+
+```bash
+bench --site <site> execute \
+  payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings.reconcile_subscriptions \
+  --kwargs '{"gateway_name":"Live"}'
+```
+
+Before production, capture signed lifecycle and recurring-transaction deliveries
+from your own Payrexx sandbox and compare them with `webhook_payload.py`. The app
+supports Payrexx's documented bare lifecycle object, an older `subscription`
+envelope, and transaction envelopes with nested subscriptions, but this repository
+has **not** completed that account-specific verification.
+This matters because Payrexx's managed-subscription guide says it sends a
+subscription webhook instead of a transaction webhook, while its transaction
+webhook reference still documents nested subscription data. The app recovers
+charge evidence through `GET /Transaction/`, but keep **Enable Managed
+Subscriptions** off until your sandbox demonstrates that complete path.
+
+## 12. Run Hosted Sandbox Settlement Acceptance
 
 Use only a dedicated developer QA site and a small, fully unpaid sandbox
 invoice. The runner never enters card data or invokes settlement itself.
@@ -400,6 +526,12 @@ bench --site <qa-site> set-config payrexx_hosted_qa_gateway <Payrexx-Settings-na
 bench --site <qa-site> set-config payrexx_hosted_qa_invoice <Sales-Invoice-name>
 bench --site <qa-site> clear-cache
 ```
+
+The bound gateway must have **Allow TEST Transactions** enabled: the whole run
+proves a TEST-mode payment settles end to end, and settlement refuses simulated
+payments otherwise. `preflight` checks this and refuses with that message rather
+than letting the run fail later as an opaque settlement conflict. Never enable it
+on a gateway that also handles real money.
 
 `clear-cache` does not reliably reload `site_config.json` in long-lived web
 workers. On Docker deployments, restart the backend container after changing
@@ -457,7 +589,7 @@ and require HTTP 403 before closing the acceptance run.
 Payrexx test transactions cannot be deleted. Keep their run marker and exact
 ERPNext records as acceptance evidence; never add destructive provider cleanup.
 
-## 11. Static QR Codes (TWINT)
+## 13. Static QR Codes (TWINT)
 
 Downstream apps (e.g. Good NPO donation campaigns) can mint permanent static
 QR codes through this app: `PayrexxSettings.create_static_qr(<landing URL>)`
@@ -498,7 +630,7 @@ User**, so that field must name an enabled System User (§2) or QR creation and
 deletion fail with "Payrexx Settings … requires an Automation User." before
 Payrexx is contacted.
 
-## 12. Run Tests
+## 14. Run Tests
 
 ```bash
 cd frappe-bench
@@ -519,6 +651,15 @@ bench --site development16.localhost run-tests \
 
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_url_utils
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_rate_limit
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_refunds
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_subscriptions
 ```
 
 Browser tests live in the Playwright project:
