@@ -894,6 +894,9 @@ class TestDocumentedSubscriptionCallbackShape(IntegrationTestCase):
 		)
 
 	def test_provider_failure_is_durable_and_daily_redrive_can_claim_the_charge(self):
+		# The callback rolls back the complete request transaction before recording
+		# recovery evidence; mirror production by making its settings row durable.
+		frappe.db.commit()
 		partial_todo = f"Partial provider effect {frappe.generate_hash(length=8)}"
 		payload = {
 			"transaction": {
