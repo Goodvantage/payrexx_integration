@@ -3,11 +3,11 @@ from unittest.mock import Mock, patch
 
 import frappe
 import requests
-from frappe.tests import UnitTestCase
+from frappe.tests import IntegrationTestCase, UnitTestCase
 from frappe.utils import CallbackManager
 from requests import HTTPError, Response
 
-from payrexx_integration import api
+from payrexx_integration import api, error_logging
 from payrexx_integration.patches.v16_1 import backfill_automation_user
 from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
 	payrexx_settings as settings_module,
@@ -258,6 +258,36 @@ class TestPayrexxApiHostTrust(UnitTestCase):
 		self.assertEqual(request.call_count, 2)
 		self.assertIn("api.payrexx.com", request.call_args_list[1].args[1])
 
+	def test_failed_custom_host_fallback_logs_only_the_final_failure(self):
+		custom_response = Response()
+		custom_response.status_code = 401
+		custom_response.reason = "Unauthorized"
+		custom_response.url = "https://api.pay.example/v1.16/Gateway/?instance=demo"
+		canonical_response = Response()
+		canonical_response.status_code = 503
+		canonical_response.reason = "Unavailable"
+		canonical_response.url = "https://api.payrexx.com/v1.16/Gateway/?instance=demo"
+		with (
+			patch(f"{CLIENT_MODULE}.frappe.conf", {"payrexx_allowed_api_hosts": ["api.pay.example"]}),
+			patch(
+				f"{CLIENT_MODULE}.get_request_session",
+				side_effect=(
+					_StubProviderSession(custom_response),
+					_StubProviderSession(canonical_response),
+				),
+			),
+			patch(f"{CLIENT_MODULE}.log_sanitized_error") as log_error,
+			self.assertRaises(HTTPError),
+		):
+			PayrexxClient(
+				instance="demo",
+				api_secret="secret",
+				api_base_domain="pay.example",
+			).create_gateway({"amount": 100})
+
+		log_error.assert_called_once()
+		self.assertEqual(log_error.call_args.kwargs, {"http_status": 503})
+
 
 class _StubProviderSession:
 	"""Real request preparation, canned response.
@@ -269,6 +299,7 @@ class _StubProviderSession:
 	def __init__(self, response):
 		self._session = requests.Session()
 		self._response = response
+		self.send_kwargs = None
 
 	def prepare_request(self, request):
 		prepared_request = self._session.prepare_request(request)
@@ -279,42 +310,86 @@ class _StubProviderSession:
 		return self._session.merge_environment_settings(*args, **kwargs)
 
 	def send(self, prepared_request, **kwargs):
+		self.send_kwargs = kwargs
 		return self._response
+
+
+class TestSafePayUrlBoundary(UnitTestCase):
+	API_SECRET = "sk_live_pay_url_boundary_secret"
+	PAYER_EMAIL = "payer-boundary@example.test"
+	PROVIDER_URL = "https://merchant.payrexx.com/checkout?token=private-checkout-token"
+	EXCEPTION_TEXT = f"provider rejected {PAYER_EMAIL} at {PROVIDER_URL} using credential {API_SECRET}"
+
+	def _assert_sanitized_error_log(self, log_error):
+		log_error.assert_called_once()
+		self.assertEqual(log_error.call_args.args[0], "payrexx_pay_url")
+		self.assertIsInstance(log_error.call_args.args[1], RuntimeError)
+		self.assertEqual(log_error.call_args.kwargs, {})
+
+	def test_failure_logs_only_the_bounded_sanitized_contract(self):
+		with (
+			patch.object(api, "payrexx_pay_url", side_effect=RuntimeError(self.EXCEPTION_TEXT)),
+			patch.object(api, "log_sanitized_error") as log_error,
+		):
+			self.assertEqual(api.safe_pay_url("SINV-BOUNDARY-TEST"), "")
+
+		self._assert_sanitized_error_log(log_error)
+
+	def test_gateway_resolution_failure_uses_the_same_sanitized_contract(self):
+		with (
+			patch.object(api.frappe.db, "exists", return_value=True),
+			patch.object(api.frappe.db, "get_value", return_value=1),
+			patch.object(api, "resolve_payrexx_settings", side_effect=RuntimeError(self.EXCEPTION_TEXT)),
+			patch.object(api, "log_sanitized_error") as log_error,
+		):
+			self.assertEqual(api.payrexx_pay_url("SINV-BOUNDARY-TEST"), "")
+
+		self._assert_sanitized_error_log(log_error)
+
+	def test_retryable_database_errors_propagate_without_logging(self):
+		for error_type in (frappe.QueryDeadlockError, frappe.QueryTimeoutError):
+			error = error_type(f"retryable failure containing {self.PAYER_EMAIL}")
+			with (
+				self.subTest(error_type=error_type.__name__),
+				patch.object(api.frappe.db, "exists", return_value=True),
+				patch.object(api.frappe.db, "get_value", return_value=1),
+				patch.object(api, "resolve_payrexx_settings", side_effect=error),
+				patch.object(api, "log_sanitized_error") as log_error,
+				self.assertRaises(error_type) as raised,
+			):
+				api.safe_pay_url("SINV-BOUNDARY-TEST")
+
+			self.assertIs(raised.exception, error)
+			log_error.assert_not_called()
 
 
 class TestApiSecretNeverReachesLoggedTracebacks(UnitTestCase):
 	"""Regression guard for audit finding V-H1 (2026-07-30).
 
-	Every failed provider request is written to Error Log — and to Sentry when
-	telemetry is on — with the frame variables of the failing frames. Frappe's
-	sanitizer redacts only the exact dict keys password/passwd/secret/token/key/
-	pwd, so an `{"x-api-key": <secret>}` header dict (or a client attribute
-	holding the secret) is persisted verbatim. The client must therefore keep the
-	secret and the payer payload out of every frame variable of the request path.
+	Provider failures must cross only the sanitized app-local logging seam. Core
+	traceback logging and Sentry capture are forbidden on this path.
 	"""
 
 	API_SECRET = "sk_live_payrexx_secret_leak_regression"
 	PAYER_EMAIL = "payer-leak-regression@example.test"
 
-	def _tracebacks_logged_by(self, provider_call):
-		"""Return exactly what frappe would persist for a failing provider call."""
+	def _sanitized_reports_by(self, provider_call):
 		logged = []
 
-		def capture_traceback(*args, **kwargs):
-			logged.append(frappe.get_traceback(with_context=True))
+		def capture_report(operation, exception, **kwargs):
+			logged.append((operation, type(exception).__name__, kwargs))
 
-		original_request_doc = frappe.flags.integration_request_doc
-		frappe.flags.integration_request_doc = None
-		try:
-			with (
-				patch.object(frappe, "log_error", side_effect=capture_traceback),
-				self.assertRaises(Exception),
-			):
-				provider_call()
-		finally:
-			frappe.flags.integration_request_doc = original_request_doc
+		with (
+			patch(f"{CLIENT_MODULE}.log_sanitized_error", side_effect=capture_report),
+			patch.object(frappe, "log_error") as core_log_error,
+			patch("frappe.utils.sentry.capture_exception") as capture_exception,
+			self.assertRaises(Exception),
+		):
+			provider_call()
 
-		self.assertTrue(logged, "the failing provider request was not reported at all")
+		self.assertEqual(len(logged), 1)
+		core_log_error.assert_not_called()
+		capture_exception.assert_not_called()
 		return logged
 
 	def test_client_does_not_retain_the_api_secret_as_an_attribute(self):
@@ -327,10 +402,9 @@ class TestApiSecretNeverReachesLoggedTracebacks(UnitTestCase):
 		client = PayrexxClient(instance="demo", api_secret=self.API_SECRET)
 
 		with patch.object(PayrexxClient, "_url", return_value="https://127.0.0.1:1/v1.14/Gateway/0/"):
-			logged = self._tracebacks_logged_by(client.ping_gateway)
+			logged = self._sanitized_reports_by(client.ping_gateway)
 
-		for traceback_text in logged:
-			self.assertNotIn(self.API_SECRET, traceback_text)
+		self.assertNotIn(self.API_SECRET, frappe.as_json(logged))
 
 	def test_http_error_traceback_never_contains_the_api_secret_or_payer_data(self):
 		response = Response()
@@ -340,7 +414,7 @@ class TestApiSecretNeverReachesLoggedTracebacks(UnitTestCase):
 		client = PayrexxClient(instance="demo", api_secret=self.API_SECRET)
 
 		with patch(f"{CLIENT_MODULE}.get_request_session", return_value=_StubProviderSession(response)):
-			logged = self._tracebacks_logged_by(
+			logged = self._sanitized_reports_by(
 				lambda: client.create_gateway(
 					{
 						"amount": 10000,
@@ -353,9 +427,178 @@ class TestApiSecretNeverReachesLoggedTracebacks(UnitTestCase):
 
 		# The header still goes out on the wire; it just never becomes a variable.
 		self.assertEqual(response.request.headers["x-api-key"], self.API_SECRET)
-		for traceback_text in logged:
-			self.assertNotIn(self.API_SECRET, traceback_text)
-			self.assertNotIn(self.PAYER_EMAIL, traceback_text)
+		serialized = frappe.as_json(logged)
+		self.assertNotIn(self.API_SECRET, serialized)
+		self.assertNotIn(self.PAYER_EMAIL, serialized)
+
+	def test_provider_failure_error_log_is_explicit_bounded_and_sanitized(self):
+		provider_url = "https://api.payrexx.com/v1.16/Gateway/?instance=demo&token=private"
+		exception_text = f"provider rejected {self.PAYER_EMAIL} using {self.API_SECRET}"
+		response = Response()
+		response.status_code = 503
+		response.reason = exception_text
+		response.url = provider_url
+		client = PayrexxClient(instance="demo", api_secret=self.API_SECRET)
+		with (
+			patch(f"{CLIENT_MODULE}.get_request_session", return_value=_StubProviderSession(response)),
+			patch(f"{CLIENT_MODULE}.log_sanitized_error") as log_error,
+			patch.object(frappe, "log_error") as core_log_error,
+			self.assertRaises(HTTPError),
+		):
+			client.create_gateway(
+				{
+					"amount": 10000,
+					"referenceId": "IR-LOG-BOUNDARY",
+					"fields[email][value]": self.PAYER_EMAIL,
+				}
+			)
+
+		log_error.assert_called_once()
+		self.assertEqual(log_error.call_args.args[0], "payrexx_request")
+		self.assertIsInstance(log_error.call_args.args[1], HTTPError)
+		self.assertEqual(log_error.call_args.kwargs, {"http_status": 503})
+		core_log_error.assert_not_called()
+
+	def test_provider_request_uses_bounded_connect_and_read_timeout(self):
+		response = Response()
+		response.status_code = 200
+		response.headers["content-type"] = "application/json"
+		response._content = b'{"status":"success","data":[]}'
+		session = _StubProviderSession(response)
+		client = PayrexxClient(instance="demo", api_secret=self.API_SECRET)
+
+		with patch(f"{CLIENT_MODULE}.get_request_session", return_value=session):
+			self.assertEqual(client.ping_gateway(), {"status": "success", "data": []})
+
+		self.assertEqual(session.send_kwargs["timeout"], (5, 30))
+
+	def test_timeout_makes_one_request_without_custom_host_fallback_and_logs_status_none(self):
+		provider_url = "https://api.pay.example/v1.16/Gateway/?instance=demo"
+		exception_text = (
+			f"timeout contacting {provider_url} for {self.PAYER_EMAIL} using credential {self.API_SECRET}"
+		)
+		session = _StubProviderSession(Response())
+		session.send = Mock(side_effect=requests.Timeout(exception_text))
+		with (
+			patch(f"{CLIENT_MODULE}.frappe.conf", {"payrexx_allowed_api_hosts": ["api.pay.example"]}),
+			patch(f"{CLIENT_MODULE}.get_request_session", return_value=session),
+			patch(f"{CLIENT_MODULE}.log_sanitized_error") as log_error,
+			patch.object(frappe, "log_error") as core_log_error,
+			self.assertRaises(requests.Timeout),
+		):
+			PayrexxClient(
+				instance="demo",
+				api_secret=self.API_SECRET,
+				api_base_domain="pay.example",
+			).create_gateway(
+				{
+					"amount": 10000,
+					"referenceId": "IR-TIMEOUT-BOUNDARY",
+					"fields[email][value]": self.PAYER_EMAIL,
+				}
+			)
+
+		session.send.assert_called_once()
+		self.assertEqual(session.send.call_args.args[0].url, provider_url)
+		log_error.assert_called_once()
+		self.assertEqual(log_error.call_args.args[0], "payrexx_request")
+		self.assertIsInstance(log_error.call_args.args[1], requests.Timeout)
+		self.assertEqual(log_error.call_args.kwargs, {"http_status": None})
+		core_log_error.assert_not_called()
+
+
+class TestCheckoutProviderFailureLogging(IntegrationTestCase):
+	API_SECRET = "sk_live_outer_checkout_secret"
+	PAYER_EMAIL = "outer-checkout-payer@example.test"
+	PROVIDER_URL = "https://api.payrexx.com/v1.16/Gateway/?instance=demo&token=provider-private"
+	PROVIDER_RESPONSE = f"provider response for {PAYER_EMAIL} with credential {API_SECRET}"
+
+	def test_outer_checkout_keeps_one_context_free_error_log(self):
+		response = Response()
+		response.status_code = 503
+		response.reason = self.PROVIDER_RESPONSE
+		response.url = self.PROVIDER_URL
+		client = PayrexxClient(instance="demo", api_secret=self.API_SECRET)
+		settings = Mock()
+		settings.name = "Live"
+		settings._validate_payment_request_source = Mock()
+		settings._client.return_value = client
+		settings._build_create_gateway_payload.return_value = {
+			"amount": 10000,
+			"currency": "CHF",
+			"referenceId": "IR-OUTER-LOG-TEST",
+			"fields[email][value]": self.PAYER_EMAIL,
+		}
+		integration_request = Mock()
+		integration_request.name = "IR-OUTER-LOG-TEST"
+		integration_request.data = frappe.as_json({"reference_docname": "PR-OUTER-LOG-TEST"})
+		fingerprint = error_logging.error_fingerprint("payrexx_request", "HTTPError")
+		before = set(frappe.get_all("Error Log", filters={"fingerprint": fingerprint}, pluck="name"))
+
+		with (
+			patch.object(settings_module, "as_automation_user", return_value=nullcontext()),
+			patch.object(settings_module, "_create_integration_request", return_value=integration_request),
+			patch.object(settings_module, "_log_unknown_gateway_outcome"),
+			patch(f"{CLIENT_MODULE}.get_request_session", return_value=_StubProviderSession(response)),
+			patch.object(error_logging, "_must_defer_database_log", return_value=False),
+			patch.object(error_logging, "_log_to_file"),
+			patch.object(frappe, "log_error") as core_log_error,
+			patch.object(frappe, "get_traceback") as get_traceback,
+			patch("frappe.utils.sentry.capture_exception") as capture_exception,
+			self.assertRaises(frappe.ValidationError),
+		):
+			settings_module.PayrexxSettings.get_payment_url(
+				settings,
+				reference_doctype="Payment Request",
+				reference_docname="PR-OUTER-LOG-TEST",
+				payer_email=self.PAYER_EMAIL,
+				amount=100,
+				currency="CHF",
+			)
+
+		core_log_error.assert_not_called()
+		get_traceback.assert_not_called()
+		capture_exception.assert_not_called()
+		self.assertEqual(response.request.headers["x-api-key"], self.API_SECRET)
+		after = set(frappe.get_all("Error Log", filters={"fingerprint": fingerprint}, pluck="name"))
+		created = after - before
+		for created_name in created:
+			self.addCleanup(frappe.db.delete, "Error Log", {"name": created_name})
+		self.assertEqual(len(created), 1)
+		name = created.pop()
+		row = frappe.db.get_value(
+			"Error Log", name, ["method", "error", "metadata", "fingerprint"], as_dict=True
+		)
+		self.assertEqual(row.method, "Payrexx request failed")
+		self.assertEqual(row.metadata, "{}")
+		self.assertEqual(row.fingerprint, fingerprint)
+		self.assertLessEqual(len(row.method), 140)
+		self.assertLessEqual(len(row.error), 300)
+		persisted = frappe.as_json(row)
+		for sensitive_value in (
+			self.PROVIDER_RESPONSE,
+			self.PROVIDER_URL,
+			self.PAYER_EMAIL,
+			self.API_SECRET,
+			"provider-private",
+		):
+			self.assertNotIn(sensitive_value, persisted)
+
+	def test_outer_checkout_propagates_retryable_database_errors_without_logging(self):
+		settings = Mock()
+		settings.name = "Live"
+		settings._validate_payment_request_source = Mock()
+		settings._client.side_effect = frappe.QueryTimeoutError("retry complete transaction")
+		with (
+			patch.object(settings_module, "as_automation_user", return_value=nullcontext()),
+			patch.object(error_logging, "log_sanitized_error") as log_error,
+			patch.object(frappe, "log_error") as core_log_error,
+			self.assertRaises(frappe.QueryTimeoutError),
+		):
+			settings_module.PayrexxSettings.get_payment_url(settings)
+
+		log_error.assert_not_called()
+		core_log_error.assert_not_called()
 
 
 class TestCheckoutCurrentState(UnitTestCase):

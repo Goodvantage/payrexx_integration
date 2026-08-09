@@ -9,6 +9,10 @@ import requests
 from frappe.tests import IntegrationTestCase
 from requests import HTTPError, Response
 
+from payrexx_integration import error_logging
+from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+	payrexx_settings as settings_module,
+)
 from payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings import (
 	QR_DELETE_TOLERATED_STATUSES,
 	_sanitize_qr_session_value,
@@ -153,9 +157,13 @@ class TestStaticQrClient(IntegrationTestCase):
 				"payrexx_integration.payrexx_integration.payrexx.payrexx_client._execute_request",
 				return_value={"status": "error", "message": "instance not found"},
 			),
+			patch(f"{CLIENT_MODULE}.log_sanitized_error") as log_error,
 			self.assertRaisesRegex(PayrexxAPIError, "instance not found"),
 		):
 			client.create_qr_code("https://ngo.example.test/donate-campaign/x")
+		log_error.assert_called_once()
+		self.assertEqual(log_error.call_args.args[0], "payrexx_response")
+		self.assertEqual(log_error.call_args.kwargs, {"http_status": 200})
 
 	def test_delete_qr_code_issues_delete_request(self):
 		client = self._client()
@@ -345,9 +353,36 @@ class TestStaticQrSettings(IntegrationTestCase):
 		with (
 			_public_origins(),
 			patch.object(type(settings), "_client", return_value=client),
+			patch.object(settings_module, "log_sanitized_error") as log_error,
 			self.assertRaisesRegex(frappe.ValidationError, "incomplete"),
 		):
 			settings.create_static_qr("https://ngo.example.test/donate-campaign/x")
+		log_error.assert_called_once()
+		self.assertEqual(log_error.call_args.args[0], "payrexx_response")
+
+	def test_static_qr_retryable_database_errors_propagate_without_logging(self):
+		settings = self._settings()
+		for method_name in ("create_qr_code", "delete_qr_code"):
+			for error_type in (frappe.QueryDeadlockError, frappe.QueryTimeoutError):
+				client = Mock()
+				error = error_type("retry complete transaction")
+				getattr(client, method_name).side_effect = error
+				with (
+					self.subTest(method_name=method_name, error_type=error_type.__name__),
+					_public_origins(),
+					patch.object(type(settings), "_client", return_value=client),
+					patch.object(settings_module, "log_sanitized_error") as log_error,
+					patch.object(frappe, "log_error") as core_log_error,
+					self.assertRaises(error_type) as raised,
+				):
+					if method_name == "create_qr_code":
+						settings.create_static_qr("https://ngo.example.test/donate-campaign/x")
+					else:
+						settings.delete_static_qr(QR_CODE_UUID)
+
+				self.assertIs(raised.exception, error)
+				log_error.assert_not_called()
+				core_log_error.assert_not_called()
 
 	def test_delete_static_qr_tolerates_provider_404(self):
 		settings = self._settings()
@@ -376,8 +411,8 @@ class TestStaticQrProviderErrorLogging(IntegrationTestCase):
 
 	``delete_static_qr`` treats a provider 404 as "already deleted" and returns
 	cleanly, so the request path must not have written an Error Log row for staff
-	to triage on the way there. Every undeclared status keeps logging exactly as
-	before.
+	to triage on the way there. Every undeclared final failure creates exactly
+	one context-free row, and the outer QR controller does not add another.
 	"""
 
 	@classmethod
@@ -389,23 +424,35 @@ class TestStaticQrProviderErrorLogging(IntegrationTestCase):
 		return frappe.get_doc("Payrexx Settings", self.settings_name)
 
 	def _error_logs_for(self, status_code: int, provider_call, *, raises=None) -> list:
-		"""Run one real client request against a canned status, capturing Error Logs."""
-		logged = []
+		"""Run an outer controller against the real context-free log boundary."""
 		client = PayrexxClient(instance="demo", api_secret="sk_test_dummy")
 		session = _StubProviderSession(_provider_response(status_code))
-		# An Integration Request doc on the flag would take the other logging branch.
-		original_request_doc = frappe.flags.integration_request_doc
-		frappe.flags.integration_request_doc = None
-		try:
-			with (
-				patch(f"{CLIENT_MODULE}.get_request_session", return_value=session),
-				patch.object(frappe, "log_error", side_effect=lambda *a, **kw: logged.append(kw or a)),
-				self.assertRaises(raises) if raises else nullcontext(),
-			):
-				provider_call(client)
-		finally:
-			frappe.flags.integration_request_doc = original_request_doc
-		return logged
+		fingerprint = error_logging.error_fingerprint("payrexx_request", "HTTPError")
+		before = set(frappe.get_all("Error Log", filters={"fingerprint": fingerprint}, pluck="name"))
+		with (
+			patch(f"{CLIENT_MODULE}.get_request_session", return_value=session),
+			patch.object(error_logging, "_must_defer_database_log", return_value=False),
+			patch.object(error_logging, "_log_to_file"),
+			patch.object(frappe, "log_error") as core_log_error,
+			patch.object(frappe, "get_traceback") as get_traceback,
+			patch("frappe.utils.sentry.capture_exception") as capture_exception,
+			self.assertRaises(raises) if raises else nullcontext(),
+		):
+			provider_call(client)
+		core_log_error.assert_not_called()
+		get_traceback.assert_not_called()
+		capture_exception.assert_not_called()
+		after = set(frappe.get_all("Error Log", filters={"fingerprint": fingerprint}, pluck="name"))
+		created = after - before
+		for name in created:
+			self.addCleanup(frappe.db.delete, "Error Log", {"name": name})
+		if not created:
+			return []
+		return frappe.get_all(
+			"Error Log",
+			filters={"name": ["in", tuple(created)]},
+			fields=["method", "error", "metadata", "fingerprint"],
+		)
 
 	def test_tolerated_delete_404_writes_no_error_log(self):
 		settings = self._settings()
@@ -423,7 +470,21 @@ class TestStaticQrProviderErrorLogging(IntegrationTestCase):
 			with patch.object(type(settings), "_client", return_value=client):
 				settings.delete_static_qr(QR_CODE_UUID)
 
-		self.assertTrue(self._error_logs_for(500, delete, raises=frappe.ValidationError))
+		logged = self._error_logs_for(500, delete, raises=frappe.ValidationError)
+		self.assertEqual(len(logged), 1)
+		self.assertEqual(logged[0].metadata, "{}")
+
+	def test_unexpected_create_500_still_writes_one_error_log(self):
+		settings = self._settings()
+
+		def create(client):
+			with _public_origins(), patch.object(type(settings), "_client", return_value=client):
+				settings.create_static_qr("https://ngo.example.test/donate-campaign/x")
+
+		logged = self._error_logs_for(500, create, raises=frappe.ValidationError)
+		self.assertEqual(len(logged), 1)
+		self.assertEqual(logged[0].method, "Payrexx request failed")
+		self.assertEqual(logged[0].metadata, "{}")
 
 	def test_client_logs_an_undeclared_status_by_default(self):
 		"""Backwards compatibility: without a declaration nothing changes."""
@@ -432,7 +493,7 @@ class TestStaticQrProviderErrorLogging(IntegrationTestCase):
 			lambda client: client.delete_qr_code(QR_CODE_UUID),
 			raises=HTTPError,
 		)
-		self.assertTrue(logged)
+		self.assertEqual(len(logged), 1)
 
 
 class TestQrSessionCheckoutPassthrough(IntegrationTestCase):

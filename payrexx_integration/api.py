@@ -22,6 +22,7 @@ from urllib.parse import urlencode
 import frappe
 from frappe import _
 
+from payrexx_integration.error_logging import log_sanitized_error
 from payrexx_integration.gateway_selection import resolve_payrexx_settings
 from payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings import (
 	CHECKOUT_PROVIDER_CONTACT_FLAG,
@@ -101,6 +102,10 @@ def _verify_payment_success_reference(
 	return verify_reference(f"{integration_request}|{gateway_name}|payment_success", token)
 
 
+def _log_pay_url_unavailable(exception: BaseException) -> None:
+	log_sanitized_error("payrexx_pay_url", exception)
+
+
 # ---------------------------------------------------------------- jinja helper
 
 
@@ -121,8 +126,10 @@ def payrexx_pay_url(sales_invoice: str | None, gateway_name: str | None = None) 
 		return ""
 	try:
 		settings_name = resolve_payrexx_settings(gateway_name).name
-	except Exception:
-		frappe.log_error(title="Payrexx pay URL unavailable", message=frappe.get_traceback())
+	except (frappe.QueryDeadlockError, frappe.QueryTimeoutError):  # fmt: skip
+		raise
+	except Exception as exc:
+		_log_pay_url_unavailable(exc)
 		return ""
 	params = {
 		"si": sales_invoice,
@@ -133,17 +140,19 @@ def payrexx_pay_url(sales_invoice: str | None, gateway_name: str | None = None) 
 
 
 def safe_pay_url(sales_invoice: str | None, gateway_name: str | None = None) -> str:
-	"""Never-raise variant of :func:`payrexx_pay_url` for email/print rendering.
+	"""Fail-soft variant of :func:`payrexx_pay_url` for email/print rendering.
 
 	Consumer apps embed pay links while composing invoice and dunning
 	output; a Payrexx misconfiguration must degrade to "no link", never
-	break the document. This wrapper owns that fallback contract in one
-	place instead of each app hand-rolling its own try/except.
+	break the document. Transaction-retry database errors still propagate.
+	This wrapper owns that contract instead of each app hand-rolling it.
 	"""
 	try:
 		return payrexx_pay_url(sales_invoice, gateway_name) or ""
-	except Exception:
-		frappe.log_error(title="Payrexx pay URL unavailable", message=frappe.get_traceback())
+	except (frappe.QueryDeadlockError, frappe.QueryTimeoutError):  # fmt: skip
+		raise
+	except Exception as exc:
+		_log_pay_url_unavailable(exc)
 		return ""
 
 

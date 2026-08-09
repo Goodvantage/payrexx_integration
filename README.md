@@ -2,6 +2,9 @@
 
 Payrexx payment gateway integration for the Frappe payments app
 
+Current release: `16.5.1` (the package version is sourced dynamically from
+`payrexx_integration/__init__.py`).
+
 ### Installation
 
 You can install this app using the [bench](https://github.com/frappe/bench) CLI:
@@ -18,6 +21,12 @@ See [`HOW_TO.md`](HOW_TO.md) for gateway, webhook, and Payment Gateway Account
 setup. Custom Payrexx Platform API domains are denied unless their exact final
 host is listed in the site's `payrexx_allowed_api_hosts` JSON array; canonical
 Payrexx-owned hosts work without an override.
+
+Python invoice and dunning renderers should use
+`payrexx_integration.api.safe_pay_url(...)`, which degrades ordinary Payrexx URL
+failures to an empty string with one context-free, empty-metadata Error Log while
+preserving retryable database exceptions. See [`DOCUMENTATION.md`](DOCUMENTATION.md)
+for the cross-app API contract.
 
 ### Contributing
 

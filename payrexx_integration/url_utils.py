@@ -105,7 +105,7 @@ def _normalized_http_origin(url: str) -> tuple[str, str, int] | None:
 	return parts.scheme, hostname, port if port is not None else (443 if parts.scheme == "https" else 80)
 
 
-def has_absolute_http_origin(value: str) -> bool:
+def has_absolute_http_origin(value: str | None) -> bool:
 	"""Public seam for consumer apps (cross-app F12): True only for an
 	absolute HTTP(S) origin with a valid port and no embedded credentials.
 

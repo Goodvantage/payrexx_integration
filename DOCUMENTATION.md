@@ -67,6 +67,25 @@ was in fact created. The checkout boundary likewise stops deadlock retry as soon
 as provider contact starts. Neither rule disables the separate custom-host
 fallback above.
 
+The initial custom-host 401/403 (plus 404 for credential probe/Gateway create)
+is likewise an expected intermediate fallback outcome and is not logged. A
+successful canonical fallback leaves no Error Log; if it fails, only that final
+failure creates one entry.
+
+Every provider request uses a `(5, 30)` connect/read timeout. Settings
+validation and checkout can call Payrexx inline, so an unbounded network wait
+would otherwise pin a web worker. A timeout is an ordinary provider failure, but
+it has no HTTP response: it makes exactly one transport request, does not
+activate the status-based custom-host fallback, and does not authorize replaying
+a POST. Database retry signals keep their existing complete transaction-boundary
+behavior. The app-local Error Log boundary directly inserts one bounded row with
+empty metadata containing only the fixed title plus operation key, exception
+class, HTTP status, and fixed summary; a timeout records `http_status=None`. It
+never calls core traceback logging or Sentry and never records exception text,
+request/provider URL, payer data, credentials, token, response body, request
+metadata, or frame context. HTTP-200 error envelopes use the same boundary with
+`http_status=200`.
+
 There is no idempotency-key parameter in the provider Gateway contract or this
 app. Payrexx documents `referenceId` as the merchant's internal reference, but
 does not document it as unique or as a de-duplication key. The local invoice and
@@ -89,8 +108,10 @@ bundled cURL/Guzzle adapters send JSON for ordinary non-file POSTs.
 
 | Module | Purpose |
 |---|---|
-| `api.py` | Signed pay-by-email URL generation and `pay_invoice` redirect endpoint. |
+| `api.py` | Signed pay-by-email URL generation, the fail-soft cross-app `safe_pay_url` rendering boundary, and the `pay_invoice` redirect endpoint. |
+| `error_logging.py` | Context-free, bounded Error Log insertion for final provider and pay-URL failures; empty metadata and no core traceback/Sentry capture. |
 | `gateway_selection.py` | Generic, strict Payrexx Settings resolver for this app and downstream consumers. |
+| `url_utils.py` | Public URL construction, published-origin policy, and the cross-app absolute HTTP(S) origin syntax boundary. |
 | `session_utils.py` | Validates each owning settings row's enabled System User and restores the caller session after scoped privilege switching. |
 | `payrexx/payrexx_client.py` | Thin Payrexx REST client (`create_gateway`, `retrieve_gateway`, `ping_gateway`, `create_qr_code`, `delete_qr_code`); host trust and credential-safe request execution. |
 | `payrexx/webhook_validator.py` | HMAC webhook signature validation. |
@@ -100,6 +121,33 @@ bundled cURL/Guzzle adapters send JSON for ordinary non-file POSTs.
 | `playwright/` | Browser tests for Payrexx plus an opt-in invoice-email check against an existing Good Event Booking. |
 
 ## URL Contracts
+
+Python consumers that render invoices, dunnings, or email call
+`payrexx_integration.api.safe_pay_url(invoice_name, gateway_name=None)`. It
+returns the same absolute signed URL as the Jinja helper when available and an
+empty string for ordinary missing configuration or URL-generation failures.
+Such an unexpected failure creates exactly one fixed, bounded, empty-metadata
+Error Log entry with no exception text, URL, invoice/payer data, credential,
+token, request metadata, or frame context. Consumer apps do not add another log.
+`QueryDeadlockError` and `QueryTimeoutError` are transaction retry signals, so
+they propagate unchanged and create no boundary log. Downstream apps retain
+their own domain eligibility checks but do not reimplement this fallback.
+
+Two public origin helpers serve intentionally different cross-app contracts:
+
+- `payrexx_integration.url_utils.has_absolute_http_origin(value)` is syntax
+  validation for a downstream app selecting its own configured public base. It
+  accepts only an absolute HTTP(S) URL with a hostname, no whitespace/control
+  characters or embedded userinfo (username or password), and either no port or
+  a numeric port from 1 through 65535. An omitted port has the scheme's effective
+  default (HTTP 80 or HTTPS 443). It does not read the site's origin allowlist and
+  does not mean that the site publishes the origin.
+- `payrexx_integration.url_utils.is_allowed_public_origin(url)` is the stronger
+  policy boundary for externally supplied targets. After the same strict parse,
+  it requires the normalized complete origin (scheme, canonical hostname, and
+  effective port) to match the canonical `host_name` or an operator-configured
+  `*_public_base_url` origin. Different schemes or effective ports remain
+  different origins.
 
 Pay-by-email endpoint:
 
@@ -658,7 +706,9 @@ only; only authenticated rows returned by `GET /Transaction/` settle money.
 - Every settings row owns a required enabled System User; payment and accounting-review side effects fail closed without one.
 - Webhook signing key and API secret are separate values.
 - API secrets are read and sent only after strict final-host validation; custom API hosts require an exact `payrexx_allowed_api_hosts` site-config entry.
-- The API secret never becomes a frame variable, argument, or object attribute on the request path. It is attached through a `requests` auth callable holding it in its closure, and requests are sent as session-prepared requests instead of through `frappe.integrations.utils.make_*_request`. Frappe logs the frame variables of a failing outbound request to Error Log (and Sentry when telemetry is on) and its sanitizer does not match an `x-api-key` header key, so any secret reachable from those frames would be stored in plaintext. The same request frame drops its reference to the POST payer payload before the network call.
+- The API secret never becomes an ordinary frame argument or object attribute on the request path. It is attached through a `requests` auth callable holding it in its closure, requests are session-prepared instead of using `frappe.integrations.utils.make_*_request`, and the request frame drops its POST payer payload reference before provider I/O.
+- Final provider and cross-app pay-URL failures use the app-local direct Error Log boundary. It inserts one bounded row with `metadata = {}` and never calls `frappe.log_error`, `frappe.get_traceback`, an Integration Request's logger, or Sentry. Stable operation/class/status classification is the only evidence; exception text, URLs, payer/invoice/request data, credentials, tokens, and provider bodies are absent. Intermediate retries and tolerated statuses produce no row, and checkout/QR controllers never re-log.
+- Cross-app pay-URL generation propagates `QueryDeadlockError` and `QueryTimeoutError` without logging or converting them to an empty URL.
 - Static QR targets are bound to the same published-origin allowlist as payment return URLs, so a permanent printed code can never point at an unconfigured origin.
 - Checkout reuse requires current locked receivable state plus exact persisted provider metadata; a stored URL alone is never trusted.
 - A new Gateway is rejected while any other submitted active Payrexx Payment Request exists for the invoice; terminal and cancelled history is preserved.
@@ -724,9 +774,10 @@ tests.
 
 ## Cross-App Integration
 
-Good Event's default invoice renderer imports `payrexx_pay_url`. Missing or
-ambiguous Payrexx configuration degrades gracefully: invoice emails still send
-without the online-pay button.
+Good Event's default invoice renderer imports the canonical `safe_pay_url`
+boundary. Missing, ambiguous, or ordinarily failing Payrexx configuration
+degrades gracefully: invoice emails still send without the online-pay button
+and do not add a second log entry. Retryable database errors still propagate.
 
 Downstream apps can import `resolve_payrexx_settings` without creating a reverse
 dependency. A caller that owns a site setting can pass its key, for example
@@ -763,6 +814,9 @@ bench --site development16.localhost run-tests \
 
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_subscriptions
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_error_logging
 ```
 
 `test_rate_limit` directly proves GET backoff and that a canonical-host POST 405
@@ -771,7 +825,11 @@ not exercised by that module. It does not prove that all POST paths make one
 HTTP request. The separate custom-host tests in `test_checkout_security` prove
 the current mocked fallback, including a second Gateway POST to
 `api.payrexx.com` after custom-host 404. The deferred provider run above remains
-the live verification requirement.
+the live verification requirement. The same module pins the `(5, 30)` transport
+timeout, final custom-host failure cardinality, outer checkout/QR controller
+cardinality, the real Error Log/Sentry seam, and cross-app `safe_pay_url`
+contracts. `test_error_logging` directly inspects the persisted empty-metadata
+row and proves retryable database errors do not enter the boundary.
 
 ```bash
 cd frappe-bench/apps/payrexx_integration/playwright

@@ -282,8 +282,11 @@ or production credentials.
       Managed Subscriptions** on that settings row.
 - [ ] Forging a request with a wrong `X-Webhook-Signature` is rejected
       (check `Error Log`).
-- [ ] A failed provider call (e.g. a deliberately wrong API secret) writes an
-      `Error Log` entry containing neither the API secret nor payer data.
+- [ ] A failed provider call (e.g. a deliberately wrong API secret) writes
+      exactly one bounded, empty-metadata `Error Log` containing neither
+      exception text, provider URL/response, API secret, credentials, payer data,
+      request metadata, nor frames; core traceback logging and Sentry capture are
+      not called.
 - [ ] The Sales Invoice-backed Payment Request becomes Paid through
       `set_as_paid()`, with exactly one submitted Payment Entry.
 - [ ] A `cancel` from the Payrexx checkout returns the user to

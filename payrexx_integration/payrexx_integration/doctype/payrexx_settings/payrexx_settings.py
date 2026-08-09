@@ -17,6 +17,7 @@ from frappe.model.document import Document
 from frappe.utils import call_hook_method, cint, cstr, flt, get_datetime, now_datetime
 from payments.utils import create_payment_gateway
 
+from payrexx_integration.error_logging import TRANSACTION_ERRORS, log_sanitized_error
 from payrexx_integration.gateway_selection import resolve_payrexx_settings
 from payrexx_integration.payrexx_integration.payrexx import webhook_payload
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import (
@@ -179,7 +180,11 @@ class PayrexxSettings(Document):
 					gateway,
 					settings_name=self.name,
 				)
-				gateway = _validate_created_gateway(gateway)
+				try:
+					gateway = _validate_created_gateway(gateway)
+				except Exception as exc:
+					log_sanitized_error("payrexx_response", exc, http_status=200)
+					raise
 
 				data = frappe.parse_json(integration_request.data) or {}
 				data["payrexx_gateway_id"] = gateway.get("id")
@@ -200,14 +205,13 @@ class PayrexxSettings(Document):
 				if payload.get("qrCodeSessionId") and gateway.get("appLink"):
 					return gateway["appLink"]
 				return gateway["link"]
-			except frappe.QueryDeadlockError:
+			except TRANSACTION_ERRORS:
 				if provider_contacted and gateway is None and integration_request:
 					_log_unknown_gateway_outcome(integration_request.name, self.name)
 				raise
 			except Exception:
 				if provider_contacted and gateway is None and integration_request:
 					_log_unknown_gateway_outcome(integration_request.name, self.name)
-				frappe.log_error(title="Payrexx get_payment_url", message=frappe.get_traceback())
 				frappe.throw(_("Could not generate Payrexx payment URL"))
 
 	# ---------------------------------------------------------- static QR codes
@@ -231,10 +235,16 @@ class PayrexxSettings(Document):
 			client = self._client()
 			try:
 				qr_code = client.create_qr_code(webshop_url)
+			except TRANSACTION_ERRORS:
+				raise
 			except Exception:
-				frappe.log_error(title="Payrexx create_static_qr", message=frappe.get_traceback())
 				frappe.throw(_("Could not create Payrexx QR code"))
 			if not isinstance(qr_code, dict) or not qr_code.get("uuid"):
+				log_sanitized_error(
+					"payrexx_response",
+					ValueError("Payrexx returned incomplete QR code metadata"),
+					http_status=200,
+				)
 				frappe.throw(_("Payrexx returned incomplete QR code metadata"))
 			return qr_code
 
@@ -252,10 +262,11 @@ class PayrexxSettings(Document):
 			client = self._client()
 			try:
 				client.delete_qr_code(qr_code_uuid, expected_statuses=QR_DELETE_TOLERATED_STATUSES)
+			except TRANSACTION_ERRORS:
+				raise
 			except Exception as exc:
 				if get_http_status(exc) in QR_DELETE_TOLERATED_STATUSES:
 					return
-				frappe.log_error(title="Payrexx delete_static_qr", message=frappe.get_traceback())
 				frappe.throw(_("Could not delete Payrexx QR code"))
 
 	# ------------------------------------------------------------------ helpers
@@ -286,6 +297,8 @@ class PayrexxSettings(Document):
 		client = self._client()
 		try:
 			body = client.ping_gateway()
+		except TRANSACTION_ERRORS:
+			raise
 		except Exception as exc:
 			status_code = get_http_status(exc)
 			if status_code in (401, 403):

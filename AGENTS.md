@@ -48,7 +48,8 @@ procedures), and the code. Record new or changed requirements in
 | `gateway_selection.py` | Canonical strict resolver shared by native flows and downstream apps. Supports explicit selection, a caller-owned site-config key, and unambiguous single-row fallback. |
 | `payrexx_integration/payrexx_integration/doctype/payrexx_settings/` | The settings DocType. One row per environment (`Sandbox` / `Live`), each with its own required automation user. `on_update` auto-creates the matching `Payment Gateway` row (`Payrexx-<gateway_name>`). |
 | `payrexx_integration/payrexx_integration/doctype/payrexx_subscription_event/` | Durable, non-PII recurring-transaction state for installments and later-installment reversals. Its deterministic gateway/event key advances monotonically; claimed same-status replays stop, while Unclaimed states remain retryable from a sanitized financial payload. A raised provider rolls back fully before that Unclaimed row is retained, and the daily worker redrives it before transaction/status reconciliation. |
-| `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client for Gateway, Subscription, and static-QR operations. **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The API version is code-pinned at `v1.16`; it is not a settings field. The legacy `ApiSignature` body field is no longer used. Canonical `*.payrexx.com` API hosts are trusted by default; custom Platform hosts require exact `payrexx_allowed_api_hosts` site-config entries and are validated before secret access. Canonical POSTs have no rate-limit retry, but custom-host Gateway creation can repeat once on `api.payrexx.com` after 401/403/404. The secret lives only in the closure of the `requests` auth callable — see "Never let the API secret become a variable" below. |
+| `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client for Gateway, Subscription, and static-QR operations. **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The API version is code-pinned at `v1.16`; it is not a settings field. The legacy `ApiSignature` body field is no longer used. Canonical `*.payrexx.com` API hosts are trusted by default; custom Platform hosts require exact `payrexx_allowed_api_hosts` site-config entries and are validated before secret access. Canonical POSTs have no rate-limit retry, but custom-host Gateway creation can repeat once on `api.payrexx.com` after 401/403/404. Intermediate retry statuses are unlogged; one final failure crosses `error_logging.py`. The secret lives only in the closure of the `requests` auth callable. |
+| `error_logging.py` | Context-free provider/pay-URL failure boundary. Inserts one bounded `Error Log` with empty metadata directly (deferred for safe HTTP methods), never calls core `frappe.log_error`/`frappe.get_traceback`, and never invokes Sentry. |
 | `payrexx_integration/payrexx_integration/payrexx/webhook_validator.py` | HMAC-SHA256 verification of `X-Webhook-Signature`. Verifies Payrexx's documented hex encoding first and retains base64 as an observed compatibility form. The signing key is **separate** from the API secret (configured per webhook in the Payrexx dashboard). |
 | `api.py::payrexx_pay_url(sales_invoice, gateway_name=None)` | Jinja helper (registered via `hooks.py.jinja`). Resolves the gateway and returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
 | `api.py::pay_invoice(si=None, token=None, gateway_name=None)` | Whitelisted GET redirect endpoint. Verifies the invoice-and-gateway-bound HMAC token, locks/revalidates the wholly unpaid invoice and exact submitted/Requested Payment Request plus Integration Request checkout metadata, lazy-creates through ERPNext only when safe, and 302s to Payrexx. Because Frappe otherwise rolls back GET transactions, it sets `frappe.local.flags.commit` only after atomic local setup and checkout URL resolution. **All args remain optional kwargs** so missing-param requests return clean 403, not 500. |
@@ -239,7 +240,8 @@ Upstream apps resolve their own public base (good_npo: `good_npo_public_base_url
 while that base is configured on the site; a permanent printed code can never
 point at a stale origin. QR deletion declares its tolerated 404 to the client
 (`expected_statuses`), so an already-deleted code produces no Error Log row while
-every undeclared status still logs.
+every undeclared final failure logs exactly once. Checkout and QR controller
+catch blocks translate ordinary failures but never re-log the client's entry.
 
 Static-QR TWINT handoff: a TWINT-app scan appends `qr_code_session_id` and a
 return-app value to the scanned URL. Pass them into `get_payment_url` as
@@ -280,6 +282,9 @@ bench --site <site> run-tests \
 bench --site <site> run-tests \
   --module payrexx_integration.tests.test_subscriptions
 
+bench --site <site> run-tests \
+  --module payrexx_integration.tests.test_error_logging
+
 # Playwright e2e (core specs plus an optional existing-booking email check)
 cd playwright
 npm install && npx playwright install chromium
@@ -318,21 +323,17 @@ Follow `HOW_TO.md` §12 and never test it on a shared or production host.
 
 ## Gotchas
 
-- **Never let the API secret become a variable.** Frappe logs the frame
-  variables of every failing outbound request (`frappe.log_error` →
-  `frappe.get_traceback(with_context=True)`, plus Sentry when telemetry is on),
-  and its sanitizer redacts only the exact dict keys
-  `password/passwd/secret/token/key/pwd` — `x-api-key` is not matched, and the
-  dump expands plain objects, so an attribute leaks exactly like a local. The
-  client therefore does **not** call
-  `frappe.integrations.utils.make_get_request`/`make_post_request` (they take
-  the header dict and the form body as ordinary arguments). It keeps the secret
-  in the closure of `_api_key_auth()` and sends a session-prepared request in
-  `_execute_request()`, which also drops its reference to the POST payer payload
-  before the network call. Response parsing and the error-reporting contract are
-  copied from `make_request`; keep them in sync if upstream changes. Regression
-  coverage: `tests/test_checkout_security.py::TestApiSecretNeverReachesLoggedTracebacks`
-  (audit finding V-H1, 2026-07-30).
+- **Never restore core traceback logging on provider or pay-URL failures.** The
+  client does **not** call `frappe.integrations.utils.make_get_request` /
+  `make_post_request`, `frappe.log_error`, or an Integration Request's
+  `log_error`: those paths collect request/frame metadata and invoke Sentry.
+  Keep the API secret only in `_api_key_auth()`'s closure, drop the POST payer
+  payload before network I/O, and route final transport/error-envelope failures
+  through `error_logging.log_sanitized_error`. That helper directly inserts one
+  bounded, empty-metadata Error Log and never serializes the exception, response,
+  provider URL, request, or frames. Checkout/QR outer catches must not log again.
+  Regression coverage: `tests/test_error_logging.py`,
+  `TestCheckoutProviderFailureLogging`, and `TestStaticQrProviderErrorLogging`.
 - **Settings save calls Payrexx live.** `validate()._ping()` hits
   `GET /Gateway/0/` to verify credentials. With bogus creds the save
   fails with "Payrexx rejected the API Secret". The ping is skipped when
@@ -401,10 +402,11 @@ Follow `HOW_TO.md` §12 and never test it on a shared or production host.
 
 ## Cross-app integration
 
-- Good Event's default invoice renderer imports
-  `payrexx_integration.api.payrexx_pay_url`. Missing or ambiguous Payrexx
-  configuration degrades gracefully: the invoice email still sends without
-  the online-pay button.
+- Good Event's default invoice renderer imports the canonical
+  `payrexx_integration.api.safe_pay_url` boundary. Missing, ambiguous, or
+  ordinarily failing Payrexx configuration degrades to no online-pay button
+  with one Payrexx-owned sanitized Error Log; retryable database errors
+  propagate unchanged and Good Event must not re-log them.
 
 ---
 

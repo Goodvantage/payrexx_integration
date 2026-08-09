@@ -114,6 +114,22 @@ rows, choose the gateway explicitly so it is included in the signed link:
 {{ payrexx_pay_url(doc.name, "Live") }}
 ```
 
+Python invoice/dunning renderers should use the owned fail-soft boundary instead
+of adding another broad `try/except` around the Jinja helper:
+
+```python
+from payrexx_integration.api import safe_pay_url
+
+payment_url = safe_pay_url(sales_invoice.name, gateway_name="Live")
+```
+
+`safe_pay_url` returns an empty string after an ordinary configuration or URL
+failure and writes exactly one fixed, sanitized, empty-metadata Error Log entry.
+Consumer apps must not wrap it with another error log. It deliberately re-raises
+`QueryDeadlockError` and `QueryTimeoutError` without logging so the caller can
+retry its complete transaction. Consumer apps keep their own rules for whether
+a document is eligible for online payment.
+
 The helper returns a signed GET URL:
 
 ```text
@@ -257,10 +273,22 @@ If saving Payrexx Settings fails:
 
 The app pings `GET /Gateway/0/`; a Payrexx JSON response with `status: error` can still mean credentials are accepted if the error is "gateway not found".
 
-Every failed provider call also writes an `Error Log` entry. Those entries
-deliberately contain no API secret and no payer payload, so they can be shared
-with support or forwarded to error telemetry as they are. Read the credentials
-from `Payrexx Settings` in Desk when you need to compare them, never from a log.
+Every final unexpected provider call writes exactly one direct Error Log entry.
+`Payrexx request failed` identifies transport failures and `Payrexx response
+failed` identifies HTTP-200 error envelopes or incomplete provider metadata;
+both contain only operation, exception class, bounded HTTP status
+(`http_status=None` without a response), and a fixed summary. The URL-rendering
+boundary uses `Payrexx pay URL unavailable`. All rows have empty metadata and
+contain no exception text, URLs, invoice/payer/request data, credentials, tokens,
+response bodies, or traceback frames. The boundary does not send the exception
+or frames to Sentry. Intermediate retries and tolerated statuses produce no row,
+and checkout/QR controllers do not add an outer entry. Read credentials from
+`Payrexx Settings` in Desk when you need to compare them, never from a log.
+
+All provider calls use a 5-second connect and 30-second read timeout. A timeout
+is surfaced through the same failure contract, makes exactly one transport
+request even for a custom API host, and never makes a Gateway-create POST safe
+to replay. Database-level transaction retry behavior is unchanged.
 
 ## 8. Troubleshoot A Payment Link
 

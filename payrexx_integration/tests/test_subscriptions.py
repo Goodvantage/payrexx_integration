@@ -107,9 +107,12 @@ class TestSubscriptionClient(UnitTestCase):
 		response = {"status": "error", "message": "Subscription is still active"}
 		with (
 			patch(f"{_CLIENT_MODULE}._execute_request", return_value=response),
+			patch(f"{_CLIENT_MODULE}.log_sanitized_error") as log_error,
 			self.assertRaises(PayrexxAPIError),
 		):
 			client.cancel_subscription(42, expected_statuses=(404,))
+		log_error.assert_called_once()
+		self.assertEqual(log_error.call_args.args[0], "payrexx_response")
 
 	def test_cancel_treats_verified_provider_404_as_idempotent_success(self):
 		client = self._client()

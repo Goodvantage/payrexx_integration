@@ -11,6 +11,8 @@ import requests
 from frappe.utils import get_request_session
 from requests import HTTPError
 
+from payrexx_integration.error_logging import TRANSACTION_ERRORS, log_sanitized_error
+
 DEFAULT_API_BASE_DOMAIN = "payrexx.com"
 DEFAULT_API_VERSION = "v1.16"
 ALLOWED_API_HOSTS_CONFIG = "payrexx_allowed_api_hosts"
@@ -40,14 +42,10 @@ class PayrexxClient:
 	``api_base_domain`` such as ``pay.goodvantage.ch``.
 
 	The secret is kept **only** inside the closure of the requests auth callable
-	built in ``__init__``. It is never stored as an attribute, never built into a
-	header dict, and never passed to another function as an argument, because a
-	failing provider request is logged with the frame variables of every frame in
-	the traceback (``frappe.log_error`` -> ``frappe.get_traceback(with_context=True)``,
-	plus Sentry when telemetry is on). That dump also expands plain objects, so an
-	``self.api_secret`` attribute would leak just like a ``{"x-api-key": ...}``
-	local: frappe's sanitizer redacts only the exact keys password/passwd/secret/
-	token/key/pwd and does not match ``x-api-key``.
+	built in ``__init__``. It is never stored as an attribute, built into a caller
+	header dict, or passed into the send function as an ordinary argument. Failed
+	requests cross the app-local context-free Error Log boundary; they never call
+	``frappe.log_error`` or send a live exception/stack to Sentry.
 	"""
 
 	def __init__(
@@ -110,7 +108,7 @@ class PayrexxClient:
 		"""
 		resp = self._delete(f"QrCode/{qr_code_uuid}/", expected_statuses=expected_statuses)
 		if isinstance(resp, dict) and resp.get("status") not in (None, "success"):
-			raise PayrexxAPIError(resp.get("message", "Unknown Payrexx error"))
+			raise _logged_response_error(resp.get("message", "Unknown Payrexx error"))
 
 	# ------------------------------------------------------------ Subscription
 
@@ -186,7 +184,7 @@ class PayrexxClient:
 			return {"status": "success"}
 		if not isinstance(response, dict) or response.get("status") != "success":
 			message = response.get("message", "Unknown Payrexx error") if isinstance(response, dict) else None
-			raise PayrexxAPIError(message or "Unknown Payrexx error")
+			raise _logged_response_error(message or "Unknown Payrexx error")
 		return response
 
 	# ----------------------------------------------------------------- internal
@@ -224,7 +222,9 @@ class PayrexxClient:
 				self._url(path, query),
 				authorize=self._authorize,
 				json_data=json_data,
-				expected_statuses=expected_statuses,
+				expected_statuses=self._initial_expected_statuses(
+					expected_statuses, retry_not_found=retry_not_found
+				),
 			)
 		except Exception as exc:
 			if self._should_retry_default_domain(exc, retry_not_found=retry_not_found):
@@ -252,7 +252,7 @@ class PayrexxClient:
 				self._url(path),
 				authorize=self._authorize,
 				data=data,
-				expected_statuses=expected_statuses,
+				expected_statuses=self._initial_expected_statuses(expected_statuses, retry_not_found=False),
 			)
 		except Exception as exc:
 			if self._should_retry_default_domain(exc, retry_not_found=False):
@@ -272,7 +272,13 @@ class PayrexxClient:
 		# not a basis for replaying a call that creates a Gateway — the orphan
 		# recovery path exists because an unknown create outcome is expensive.
 		try:
-			return _execute_request("POST", self._url(path), authorize=self._authorize, data=data)
+			return _execute_request(
+				"POST",
+				self._url(path),
+				authorize=self._authorize,
+				data=data,
+				expected_statuses=self._initial_expected_statuses((), retry_not_found=retry_not_found),
+			)
 		except Exception as exc:
 			if self._should_retry_default_domain(exc, retry_not_found=retry_not_found):
 				fallback_url = self._url(path, api_base_domain=DEFAULT_API_BASE_DOMAIN)
@@ -290,7 +296,7 @@ class PayrexxClient:
 				"DELETE",
 				self._url(path),
 				authorize=self._authorize,
-				expected_statuses=expected_statuses,
+				expected_statuses=self._initial_expected_statuses(expected_statuses, retry_not_found=False),
 			)
 		except Exception as exc:
 			# A concrete resource DELETE 404 is authoritative (the code is already
@@ -335,6 +341,15 @@ class PayrexxClient:
 		status_code = getattr(exc.response, "status_code", None)
 		return status_code in {401, 403} or (retry_not_found and status_code == 404)
 
+	def _initial_expected_statuses(
+		self, expected_statuses: Collection[int], *, retry_not_found: bool
+	) -> Collection[int]:
+		"""Suppress an intermediate custom-host failure that will be retried."""
+		if self.api_base_domain == DEFAULT_API_BASE_DOMAIN:
+			return expected_statuses
+		fallback_statuses = (401, 403, 404) if retry_not_found else (401, 403)
+		return tuple(dict.fromkeys((*expected_statuses, *fallback_statuses)))
+
 	def _url(
 		self,
 		path: str,
@@ -352,9 +367,8 @@ class PayrexxClient:
 def _api_key_auth(api_secret: str) -> Callable[[requests.PreparedRequest], requests.PreparedRequest]:
 	"""Build a requests auth callable that holds the API secret in its closure.
 
-	A closure cell is the one place the secret can live without appearing in the
-	frame variables (or expanded object attributes) that frappe writes to Error
-	Log — and to Sentry — for every failed provider request.
+	A closure cell keeps the secret outside ordinary frame variables and expanded
+	client attributes even if a caller later adds unsafe exception inspection.
 	"""
 
 	def apply_api_key(prepared_request: requests.PreparedRequest) -> requests.PreparedRequest:
@@ -376,10 +390,9 @@ def _execute_request(
 	"""Send one authenticated Payrexx request without leaking credentials or payer data.
 
 	Deliberately does not use ``frappe.integrations.utils.make_*_request``: that
-	helper takes the auth header and the form body as ordinary arguments, so both
-	become frame variables of framework code and are written verbatim into the
-	Error Log traceback it produces on failure. Response handling and the error
-	reporting contract are otherwise identical to ``make_request``.
+	helper takes the auth header and form body as ordinary arguments and reports
+	failures through core traceback/Sentry capture. Response parsing mirrors
+	``make_request``; error reporting intentionally does not.
 
 	``expected_statuses`` lets a caller declare provider HTTP statuses it handles
 	as a normal outcome; those are re-raised without an Error Log row. It is empty
@@ -393,8 +406,8 @@ def _execute_request(
 	prepared_request = session.prepare_request(
 		requests.Request(method=method, url=url, headers=headers, data=data, json=json_data, auth=authorize)
 	)
-	# The body is now sealed inside the prepared request, which does not expose it
-	# to traceback frame dumps. Drop this frame's own reference to the payer data.
+	# The body is now sealed inside the prepared request. Drop this frame's own
+	# reference before provider I/O and any failure handling.
 	data = None
 	json_data = None
 	# ``Session.request()`` merges proxy, CA-bundle, and client-certificate settings
@@ -411,22 +424,15 @@ def _execute_request(
 		)
 		response.raise_for_status()
 		return _parse_response(response)
+	except TRANSACTION_ERRORS:
+		raise
 	except Exception as exc:
 		# Statuses the caller declared expected are a normal, handled outcome, not
 		# staff-visible breakage: re-raise them so the caller still decides, but
-		# without an Error Log row. ``exc`` only ever repr's as its own message, so
-		# binding it keeps the secret-safety contract above intact.
+		# without an Error Log row. The direct helper reads only its class and status;
+		# it never serializes the exception or live frames.
 		if get_http_status(exc) not in expected_statuses:
-			if frappe.flags.integration_request_doc:
-				frappe.flags.integration_request_doc.log_error()
-			else:
-				# Bounded evidence only (F30): the exception class and HTTP
-				# status; the transport row carries the sanitized detail.
-				frappe.log_error(
-					title="Payrexx request failed",
-					message=f"operation=payrexx_request exception={type(exc).__name__} "
-					f"status={get_http_status(exc)}",
-				)
+			log_sanitized_error("payrexx_request", exc, http_status=get_http_status(exc))
 		raise
 
 
@@ -449,9 +455,16 @@ def _unwrap(resp: dict) -> dict:
 
 def _unwrap_list(resp: dict) -> list[dict]:
 	"""The same envelope, for endpoints that legitimately return many rows."""
-	if not resp or resp.get("status") != "success":
-		raise PayrexxAPIError((resp or {}).get("message", "Unknown Payrexx error"))
+	if not isinstance(resp, dict) or resp.get("status") != "success":
+		message = resp.get("message", "Unknown Payrexx error") if isinstance(resp, dict) else None
+		raise _logged_response_error(message or "Unknown Payrexx error")
 	return resp.get("data") or []
+
+
+def _logged_response_error(message: str) -> PayrexxAPIError:
+	exception = PayrexxAPIError(message)
+	log_sanitized_error("payrexx_response", exception, http_status=200)
+	return exception
 
 
 _SUBSCRIPTION_INTERVAL = re.compile(r"^P(\d{1,3})([MY])$")
