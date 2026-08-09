@@ -403,7 +403,12 @@ def _execute_request(
 	environment_settings = session.merge_environment_settings(prepared_request.url, {}, None, None, None)
 
 	try:
-		response = frappe.flags.integration_request = session.send(prepared_request, **environment_settings)
+		# Bounded (connect, read) timeout: get_payment_url runs inline in the
+		# guest checkout web request, so a hung provider connection must never
+		# pin a worker (an unbounded wait exhausts the pool and downs the site).
+		response = frappe.flags.integration_request = session.send(
+			prepared_request, timeout=(5, 30), **environment_settings
+		)
 		response.raise_for_status()
 		return _parse_response(response)
 	except Exception as exc:
