@@ -131,3 +131,25 @@ class TestSafeReturnUrl(UnitTestCase):
 				safe_return_url("/payment-success"),
 				"https://npo.example.org/payment-success",
 			)
+
+
+class TestHasAbsoluteHttpOrigin(UnitTestCase):
+	def test_the_public_seam_accepts_only_clean_http_origins(self):
+		from payrexx_integration.url_utils import has_absolute_http_origin
+
+		for value in ("https://example.org", "http://example.org", "https://example.org:8443"):
+			with self.subTest(value=value):
+				self.assertTrue(has_absolute_http_origin(value))
+		# The weaker consumer copies accepted several of these.
+		for value in (
+			"ftp://example.org",
+			"javascript://example.org",
+			"https://user:secret@example.org",
+			"https://example.org:notaport",
+			"example.org",
+			"//example.org",
+			"",
+			None,
+		):
+			with self.subTest(value=value):
+				self.assertFalse(has_absolute_http_origin(value))

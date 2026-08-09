@@ -105,5 +105,16 @@ def _normalized_http_origin(url: str) -> tuple[str, str, int] | None:
 	return parts.scheme, hostname, port if port is not None else (443 if parts.scheme == "https" else 80)
 
 
+def has_absolute_http_origin(value: str) -> bool:
+	"""Public seam for consumer apps (cross-app F12): True only for an
+	absolute HTTP(S) origin with a valid port and no embedded credentials.
+
+	Good NPO and Good Demo previously accepted any ``scheme://netloc`` pair
+	from site config here, including non-HTTP schemes and userinfo-bearing
+	hosts; this is the one parser they reuse instead.
+	"""
+	return _normalized_http_origin(cstr(value)) is not None
+
+
 def _has_absolute_host(host_name: str) -> bool:
 	return _normalized_http_origin(host_name) is not None
