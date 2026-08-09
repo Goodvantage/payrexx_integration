@@ -3,8 +3,9 @@
 """Payrexx edge rate limiting (600 requests / 5 minutes, AWS WAF).
 
 The limit surfaces as 405 and then 403 — neither of which reads like a rate
-limit — so an idempotent call backs off instead of hammering, and a POST never
-replays at all.
+limit. This module directly exercises GET backoff and a canonical-host POST 405;
+PUT and DELETE use the same helper in production but are not exercised here.
+Custom-host fallback is covered by the host-trust tests as a separate path.
 """
 
 from unittest.mock import Mock, patch
@@ -47,7 +48,7 @@ class TestRateLimitBackoff(UnitTestCase):
 		self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.5, 1.5])
 
 	def test_intermediate_attempts_do_not_log_but_the_last_one_does(self):
-		"""A call that recovers must not leave one Error Log row per attempt."""
+		"""A recovering GET must not leave one Error Log row per attempt."""
 		client = self._client()
 		success = {"status": "success", "data": [{"id": 7}]}
 		with (
@@ -91,8 +92,8 @@ class TestRateLimitBackoff(UnitTestCase):
 		self.assertEqual(execute.call_count, 1)
 		sleep.assert_not_called()
 
-	def test_post_is_never_replayed(self):
-		"""A create rejected at the edge probably never landed — probably is not enough."""
+	def test_canonical_post_405_is_not_replayed(self):
+		"""A canonical-host create rejected at the edge is not rate-limit replayed."""
 		client = self._client()
 		with (
 			patch(f"{_CLIENT_MODULE}._execute_request", side_effect=_http_error(405)) as execute,

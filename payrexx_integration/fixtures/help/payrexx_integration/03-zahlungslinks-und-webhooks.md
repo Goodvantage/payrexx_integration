@@ -28,6 +28,13 @@ Request, wird der neue Request unverändert erhalten und vor dem Provider-Kontak
 abgelehnt. Bezahlte, fehlgeschlagene, stornierte und abgebrochene historische
 Requests bleiben erhalten und blockieren keinen legitimen neuen Checkout.
 
+Ein POST direkt an `api.payrexx.com` wird weder wegen eines Rate Limits noch
+nach einem Datenbank-Deadlock nach Provider-Kontakt wiederholt. Bei einem
+konfigurierten eigenen API-Host besteht jedoch ein separater Fallback: Die
+Gateway-Erstellung sendet denselben POST nach 401/403/404 einmal an
+`api.payrexx.com`. Payrexx bietet dafür keinen Idempotency Key und dokumentiert
+`referenceId` nicht als eindeutigen Deduplizierungsschlüssel.
+
 ## Erfolgreiche Zahlung
 
 Nach erfolgreicher Zahlung passiert im Normalfall Folgendes:
@@ -49,23 +56,28 @@ Bei einer bestätigten Zahlung immer die gesamte Kette prüfen:
 
 Bei einem Chargeback bleibt der eingereichte Payment Entry unverändert. Die App setzt den Integration Request auf **Failed** und erstellt einmalig ein dringendes ToDo für die manuelle buchhalterische Gegenbuchung.
 
-Die lokale Checkout-Erstellung wird gemeinsam gespeichert: Ein Fehler bei
-Payrexx hinterlässt keinen vorzeitig bestätigten Payment Request oder
-unvollständigen Integration Request. Nach einer Gateway-Antwort enthält
+Die lokalen Checkout-Datensätze werden gemeinsam gespeichert: Ein Fehler bei
+Payrexx hinterlässt keinen vorzeitig bestätigten lokalen Payment Request oder
+unvollständigen lokalen Integration Request. Ein extern bereits erzeugter
+Gateway kann aber nicht Teil dieser Datenbanktransaktion sein. Nach einer
+Gateway-Antwort enthält
 `sites/<site>/logs/payrexx_integration.log` zuerst
 `[Payrexx Gateway recovery] state=local_commit_pending`. Ein normaler Commit
 ergänzt `state=local_commit_confirmed`, ein Rollback
 `[Payrexx possible orphan Gateway] state=local_rollback_confirmed`. Bleibt ein
 Pending-Eintrag ohne Ergebnis, ist der SQL-Commit-Ausgang unklar. Den lokalen
 Integration Request und den Gateway über `referenceId`/Gateway-ID in Payrexx
-prüfen. Nur einen unbenutzten Gateway ohne Transaktion und ohne vollständigen
-lokalen Besitzer löschen. Bei vorhandener Transaktion oder unklarem Ausgang
-nicht erneut bezahlen und nichts automatisch löschen, sondern die bestehende
-Zahlung abstimmen.
+prüfen. Payrexx unterstützt `DELETE /Gateway/{id}/`, die App stellt dafür aber
+keinen Wrapper bereit. Gibt es keinen Gateway, ist nichts zu löschen. Nur mit
+ausdrücklicher Provider-Berechtigung jeden exakten gefundenen Gateway einzeln
+und nur dann löschen, wenn sein Abruf sowie die Transaktionssuche zeigen, dass
+alle `invoices[].transactions[]` leer sind. Gateways mit Transaktion oder
+unklarem Host/Ausgang nicht erneut bezahlen oder löschen, sondern die bestehende
+Evidenz abstimmen.
 
 ## Nicht unterstützte Aktionen
 
-Die App startet keine spätere Belastung für `authorized`, keinen Capture für `reserved`, keine Stornierung/Voids und keine Rückerstattung. Ein `refunded` Webhook wird gespeichert, aber nicht automatisch in ERPNext verbucht oder zurückgebucht. Solche Aktionen in Payrexx ausführen und die freigegebene Gegenbuchung in ERPNext manuell erfassen. Eingereichte Payment Entries nicht allein aufgrund eines Webhook-Status automatisch stornieren.
+Die App startet keine spätere Belastung für `authorized`, keinen Capture für `reserved`, keine Stornierung/Voids und keine Rückerstattung. Payrexx unterstützt das Löschen eines Gateways, die App stellt dafür jedoch keinen Gateway-DELETE-Wrapper bereit. Ein `refunded` Webhook wird gespeichert, aber nicht automatisch in ERPNext verbucht oder zurückgebucht. Solche Aktionen in Payrexx ausführen und die freigegebene Gegenbuchung in ERPNext manuell erfassen. Gateways nur mit exaktem Nachweis löschen, dass keine Transaktion vorhanden ist. Eingereichte Payment Entries nicht allein aufgrund eines Webhook-Status automatisch stornieren.
 
 ## Fehleranalyse
 

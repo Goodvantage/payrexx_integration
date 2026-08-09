@@ -55,10 +55,15 @@ allowlist contains the final host the client contacts
 `https://...`, credentials, paths, queries, and fragments are never accepted.
 
 If that custom API domain rejects an otherwise valid instance key with 401/403,
-the client retries on `api.payrexx.com`. A 404 retries only for the credential
-probe or Gateway creation, where the custom API host may not be provisioned. A
-404 for a specific existing-checkout Gateway lookup does not fall back; verify
-the configured API domain and Gateway in Payrexx instead.
+the client repeats the request once on `api.payrexx.com`. A 404 repeats only for
+the credential probe or Gateway creation, where the custom API host may not be
+provisioned. Therefore Gateway creation on a custom host can send the same POST
+twice, once per host, after 401/403/404. A 404 for a specific existing-checkout
+Gateway lookup does not fall back; verify the configured API domain and Gateway
+in Payrexx instead. This host fallback is separate from rate-limit and database
+deadlock retry. Payrexx exposes no idempotency-key field and does not document
+`referenceId` as unique, so do not assume the provider de-duplicates the two
+requests.
 
 ## 2. Create The Payment Gateway Account
 
@@ -129,8 +134,11 @@ Payrexx Payment Request for the invoice, across all Payrexx settings rows. If
 another one exists, the new/manual submission is preserved but rejected before
 provider contact. Paid, failed, cancelled, and docstatus-cancelled history does
 not block a legitimate new checkout. Concurrent first clicks and lock waits are
-retried at most three times only before a Payrexx Gateway POST; provider creation
-is never replayed after contact has started.
+retried at most three times only before a Payrexx Gateway POST. After contact
+starts, the checkout transaction is not retried for a database deadlock, and
+canonical-host POSTs are not retried for rate limiting. A configured custom API
+host remains the exception: its Gateway-create POST currently falls back once to
+`api.payrexx.com` after 401/403/404.
 The GET endpoint commits its lazy-created local records only after Payrexx has
 returned a valid checkout URL and complete provider metadata. Integration
 Request creation itself does not commit. A failed provider call therefore rolls
@@ -241,7 +249,7 @@ If saving Payrexx Settings fails:
 
 1. Confirm the instance name matches the first subdomain of the checkout/login domain.
 2. Confirm the API base domain is correct (`payrexx.com` for normal accounts, e.g. `pay.goodvantage.ch` for GoodVantage partner accounts).
-3. For a custom domain, confirm its exact final host is present in the `payrexx_allowed_api_hosts` JSON list, e.g. `api.pay.goodvantage.ch`. A 401/403 retries once on `api.payrexx.com`; a 404 retries only for credential probing and Gateway creation, not a concrete Gateway retrieval.
+3. For a custom domain, confirm its exact final host is present in the `payrexx_allowed_api_hosts` JSON list, e.g. `api.pay.goodvantage.ch`. A 401/403 repeats the request once on `api.payrexx.com`; a 404 repeats only credential probing and Gateway creation, not a concrete Gateway retrieval. For Gateway creation this is a second POST, not a rate-limit retry.
 4. Confirm the Automation User is present, enabled, and a System User.
 5. Confirm the API secret is current.
 6. Confirm outbound network access from the bench.
@@ -319,9 +327,9 @@ payer data. Search both local state and Payrexx by `referenceId` and Gateway id:
 
 1. If `local_commit_confirmed` exists and the complete local Integration Request exists, use that checkout; do not create another.
 2. If no Gateway exists, retry the original signed invoice link after the local issue is fixed.
-3. If an unused Gateway exists and has no transaction and no complete local request owns it, delete that Gateway in the Payrexx dashboard, then retry.
-4. If a transaction exists or commit outcome remains ambiguous, do not delete or pay again; reconcile that existing transaction through the normal webhook/success path and accounting review.
-5. Never manually commit/recreate incomplete local state or automate provider deletion to close an unpaired pending record.
+3. If one or more unused Gateways exist and no complete local request owns them, retrieve every exact Gateway id and search the exact `referenceId` in Payrexx. With explicit Gateway DELETE permission, conditionally delete each Gateway only when its `invoices[].transactions[]` collections and the provider transaction search are empty; if no Gateway exists, there is nothing to delete.
+4. If any Gateway has a transaction or its commit/host outcome remains ambiguous, do not delete that Gateway or pay again; reconcile that existing evidence through the normal webhook/success path and accounting review.
+5. Never manually commit/recreate incomplete local state or automate provider deletion to close an unpaired pending record. Payrexx documents `DELETE /Gateway/{id}/`, but this app deliberately exposes no wrapper for it.
 
 For a confirmed Payment Request, verify that its status is **Paid**, its
 outstanding amount is zero, and exactly one submitted Payment Entry references
@@ -389,12 +397,14 @@ automatically. Repeated chargeback callbacks do not create additional ToDos.
 ### Unsupported Provider Operations
 
 This app does not initiate captures of `reserved` transactions, later charges of
-`authorized` transactions, checkout cancellation/voids, or refunds. It records
-provider refund/dispute webhooks as evidence and accounting-review work, but
-posts no ERPNext reversal. Perform the provider action in Payrexx and post the
-approved ERPNext reversal manually. Do not infer a refund from a failed or
-chargeback Integration Request, and never cancel submitted Payment Entries
-automatically.
+`authorized` transactions, checkout cancellation/voids, or refunds. Payrexx also
+documents Gateway DELETE, but the app has no Gateway-delete wrapper or Desk
+action. It records provider refund/dispute webhooks as evidence and
+accounting-review work, but posts no ERPNext reversal. Perform an authorized
+provider action in Payrexx and post the approved ERPNext reversal manually. If
+Gateways are discovered, conditionally delete each exact one only after proving
+it transaction-free; do not infer a refund from a failed or chargeback
+Integration Request, and never cancel submitted Payment Entries automatically.
 
 ## 10. Handle A Refund Issued In Payrexx
 
@@ -587,7 +597,99 @@ Restart the backend workers after disabling the gate, then call preflight once
 and require HTTP 403 before closing the acceptance run.
 
 Payrexx test transactions cannot be deleted. Keep their run marker and exact
-ERPNext records as acceptance evidence; never add destructive provider cleanup.
+ERPNext records as acceptance evidence; never add destructive provider cleanup
+to settlement acceptance. The separate run below may conditionally delete each
+of zero or more unvisited, exactly identified Gateways only after proving that
+it has no transaction.
+
+### Verify custom-host fallback safely (deferred)
+
+This is a separate transport test, not part of ordinary settlement acceptance.
+It is **deferred** because there is currently no dedicated controllable custom
+API target and no confirmed operator permission to call provider Gateway DELETE.
+Do not run it against a shared custom host, a Live instance, or production
+credentials. A custom-host Gateway create can produce zero, one, or multiple
+provider objects, and neither an idempotency key nor documented `referenceId`
+uniqueness protects it.
+
+When both prerequisites exist, use a dedicated direct one-shot harness. It must
+read credentials from the disposable sandbox Settings row, construct a
+`PayrexxClient` for the dedicated target without saving or mutating that row,
+and call `create_gateway()` once. It must **not** call `pay_invoice`,
+`PayrexxSettings.get_payment_url()`, ERPNext `make_payment_request`, or any path
+that creates a local Payment Request or Integration Request.
+
+1. Before changing configuration, snapshot the exact sandbox Settings values
+   and the exact `payrexx_allowed_api_hosts` representation, including whether
+   the site-config key is absent, present with an empty list, or populated.
+   Snapshot the relevant Payment Request, Integration Request, Error Log, and
+   Payrexx recovery-log baselines. Start an outer `try/finally` immediately
+   after this snapshot; every following step, including validation and cleanup,
+   belongs inside `try`.
+2. Add only the exact dedicated target to the temporary allowlist and pass its
+   base domain directly to the harness client; do not save the Settings row.
+   Keep the injector disarmed. Clear/reload site configuration, then validate
+   the source row and harness client before fault injection: expected sandbox
+   instance, unchanged Settings values, app API `v1.16`, exact final-host
+   allowlist, accepted small test currency/amount, working credentials, and one
+   healthy non-creating `GET /Gateway/0/` through the custom target. Confirm the
+   target recorded one probe and the client did not enter canonical fallback.
+   Confirm provider permission to retrieve and DELETE sandbox Gateways. Before
+   arming the fault, prove that cleanup path with a separate unique
+   `PRX-CLEANUP-YYYYMMDD-<random>` canary: create it once through the healthy
+   dedicated target with the same direct harness, retrieve its exact Gateway id,
+   prove every `invoices[].transactions[]` collection empty, DELETE that exact id
+   on its source host, and confirm by retrieval plus dashboard search that it is
+   gone. Also confirm the canary created no local Payment Request, Integration
+   Request, or recovery-journal row. Abort before the fallback POST if canary
+   creation is ambiguous, any transaction exists, deletion fails, or absence
+   cannot be proven.
+3. Choose one status (401, 403, or 404) and a unique
+   `PRX-FALLBACK-YYYYMMDD-<random>` `referenceId`. Confirm provider/dashboard
+   searches return no existing Gateway or transaction for that exact reference.
+   Arm the target for exactly the next matching form-encoded
+   `POST /v1.16/Gateway/`: record it, return the selected status, do not forward
+   it, then disarm automatically. Use a new reference and fresh one-shot arm for
+   every status; never combine statuses in one run.
+4. Invoke the direct harness exactly once with only the small positive
+   amount/currency, unique `referenceId`, non-sensitive purpose, and safe
+   sandbox redirects. Capture its returned Gateway id or exception plus the
+   custom-target request count and canonical response metadata. Never open the
+   checkout URL, enter payer data, or submit payment.
+5. Assert local payment state exactly: no new Payment Request or Integration
+   Request and no Payrexx recovery-journal entry. The injected first-host HTTP
+   failure may create the client's normal Error Log; retain its redacted name as
+   expected transport evidence rather than deleting it or inventing local
+   payment ownership.
+6. Resolve external state without assuming `referenceId` uniqueness. Combine
+   custom-target logs, harness response/error, canonical provider search, and
+   dashboard search; retrieve zero, one, or every discovered Gateway id on its
+   exact host. Record each id, host, status, invoices, and nested transactions.
+7. If no Gateway exists, record that no deletion was required. If one or more
+   exist, evaluate each separately. With the pre-confirmed permission,
+   conditionally delete only an exact Gateway whose retrieval and provider
+   transaction search both prove all `invoices[].transactions[]` empty. Confirm
+   each attempted deletion by retrieval/search. Leave every paid, ambiguous, or
+   unprovable Gateway untouched for reconciliation and incident review; cleanup
+   failure must not trigger another create.
+8. In the outer `finally`, unconditionally disarm the injector first, restore
+   the exact prior Settings values and exact prior allowlist representation,
+   clear/reload configuration, and verify restoration from a fresh process.
+   This restoration is attempted even when validation, create, inspection, or
+   conditional deletion raises. If restoration cannot be proven, keep the
+   incident open and do not run another status.
+9. Retain the redacted validation result, request/adapter counts, status,
+   zero/one/multiple Gateway findings, local-state assertion, conditional
+   deletion results, and restoration proof. Do not retain API secrets, hashes,
+   checkout URLs, or payer data.
+
+The official PHP SDK v2.0.15 is not a substitute for this run. Its communicator
+invokes the configured adapter once and has no built-in custom-host fallback or
+idempotency layer; an injected adapter may implement its own retries or multiple
+wire requests. Tagged code defaults to API `v1.15`, while the same tag's README
+inconsistently says API `v1.11` and calls SDK v2.0.0 current stable. This app pins
+API `v1.16`. Its form-encoded POST remains supported by Payrexx's official
+Gateway OpenAPI.
 
 ## 13. Static QR Codes (TWINT)
 
@@ -661,6 +763,12 @@ bench --site development16.localhost run-tests \
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_subscriptions
 ```
+
+`test_rate_limit` directly covers GET backoff and a canonical-host POST 405 that
+is not rate-limit retried. PUT and DELETE use the same shared helper in runtime
+code but are not exercised by that module. `test_checkout_security` separately
+covers the current custom-host fallback with mocked responses; neither suite is
+live sandbox evidence.
 
 Browser tests live in the Playwright project:
 

@@ -46,11 +46,13 @@ ports other than explicit HTTPS 443. `PayrexxSettings._client()` validates this
 destination before reading the Password field, and the client validates it
 again before constructing request headers. If an allowed custom API domain
 rejects a supported operation with 401/403, the client retries the same request
-against trusted `api.payrexx.com`. A 404 retries only for the credential probe
-or Gateway collection/create operation, where it can mean the custom API host
-is not provisioned. A 404 retrieving a concrete Gateway is authoritative and
-never falls back, preventing a missing custom-domain resource from being read
-from another API domain.
+once against trusted `api.payrexx.com`. A 404 retries only for the credential
+probe or Gateway collection/create operation, where it can mean the custom API
+host is not provisioned. This means custom-host Gateway creation currently can
+send the identical POST twice, first to the configured host and then to
+`api.payrexx.com`, after 401/403/404. A 404 retrieving a concrete Gateway is
+authoritative and never falls back, preventing a missing custom-domain resource
+from being read from another API domain.
 
 Payrexx enforces 600 requests per 5 minutes at the CDN edge. It answers `405`
 first and `403` once the limit is well exceeded, so neither status reads like a
@@ -59,9 +61,29 @@ backoff on `405`/`429` and tolerate those statuses on intermediate attempts, so 
 call that recovers does not leave one Error Log row per attempt while a
 persistent limit still surfaces on the final attempt. `403` keeps its existing
 meaning (rejected API secret, and the custom-domain fallback trigger) and is not
-treated as a rate limit. A POST is never replayed: an edge rejection cannot be
-distinguished with certainty from a Gateway that was in fact created.
-The API version is pinned once as `DEFAULT_API_VERSION` (currently `v1.16`).
+treated as a rate limit. A canonical-host POST is not rate-limit retried because
+an edge rejection cannot be distinguished with certainty from a Gateway that
+was in fact created. The checkout boundary likewise stops deadlock retry as soon
+as provider contact starts. Neither rule disables the separate custom-host
+fallback above.
+
+There is no idempotency-key parameter in the provider Gateway contract or this
+app. Payrexx documents `referenceId` as the merchant's internal reference, but
+does not document it as unique or as a de-duplication key. The local invoice and
+Payment Request locks prevent ordinary duplicate checkout creation inside one
+site; they cannot make a provider replay idempotent across hosts.
+
+The official PHP SDK v2.0.15 is a qualified comparison baseline, not this app's
+runtime. Its communicator invokes the configured adapter once per API call and
+contains no built-in custom-host fallback or idempotency layer; a caller-injected
+adapter may still perform retries or multiple wire requests. Tagged code
+defaults to API `v1.15`, while the same tag's README is stale/inconsistent: it
+says API `v1.11` and calls SDK v2.0.0 current stable even though the code declares
+client v2.0.15 and supports/defaults through `v1.15`. This app pins
+`DEFAULT_API_VERSION` to `v1.16`. The provider's current Gateway OpenAPI
+explicitly accepts `application/x-www-form-urlencoded`, so the app's
+form-encoded POST body remains an official wire format even though the SDK's
+bundled cURL/Guzzle adapters send JSON for ordinary non-file POSTs.
 
 ## Important Modules
 
@@ -117,7 +139,9 @@ The complete pay-link checkout boundary retries a changed lock-order discovery
 or `QueryDeadlockError` at most three times, rolling back before each replay.
 Retries are allowed only while the current attempt has not started the Payrexx
 Gateway POST. Once provider contact begins, any later deadlock is rolled back
-and surfaced; external Gateway creation is never blindly replayed.
+and surfaced; the checkout transaction is not replayed. This boundary rule does
+not suppress the client's current custom-host fallback, which can repeat Gateway
+creation once on canonical `api.payrexx.com` after a custom-host 401/403/404.
 
 Payrexx checkout and automatic settlement support Payment Requests whose source
 is a Sales Invoice. The controller checks the Payment Request source before
@@ -157,10 +181,16 @@ before issuing SQL `COMMIT`. If that SQL call raises, neither outcome callback
 can prove the result. The already-written, unpaired `local_commit_pending` line
 therefore remains conservative durable recovery evidence. The app cannot safely
 add an internal commit or automatically delete the Gateway, because the commit
-outcome may be unknown and a provider transaction may already exist. Operators
-must compare the local Integration Request and Payrexx reference/id, delete only
-an unused Gateway with no transaction, and retry only after that review;
-incomplete local state is never committed as recovery.
+outcome may be unknown and a provider transaction may already exist. Payrexx
+documents `DELETE /Gateway/{id}/`, but this app exposes no wrapper for it.
+Operators with explicit provider DELETE permission must compare the exact local
+Integration Request, host, `referenceId`, and every discovered Gateway id, then
+retrieve every matching Gateway. If none exists, no deletion is needed. Each
+external Gateway may be deleted conditionally in the provider dashboard/API only
+when its retrieval and transaction search prove every
+`invoices[].transactions[]` collection empty. Any paid or uncertain Gateway
+remains for reconciliation; incomplete local state is never committed as
+recovery.
 
 ERPNext `make_payment_request` re-uses any existing draft Payment Request for
 the same invoice without first applying the requested gateway. The pay-link
@@ -294,10 +324,12 @@ chargeback, settlement, or pay-link checkout boundary. Locked one-attempt
 helpers propagate the error. The boundary rolls back the failed transaction,
 waits with bounded linear backoff, and replays the whole atomic unit from a fresh
 snapshot, for at most three attempts; the final failure is also rolled back
-before it is re-raised. Checkout is stricter: it retries only before provider
-contact and never repeats a Gateway POST. This prevents code from continuing
-inside an invalid transaction and ensures a partial Integration Request or
-Payment Entry attempt is never retained.
+before it is re-raised. Checkout is stricter: its transaction boundary retries
+only before provider contact and does not repeat a canonical-host Gateway POST
+for a deadlock or rate limit. The separate custom-host 401/403/404 fallback can
+still make a second Gateway POST during that one provider-contact attempt. This
+prevents code from continuing inside an invalid transaction and ensures a
+partial Integration Request or Payment Entry attempt is never retained.
 Duplicate confirmed callbacks return after observing the locked completed row,
 while separate requests for the same Payment Request are serialized on that
 Payment Request.
@@ -467,7 +499,11 @@ The payment client surface is `create_gateway`, `retrieve_gateway`, and
 `retrieve_subscription`, `list_subscriptions`, `update_subscription` and
 `cancel_subscription`; paged, time-bounded `list_transactions`; plus the
 non-payment static QR helpers `create_qr_code` / `delete_qr_code` documented
-above. There is no Gateway deletion.
+above. Payrexx itself documents `DELETE /Gateway/{id}/` and the official PHP SDK
+includes a Gateway-delete example, but this app exposes no Gateway-delete method
+or Desk action. Provider cleanup remains an explicitly authorized manual action:
+no-op when none exists, and conditional per exactly identified,
+transaction-free Gateway, never an application recovery primitive.
 
 `create_subscription` is rarely usable: Payrexx requires a `userId` that only
 exists once the payer has transacted, so subscriptions are normally created by
@@ -669,6 +705,23 @@ owner-readable redacted state. A human must complete the provider sandbox page
 through the normal invoice payment link; the runner does not automate cards,
 CAPTCHA, 3-D Secure, callback replay, or reconciliation.
 
+Live custom-host fallback verification is deliberately deferred. A safe run
+requires a dedicated sandbox instance, a controllable one-shot custom API target,
+a direct harness that constructs a target-specific client without saving the
+sandbox Settings row and calls `PayrexxClient.create_gateway()` once without
+creating Payment Request or Integration Request rows, and confirmed permission
+to retrieve and conditionally DELETE transaction-free provider Gateways. The
+harness validates settings and a healthy non-creating custom-host probe, then
+creates, proves empty, deletes, and confirms absence of a separate cleanup
+canary before arming one 401/403/404 fault. It accounts for zero/one/multiple
+external Gateways and the expected transport Error Log while asserting payment rows unchanged,
+and wraps all configuration mutation, provider inspection, and conditional
+cleanup in an outer `try/finally` that always disarms injection and restores the
+exact prior settings/allowlist representation. This environment currently has
+neither the dedicated target nor confirmed Gateway DELETE permission. The full
+runbook is in `HOW_TO.md` §12; no live provider claim is inferred from mocked
+tests.
+
 ## Cross-App Integration
 
 Good Event's default invoice renderer imports `payrexx_pay_url`. Missing or
@@ -711,6 +764,14 @@ bench --site development16.localhost run-tests \
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_subscriptions
 ```
+
+`test_rate_limit` directly proves GET backoff and that a canonical-host POST 405
+is not retried. PUT and DELETE use the same shared helper in runtime code but are
+not exercised by that module. It does not prove that all POST paths make one
+HTTP request. The separate custom-host tests in `test_checkout_security` prove
+the current mocked fallback, including a second Gateway POST to
+`api.payrexx.com` after custom-host 404. The deferred provider run above remains
+the live verification requirement.
 
 ```bash
 cd frappe-bench/apps/payrexx_integration/playwright

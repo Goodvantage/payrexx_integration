@@ -132,6 +132,13 @@ The REST API version is code-pinned at `v1.16` through
 `payrexx_client.DEFAULT_API_VERSION`. It is intentionally not a settings field:
 an API-version change is an integration release that must pass the complete
 client and settlement suite rather than an unreviewed per-site toggle.
+The official PHP SDK v2.0.15 is not the version baseline for this app. Its code
+defaults to API `v1.15`; the communicator invokes its configured adapter once
+and implements neither built-in custom-host fallback nor an idempotency key. An
+injected adapter may still perform retries or multiple wire requests. The same
+tag's README is stale/inconsistent: it says API `v1.11` and calls SDK v2.0.0
+current stable, while tagged code declares v2.0.15 and supports/defaults through
+`v1.15`. The app's `v1.16` pin and replay behavior are separate contracts.
 
 Installation is in `README.md`; creating the settings row, the
 `Payment Gateway Account`, and the Payrexx webhook is in `HOW_TO.md` §1–§4.
@@ -152,6 +159,7 @@ here.
 | `POST` | `/Gateway/` | Create a hosted checkout. Returns `{id, link, hash, status}`. |
 | `GET` | `/Gateway/{id}/` | Look up a gateway and its `invoices[].transactions[]`. |
 | `GET` | `/Gateway/0/` | Credential ping — HTTP 200 with `status: error` means the credentials are valid. |
+| `DELETE` | `/Gateway/{id}/` | Provider-supported Gateway deletion. This app exposes no wrapper; manual cleanup requires exact transaction-free evidence and provider permission. |
 | `POST` | `/Subscription/` | Create a subscription for an already-known Payrexx contact. Normal signup uses Gateway subscription parameters instead. |
 | `GET` | `/Subscription/` or `/Subscription/{id}/` | List or retrieve subscriptions; list pagination uses query parameters. |
 | `GET` | `/Transaction/` | Recover real transaction evidence by bounded UTC/query pagination. |
@@ -159,11 +167,26 @@ here.
 | `DELETE` | `/Subscription/{id}/` | Cancel a subscription immediately. |
 | `POST` / `DELETE` | `/QrCode/` / `/QrCode/{uuid}/` | Create or delete a permanent static QR code. |
 
-There is no Gateway deletion, capture, later charge, void, or refund initiation
-(`REQUIREMENTS.md` REQ-PRX-BND-01).
-Only Gateway creation may retry a custom-host POST 404 against the canonical
-host. Subscription and QR creation treat 404 as authoritative to avoid creating
-the same external resource on a second host.
+The provider has Gateway deletion, but this app exposes no Gateway-delete,
+capture, later-charge, void, or refund-initiation method (`REQUIREMENTS.md`
+REQ-PRX-BND-01). For zero discovered Gateways no deletion is needed; an operator
+may conditionally use provider Gateway DELETE on each exact discovered Gateway
+only when retrieval and transaction search prove it contains no transaction.
+
+A POST sent directly to canonical `api.payrexx.com` has no rate-limit retry, and
+the checkout transaction is not deadlock-retried after provider contact. The
+custom-host fallback is a separate exception: every custom-host POST can repeat
+once on canonical 401/403, and Gateway creation also repeats there on 404.
+Therefore custom-host Gateway creation can make two POST requests for one app
+call. Subscription and QR creation treat 404 as authoritative to avoid that
+second-host creation. Neither the provider contract nor this app has an
+idempotency key, and Payrexx describes `referenceId` only as an internal merchant
+reference, not as unique or de-duplicating.
+
+The app sends `application/x-www-form-urlencoded`; that remains an official
+media type in Payrexx's Gateway OpenAPI. The official PHP SDK v2.0.15's bundled
+cURL/Guzzle adapters send JSON for ordinary non-file creates, but that transport
+choice does not make the provider's form encoding obsolete.
 
 ### `POST /Gateway/` parameters emitted by this app
 
@@ -229,6 +252,16 @@ Automated suites and their commands are listed in `DOCUMENTATION.md`
 ("Testing"). This checklist covers what only a human on a real (sandbox) tenant
 can confirm:
 
+The custom-host fallback is not part of this general checklist. Its safe live
+run is deferred until a dedicated controllable custom API target and confirmed
+Gateway DELETE permission exist. It uses a direct one-shot client harness that
+does not save the source Settings row, not a normal checkout or local Integration
+Request flow; validates settings before arming one fault; handles exact local
+and zero/one/multiple external state; first proves a separate transaction-free
+Gateway canary can be deleted and confirmed absent; and restores settings/allowlists
+unconditionally in `finally`. Follow `HOW_TO.md` §12 and never use a shared host
+or production credentials.
+
 - [ ] `bench --site <site> migrate` runs cleanly; `Payrexx Settings` appears in
       the DocType list.
 - [ ] Saving a settings row creates a `Payment Gateway` named
@@ -261,10 +294,11 @@ can confirm:
 
 ## 5. External references
 
-- Payrexx Gateway API — <https://developers.payrexx.com/reference/create-a-gateway>
+- Payrexx Gateway create API — <https://developers.payrexx.com/reference/create-a-gateway>
+- Payrexx Gateway delete API — <https://developers.payrexx.com/reference/delete-a-gateway>
 - Payrexx Webhook docs — <https://docs.payrexx.com/developer/guides/webhook>
 - Payrexx Build Gateway guide — <https://docs.payrexx.com/developer/guides/gateway/build>
-- Payrexx PHP SDK (auth pattern) — <https://github.com/payrexx/payrexx-php>
+- Payrexx PHP SDK v2.0.15 comparison baseline — <https://github.com/payrexx/payrexx-php/tree/v2.0.15>
 - Frappe `payments` app — <https://github.com/frappe/payments>
 - In-bench analog — `apps/payments/payments/payment_gateways/doctype/paymob_settings/paymob_settings.py`
 - Stripe-style `on_update` registration — `apps/payments/payments/payment_gateways/doctype/stripe_settings/stripe_settings.py`

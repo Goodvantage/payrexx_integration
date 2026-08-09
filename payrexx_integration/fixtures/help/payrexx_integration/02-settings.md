@@ -48,6 +48,19 @@ Benutzerinformationen, Query/Fragment und andere Ports als HTTPS 443 werden
 abgelehnt, bevor das API Secret gelesen wird. Nach einer Änderung die
 langlaufenden Web- und Worker-Prozesse neu starten.
 
+Bei einem eigenen API-Host wiederholt die App eine abgelehnte Anfrage nach
+401/403 einmal auf `api.payrexx.com`; bei der Gateway-Erstellung gilt dies auch
+für 404. Eine Gateway-Erstellung kann deshalb denselben POST einmal pro Host
+senden. Das ist kein Rate-Limit- oder Datenbank-Deadlock-Retry. Für den POST gibt
+es keinen Idempotency Key, und Payrexx dokumentiert `referenceId` nicht als
+eindeutig. Beim offiziellen PHP SDK v2.0.15 ruft der Communicator pro API-Aufruf
+den konfigurierten Adapter einmal auf und besitzt keinen eingebauten Host-
+Fallback oder Idempotency Key; ein eigener Adapter kann trotzdem mehrere
+Netzwerkanfragen senden. Der Code verwendet standardmässig API `v1.15`, während
+die README desselben Tags widersprüchlich API `v1.11` und SDK v2.0.0 als aktuell
+nennt. Die App bleibt bewusst auf API `v1.16`; ihr Form-POST ist weiterhin ein
+offiziell dokumentiertes Payrexx-Format.
+
 Sobald **Gateway Name** ausgefüllt ist, zeigt bereits das ungespeicherte Formular die Webhook URL an. Diese URL zuerst in Payrexx anlegen, den dort erzeugten Signing Key in **Webhook Signing Key** eintragen und erst danach speichern. Beim Speichern werden die API-Zugangsdaten geprüft und der Payment Gateway `Payrexx-<Gateway Name>` erzeugt.
 
 ## Payment Gateway Account
@@ -70,6 +83,15 @@ Fehlt dieser Datensatz, kann der erste Klick auf einen gültigen Rechnungslink k
 3. Payment Gateway Account für Testfirma und Testwährung anlegen.
 4. Prüfen, ob Integration Request, Payment Request, Payment Entry und Rechnung korrekt aktualisiert werden.
 5. Danach erst Live-Zugangsdaten und Live-Payment-Gateway-Account hinterlegen.
+
+Der separate Live-Nachweis des Custom-Host-Fallbacks ist aufgeschoben, bis ein
+eigener kontrollierbarer Sandbox-API-Host und eine bestätigte Berechtigung zum
+Löschen leerer Gateways vorhanden sind. Er muss den Client einmal direkt ohne
+Speichern der Settings und ohne Payment Request/Integration Request aufrufen,
+die Settings vor der Fehlerinjektion prüfen, null/einen/mehrere externe Gateways
+exakt behandeln und Settings sowie Allowlist in `finally` immer
+wiederherstellen. Diesen Test nie auf einem gemeinsam genutzten oder produktiven
+Host durchführen.
 
 ## Häufige Fragen
 

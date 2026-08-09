@@ -48,7 +48,7 @@ procedures), and the code. Record new or changed requirements in
 | `gateway_selection.py` | Canonical strict resolver shared by native flows and downstream apps. Supports explicit selection, a caller-owned site-config key, and unambiguous single-row fallback. |
 | `payrexx_integration/payrexx_integration/doctype/payrexx_settings/` | The settings DocType. One row per environment (`Sandbox` / `Live`), each with its own required automation user. `on_update` auto-creates the matching `Payment Gateway` row (`Payrexx-<gateway_name>`). |
 | `payrexx_integration/payrexx_integration/doctype/payrexx_subscription_event/` | Durable, non-PII recurring-transaction state for installments and later-installment reversals. Its deterministic gateway/event key advances monotonically; claimed same-status replays stop, while Unclaimed states remain retryable from a sanitized financial payload. A raised provider rolls back fully before that Unclaimed row is retained, and the daily worker redrives it before transaction/status reconciliation. |
-| `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client for Gateway, Subscription, and static-QR operations. **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The API version is code-pinned at `v1.16`; it is not a settings field. The legacy `ApiSignature` body field is no longer used. Canonical `*.payrexx.com` API hosts are trusted by default; custom Platform hosts require exact `payrexx_allowed_api_hosts` site-config entries and are validated before secret access. The secret lives only in the closure of the `requests` auth callable — see "Never let the API secret become a variable" below. |
+| `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client for Gateway, Subscription, and static-QR operations. **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The API version is code-pinned at `v1.16`; it is not a settings field. The legacy `ApiSignature` body field is no longer used. Canonical `*.payrexx.com` API hosts are trusted by default; custom Platform hosts require exact `payrexx_allowed_api_hosts` site-config entries and are validated before secret access. Canonical POSTs have no rate-limit retry, but custom-host Gateway creation can repeat once on `api.payrexx.com` after 401/403/404. The secret lives only in the closure of the `requests` auth callable — see "Never let the API secret become a variable" below. |
 | `payrexx_integration/payrexx_integration/payrexx/webhook_validator.py` | HMAC-SHA256 verification of `X-Webhook-Signature`. Verifies Payrexx's documented hex encoding first and retains base64 as an observed compatibility form. The signing key is **separate** from the API secret (configured per webhook in the Payrexx dashboard). |
 | `api.py::payrexx_pay_url(sales_invoice, gateway_name=None)` | Jinja helper (registered via `hooks.py.jinja`). Resolves the gateway and returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
 | `api.py::pay_invoice(si=None, token=None, gateway_name=None)` | Whitelisted GET redirect endpoint. Verifies the invoice-and-gateway-bound HMAC token, locks/revalidates the wholly unpaid invoice and exact submitted/Requested Payment Request plus Integration Request checkout metadata, lazy-creates through ERPNext only when safe, and 302s to Payrexx. Because Frappe otherwise rolls back GET transactions, it sets `frappe.local.flags.commit` only after atomic local setup and checkout URL resolution. **All args remain optional kwargs** so missing-param requests return clean 403, not 500. |
@@ -153,6 +153,7 @@ closed.
 | Response envelope | `{"status":"success", "data":[ … ]}` |
 | Amount unit | Canonical integer hundredths for supported two-decimal currencies (CHF 2.00 → `200`); other fraction units and sub-cent amounts are rejected |
 | Webhook signature header | `X-Webhook-Signature` — HMAC-SHA256 of raw body, signed with the per-webhook signing key (NOT the API secret) |
+| Create idempotency | No idempotency-key field; `referenceId` is documented as an internal merchant reference, not as unique or de-duplicating |
 
 A "no gateway found" GET against `/Gateway/0/` is the cheap auth-check used
 by `_ping()` — HTTP 200 with `status: error` means creds are valid.
@@ -163,10 +164,21 @@ For Payrexx Platform / partner accounts, split the checkout/login domain:
 `instance_name`. Add the exact final host (`api.pay.goodvantage.ch`) to the
 site-config JSON list `payrexx_allowed_api_hosts` before saving. URL-like values,
 IP literals, malformed hosts, wildcards, and non-HTTPS ports are rejected before
-the Password field is read. A custom API domain's 401/403 response retries once
-against `api.payrexx.com` for every supported operation. A 404 retries only for
-the credential probe and Gateway creation, where it can indicate an
+the Password field is read. A custom API domain's 401/403 response repeats the
+same request once against `api.payrexx.com` for every supported operation. A 404
+repeats only the credential probe and Gateway creation, where it can indicate an
 unprovisioned custom API host; every other retrieval or POST 404 is authoritative.
+Thus custom-host Gateway creation can issue two POSTs for one app call. This is a
+host fallback, not a rate-limit or checkout-deadlock retry.
+
+The official PHP SDK v2.0.15 communicator invokes its configured adapter once
+per API call and has no built-in custom-host fallback or idempotency layer; an
+injected adapter may add retries or multiple wire requests. Tagged code defaults
+to API `v1.15`, but that tag's stale README says API `v1.11` and calls SDK v2.0.0
+current stable. This app pins `v1.16`. The provider Gateway OpenAPI still
+officially accepts `application/x-www-form-urlencoded`, so do not replace the
+app's encoding merely because the SDK's bundled cURL/Guzzle adapters send JSON
+for ordinary non-file POSTs.
 
 Checkout creation must use the app-owned `_create_integration_request()` path,
 never core `create_request_log()` (it commits). Provider metadata and the
@@ -175,9 +187,13 @@ immediately journals `[Payrexx Gateway recovery] state=local_commit_pending`;
 commit adds `local_commit_confirmed` and ordinary rollback adds
 `[Payrexx possible orphan Gateway] state=local_rollback_confirmed`. Frappe clears
 rollback callbacks before SQL commit, so an unpaired pending record is the exact
-commit-failure residual. Operators search by `referenceId`/Gateway id and delete
-only a transaction-free external orphan; never add an internal commit or blind
-provider teardown to close this gap.
+commit-failure residual. Payrexx documents `DELETE /Gateway/{id}/`, but this app
+exposes no wrapper. Operators with explicit provider DELETE permission search by
+exact host, `referenceId`, and every discovered Gateway id. If none exists, no
+deletion is needed; each exact Gateway is deleted conditionally only after its
+retrieval and transaction search prove every `invoices[].transactions[]`
+collection empty. Paid or ambiguous Gateways remain for reconciliation. Never
+add an internal commit or blind provider teardown to close this gap.
 
 ### Status mapping (webhook)
 
@@ -208,10 +224,11 @@ The integration creates hosted Gateways and reads Gateway state (`create_gateway
 `retrieve_gateway`, `ping_gateway`), exposes Subscription CRUD/reporting, and
 manages non-payment static QR codes
 (`create_qr_code`, `delete_qr_code` → `PayrexxSettings.create_static_qr` /
-`delete_static_qr`; see DOCUMENTATION.md "Static QR Codes"). It does not expose
-Gateway deletion, capture, later-charge, void/cancel, or refund operations. Those
-provider actions and their ERPNext accounting reversals are manual operational
-workflows until an explicit, tested contract is implemented.
+`delete_static_qr`; see DOCUMENTATION.md "Static QR Codes"). The provider
+supports Gateway DELETE, but the app exposes no wrapper for it, capture,
+later-charge, void/cancel, or refund operations. Those provider actions and
+their ERPNext accounting reversals are manual operational workflows until an
+explicit, tested contract is implemented.
 
 Static-QR targets are origin-bound, not merely scheme-checked: `create_static_qr`
 requires the URL's normalized origin to be one the operator published here
@@ -269,6 +286,13 @@ npm install && npx playwright install chromium
 TEST_BOOKING_NAME=<booking> npx playwright test
 ```
 
+`test_rate_limit` directly proves GET backoff and the canonical-host POST 405
+case. PUT and DELETE use the shared helper in runtime code but are not exercised
+there; the module is not a universal one-request POST test.
+`test_checkout_security` separately mocks the custom-host fallback, including
+the second canonical Gateway POST after custom-host 404. Neither is live
+provider evidence.
+
 `TEST_BOOKING_NAME` must identify an existing eligible Good Event Booking
 created through Good Event's own fixtures or operator workflow. Payrexx
 Integration does not create cross-app event test data.
@@ -280,6 +304,15 @@ booking spec.
 Hosted sandbox settlement uses the separately documented protected CLI. Keep
 the provider page human-operated, require provider `TEST` evidence, and disable
 `payrexx_hosted_qa_enabled` after the run.
+Custom-host fallback verification is separate and deferred until a dedicated
+controllable sandbox API target and confirmed Gateway DELETE permission exist.
+It must use a direct one-shot client harness that does not save the source
+Settings row and has no Payment Request/Integration Request flow, validate
+settings and prove one separate transaction-free cleanup canary can be deleted
+and confirmed absent before arming one fault, account for exact local
+and zero/one/multiple external state, conditionally delete only proven-empty
+Gateways, and restore settings/allowlists unconditionally in an outer `finally`.
+Follow `HOW_TO.md` §12 and never test it on a shared or production host.
 
 ---
 
@@ -347,14 +380,18 @@ the provider page human-operated, require provider `TEST` evidence, and disable
 - **Retry only at transaction boundaries.** MariaDB error 1020 is exposed as
   `QueryDeadlockError`. Locked one-attempt helpers must propagate it; callback,
   reconciliation, chargeback, settlement, and pay-link checkout boundaries roll
-  back before replaying the complete unit, at most three times. Checkout retries
-  stop permanently once a provider POST has been attempted. Never catch a
-  deadlock and continue inside the failed transaction or replay Gateway creation.
+  back before replaying the complete unit, at most three times. Checkout
+  transaction retries stop permanently once a provider POST has been attempted,
+  and canonical POSTs have no rate-limit replay. This does not suppress the
+  client's separate custom-host Gateway fallback on 401/403/404. Never catch a
+  deadlock and continue inside the failed transaction.
 - **Custom API hosts are opt-in.** Keep `api_base_domain` host-only and add the
   final `api.<base-domain>` hostname exactly to `payrexx_allowed_api_hosts`; do
   not weaken the parser or move `get_password("api_secret")` before validation.
   Preserve operation-aware fallback: 401/403 may retry any supported operation,
-  but a 404 must not retry concrete Gateway retrieval.
+  but a 404 must not retry concrete Gateway retrieval. Gateway creation is the
+  risky exception that repeats its POST once on canonical 401/403/404, without a
+  provider idempotency key or documented `referenceId` uniqueness.
 - **No URL hard-coding** — externally shared URLs go through
   `payrexx_integration.url_utils.get_public_url()`, which respects
   `host_name` without leaking the local bench port. The Playwright config is
