@@ -415,7 +415,13 @@ def _execute_request(
 			if frappe.flags.integration_request_doc:
 				frappe.flags.integration_request_doc.log_error()
 			else:
-				frappe.log_error()
+				# Bounded evidence only (F30): the exception class and HTTP
+				# status; the transport row carries the sanitized detail.
+				frappe.log_error(
+					title="Payrexx request failed",
+					message=f"operation=payrexx_request exception={type(exc).__name__} "
+					f"status={get_http_status(exc)}",
+				)
 		raise
 
 
