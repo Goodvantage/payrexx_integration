@@ -1,6 +1,14 @@
 # Copyright (c) 2026, Goodvantage GmbH and contributors
 
-"""Context-free Error Log boundary for Payrexx failures."""
+"""Context-free Error Log boundary for Payrexx failures.
+
+Deliberate self-contained twin (D46): payrexx_integration stays standalone on
+top of upstream `payments` and must not import good_connector. The shared
+engine is `good_connector.error_logging`; this module's contract — re-raise
+transaction errors before any logging side effect, defer on read-only/safe
+methods, guard the no-DB context, file-log fallback — is pinned against it by
+good_connector's `tests/test_error_logging_parity.py`.
+"""
 
 from __future__ import annotations
 
@@ -35,6 +43,10 @@ def log_sanitized_error(
 			f"summary={ERROR_SUMMARY}",
 		)
 	)
+	if not getattr(frappe.local, "db", None):
+		_log_to_file(message)
+		return message
+
 	values = {
 		"doctype": "Error Log",
 		"method": _error_title(operation),

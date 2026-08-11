@@ -1,5 +1,7 @@
 # Payrexx Integration - Documentation
 
+Architecture decisions: [ARCHITECTURE_DECISIONS.md](ARCHITECTURE_DECISIONS.md).
+
 ## Purpose
 
 `payrexx_integration` adds Payrexx as a standalone payment gateway app without patching upstream `payments`. It provides a Payrexx Settings DocType, a REST client, webhook handling, and signed pay-by-email URLs for ERPNext Sales Invoices.
@@ -860,3 +862,7 @@ be configured by an operator before payment work can continue.
 - `HOW_TO.md` - operator runbook.
 - `AGENTS.md` - detailed implementation notes.
 - `PAYREXX_INTEGRATION.md` - design rationale, repository layout, and the Payrexx provider wire format (payload/webhook shapes).
+
+## Wave A duplication note (2026-08-11, 16.5.2)
+
+- `error_logging` stays a deliberate self-contained twin (the app remains standalone on top of `payments`, no good_connector import); its contract is pinned by good_connector's `tests/test_error_logging_parity.py`. The no-DB-context guard from the shared engine was folded in (D46).

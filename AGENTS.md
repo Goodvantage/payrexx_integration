@@ -1,5 +1,11 @@
 # AGENTS.md — payrexx_integration
 
+Architecture decisions live in
+[ARCHITECTURE_DECISIONS.md](ARCHITECTURE_DECISIONS.md). Keep that register
+current when boundaries, dependencies, ownership, public contracts,
+security/consistency models, or migration strategy change. Append a decision and
+supersede old records rather than rewriting accepted history.
+
 Guidance for coding agents working in `payrexx_integration`. Pairs with the
 bench-root `AGENTS.md` (general Frappe rules) and the upstream
 `apps/payments` (which this app extends without forking).
@@ -34,10 +40,11 @@ Innermost package dir: `payrexx_integration/payrexx_integration/payrexx_integrat
 
 ## Documentation Contract
 
-This repo keeps four synchronized artifacts: `REQUIREMENTS.md` (what the app
-must do), `DOCUMENTATION.md` (how it works), `HOW_TO.md` (operator
-procedures), and the code. Record new or changed requirements in
-`REQUIREMENTS.md` and keep all four in sync with every change.
+This repo keeps five synchronized artifacts: `REQUIREMENTS.md` (what the app
+must do), `ARCHITECTURE_DECISIONS.md` (why durable boundaries and contracts
+exist), `DOCUMENTATION.md` (how it works), `HOW_TO.md` (operator procedures),
+and the code. Record new or changed requirements in `REQUIREMENTS.md` and keep
+all five in sync with every change.
 
 ---
 
