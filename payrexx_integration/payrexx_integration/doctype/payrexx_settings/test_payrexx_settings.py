@@ -417,13 +417,18 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 	def test_settings_ping_uses_client(self):
 		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
+		pings: list[dict] = []
 
 		class _FakeClient:
 			instance = "test-instance"
 			api_base_domain = "payrexx.com"
 
 			def ping_gateway(self) -> dict:
-				return {"status": "error", "message": "No Gateway found with id 0"}
+				# Payrexx answers this body on valid credentials (see _ping);
+				# it must be accepted as success, not thrown.
+				body = {"status": "error", "message": "No Gateway found with id 0"}
+				pings.append(body)
+				return body
 
 		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
 			payrexx_settings as ps_module,
@@ -431,6 +436,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 		with patch.object(ps_module.PayrexxSettings, "_client", return_value=_FakeClient()):
 			doc._ping()
+		self.assertEqual(len(pings), 1)
 
 	def test_settings_ping_rejects_http_auth_error(self):
 		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
