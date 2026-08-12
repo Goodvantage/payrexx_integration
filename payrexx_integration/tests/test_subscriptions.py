@@ -214,6 +214,14 @@ class TestSubscriptionWebhookRouting(IntegrationTestCase):
 	def setUp(self):
 		super().setUp()
 		self.settings_name = _ensure_settings()
+		frappe.db.set_value(
+			"Payrexx Settings",
+			self.settings_name,
+			"allow_test_transactions",
+			0,
+			update_modified=False,
+		)
+		frappe.clear_document_cache("Payrexx Settings", self.settings_name)
 		self.claimed: list[dict] = []
 
 	def _claiming_provider(self):
@@ -836,7 +844,10 @@ class TestDocumentedSubscriptionCallbackShape(IntegrationTestCase):
 
 	def _deliver(self, payload: dict):
 		body = frappe.as_json(payload).encode()
-		signature = hmac.new(b"whk_test_dummy", body, hashlib.sha256).hexdigest()
+		signing_key = frappe.get_doc("Payrexx Settings", self.settings_name).get_password(
+			"webhook_signing_key"
+		)
+		signature = hmac.new(signing_key.encode(), body, hashlib.sha256).hexdigest()
 
 		class FakeRequest:
 			def __init__(self):
@@ -929,11 +940,17 @@ class TestDocumentedSubscriptionCallbackShape(IntegrationTestCase):
 			).insert(ignore_permissions=True)
 			raise RuntimeError("broken")
 
-		with patch.object(ps_module, "_dispatch_subscription_event", side_effect=fail_after_partial_write):
+		with (
+			patch.object(ps_module, "_dispatch_subscription_event", side_effect=fail_after_partial_write),
+			patch.object(frappe, "log_error") as core_log_error,
+			patch("frappe.utils.sentry.capture_exception") as capture_exception,
+		):
 			self.assertEqual(
 				self._deliver(payload),
 				{"ok": False, "error": "subscription_event_unclaimed"},
 			)
+		core_log_error.assert_not_called()
+		capture_exception.assert_not_called()
 
 		event = frappe.get_doc(
 			ps_module.SUBSCRIPTION_EVENT_DOCTYPE,

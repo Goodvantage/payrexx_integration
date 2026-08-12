@@ -34,7 +34,7 @@ from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
 	verify_webhook_signature,
 )
 
-IGNORE_TEST_RECORD_DEPENDENCIES = ["User"]
+IGNORE_TEST_RECORD_DEPENDENCIES = ["User", "Account", "Bank Account", "Cost Center"]
 
 GATEWAY_NAME = "TestGW"
 SETTINGS_NAME_PREFIX = "Payrexx-Test-"
@@ -44,15 +44,16 @@ def _ensure_settings(name: str = GATEWAY_NAME, automation_user: str = "Administr
 	"""Create a Payrexx Settings row (if missing) and return its name."""
 	if frappe.db.exists("Payrexx Settings", {"gateway_name": name}):
 		settings_name = frappe.db.get_value("Payrexx Settings", {"gateway_name": name}, "name")
-		if not frappe.db.get_value("Payrexx Settings", settings_name, "automation_user"):
-			frappe.db.set_value(
-				"Payrexx Settings",
-				settings_name,
-				"automation_user",
-				automation_user,
-				update_modified=False,
-			)
-			frappe.clear_document_cache("Payrexx Settings", settings_name)
+		settings = frappe.get_doc("Payrexx Settings", settings_name)
+		changed = False
+		if not settings.automation_user:
+			settings.automation_user = automation_user
+			changed = True
+		if settings.get_password("webhook_signing_key") != "whk_test_dummy":
+			settings.webhook_signing_key = "whk_test_dummy"
+			changed = True
+		if changed:
+			settings.save(ignore_permissions=True)
 		return settings_name
 
 	doc = frappe.get_doc(
@@ -324,10 +325,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 	# ----------------------------------------------------- HMAC pay-link token
 
 	def test_pay_url_token_round_trip(self):
-		with (
-			patch("payrexx_integration.api.frappe.db.exists", return_value=True),
-			patch("payrexx_integration.api.frappe.db.get_value", return_value=1),
-		):
+		with patch("payrexx_integration.api.is_invoice_checkout_eligible", return_value=True):
 			url = payrexx_pay_url("ACC-SINV-2026-00001", gateway_name=self.settings_name)
 		params = parse_qs(urlparse(url).query)
 		self.assertEqual(params.get("si"), ["ACC-SINV-2026-00001"])
@@ -437,6 +435,37 @@ class TestPayrexxSettings(IntegrationTestCase):
 		with patch.object(ps_module.PayrexxSettings, "_client", return_value=_FakeClient()):
 			doc._ping()
 		self.assertEqual(len(pings), 1)
+
+	def test_settings_ping_rejects_every_near_match_sentinel(self):
+		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
+
+		class _FakeClient:
+			instance = "test-instance"
+			api_base_domain = "payrexx.com"
+
+			def __init__(self, body):
+				self.body = body
+
+			def ping_gateway(self) -> dict:
+				return self.body
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		near_matches = (
+			{"status": "success", "data": []},
+			{"status": "error", "message": "An error occurred: No Gateway found with id 0"},
+			{"status": "error", "message": "No Gateway found with id 0", "data": []},
+			{"status": "error", "message": "No Gateway found with id 00"},
+		)
+		for body in near_matches:
+			with (
+				self.subTest(body=body),
+				patch.object(ps_module.PayrexxSettings, "_client", return_value=_FakeClient(body)),
+				self.assertRaisesRegex(frappe.ValidationError, "Unexpected response from Payrexx"),
+			):
+				doc._ping()
 
 	def test_settings_ping_rejects_http_auth_error(self):
 		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
@@ -568,10 +597,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 	def test_pay_url_explicit_gateway_name(self):
 		other_settings = _ensure_settings("OtherGateway")
-		with (
-			patch("payrexx_integration.api.frappe.db.exists", return_value=True),
-			patch("payrexx_integration.api.frappe.db.get_value", return_value=1),
-		):
+		with patch("payrexx_integration.api.is_invoice_checkout_eligible", return_value=True):
 			url = payrexx_pay_url("ACC-SINV-2026-00001", gateway_name=other_settings)
 		params = parse_qs(urlparse(url).query)
 		self.assertEqual(params.get("gateway_name"), [other_settings])
@@ -1303,9 +1329,13 @@ class TestPayrexxSettings(IntegrationTestCase):
 			sig if name == "X-Webhook-Signature" else default
 		)
 		try:
-			with patch("frappe.log_error") as log_error:
+			with (
+				patch("frappe.log_error") as core_log_error,
+				patch.object(ps_module, "_log_webhook_observation") as observation,
+			):
 				self.assertEqual(ps_module.callback(gateway_name=GATEWAY_NAME), {"ok": True})
-				log_error.assert_called_once()
+				core_log_error.assert_not_called()
+				observation.assert_called_once()
 		finally:
 			frappe.get_request_header = original_header  # type: ignore[assignment]
 			if original_request is None:
@@ -1530,9 +1560,13 @@ class TestPayrexxSettings(IntegrationTestCase):
 			sig if name == "X-Webhook-Signature" else default
 		)
 		try:
-			with patch("frappe.log_error") as log_error:
+			with (
+				patch("frappe.log_error") as core_log_error,
+				patch.object(ps_module, "_log_webhook_observation") as observation,
+			):
 				self.assertEqual(ps_module.callback(gateway_name=GATEWAY_NAME), {"ok": True})
-				log_error.assert_called_once()
+				core_log_error.assert_not_called()
+				observation.assert_called_once()
 		finally:
 			frappe.get_request_header = original_header  # type: ignore[assignment]
 			if original_request is None:
@@ -1672,7 +1706,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 		self.assertEqual(calls, [(ir.name, transaction), (ir.name, transaction)])
 		rollback.assert_called_once()
-		sleep.assert_called_once_with(0.25)
+		sleep.assert_called_once_with(0.2)
 		ir.reload()
 		self.assertEqual(ir.status, "Failed")
 		self.assertEqual((frappe.parse_json(ir.data) or {})["payrexx_transaction"], transaction)
@@ -1696,7 +1730,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 
 		self.assertEqual(operation.call_count, ps_module.DEADLOCK_MAX_ATTEMPTS)
 		self.assertEqual(rollback.call_count, ps_module.DEADLOCK_MAX_ATTEMPTS)
-		self.assertEqual([item.args[0] for item in sleep.call_args_list], [0.25, 0.5])
+		self.assertEqual([item.args[0] for item in sleep.call_args_list], [0.2, 0.4])
 
 	def test_deadlock_retry_completes_request_and_creates_exactly_one_payment_entry(self):
 		from erpnext.accounts.doctype.payment_request.payment_request import (
@@ -1781,7 +1815,7 @@ class TestPayrexxSettings(IntegrationTestCase):
 		self.assertEqual(len(settlement_attempts), 2)
 		self.assertEqual(rollback_statuses, ["Completed", "Queued"])
 		rollback.assert_called_once_with()
-		sleep.assert_called_once_with(0.25)
+		sleep.assert_called_once_with(0.2)
 		integration_request.reload()
 		payment_request.reload()
 		sales_invoice.reload()
@@ -2788,7 +2822,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 						(integration_request_name, confirmed_transaction),
 					],
 				)
-				sleep.assert_called_once_with(0.25)
+				sleep.assert_called_once_with(0.2)
 				settle_again.assert_not_called()
 				current_request = frappe.get_doc("Integration Request", integration_request_name)
 				self.assertEqual(current_request.status, "Failed")
@@ -2889,7 +2923,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 						(integration_request_name, chargeback_transaction),
 					],
 				)
-				sleep.assert_called_once_with(0.25)
+				sleep.assert_called_once_with(0.2)
 				current_request = frappe.get_doc("Integration Request", integration_request_name)
 				self.assertEqual(current_request.status, "Failed")
 				self.assertEqual(current_request.error, ps_module.CHARGEBACK_ERROR)
@@ -3019,7 +3053,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 								(integration_request_name, None),
 							],
 						)
-						sleep.assert_called_once_with(0.25)
+						sleep.assert_called_once_with(0.2)
 						client.retrieve_gateway.assert_called_once_with(91000)
 						current_request = frappe.get_doc(
 							"Integration Request",
@@ -3140,7 +3174,7 @@ class TestPayrexxCurrentReadConcurrency(IntegrationTestCase):
 					(GATEWAY_NAME, waiting_transaction, integration_request_name, "waiting"),
 				)
 				self.assertEqual(attempts[1], attempts[0])
-				sleep.assert_called_once_with(0.25)
+				sleep.assert_called_once_with(0.2)
 				current_request = frappe.get_doc(
 					"Integration Request",
 					integration_request_name,

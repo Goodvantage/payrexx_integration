@@ -1,0 +1,304 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:evidence_key",
+ "creation": "2026-08-11 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "evidence_key",
+  "payrexx_settings",
+  "payout_uuid",
+  "mode",
+  "provider_status",
+  "evidence_origin",
+  "reconciliation_status",
+  "reconciliation_reason",
+  "bank_match_reference",
+  "settlement_ready",
+  "status_updated_on",
+  "amount_section",
+  "amount",
+  "gross_amount",
+  "total_fees",
+  "currency",
+  "column_break_amount",
+  "payout_date",
+  "statement",
+  "payer",
+  "is_manual_payout",
+  "destination_section",
+  "destination_type",
+  "destination_iban_last_four",
+  "destination_iban_hash",
+  "composition_section",
+  "transfers",
+  "items",
+  "audit_section",
+  "composition_hash",
+  "received_on"
+ ],
+ "fields": [
+  {
+   "fieldname": "evidence_key",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Evidence Key",
+   "read_only": 1,
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "payrexx_settings",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Payrexx Settings",
+   "options": "Payrexx Settings",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "payout_uuid",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Payout UUID",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "mode",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Mode",
+   "options": "TEST\nLIVE",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "provider_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Provider Status",
+   "options": "initiated\npending\nunder-review\nprocessing\nsent\nfailed\nsynthetic",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "evidence_origin",
+   "fieldtype": "Select",
+   "in_standard_filter": 1,
+   "label": "Evidence Origin",
+   "options": "Signed Provider Webhook\nSynthetic Acceptance",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "reconciliation_status",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Reconciliation Status",
+   "options": "Pending\nReview\nReconciled",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "reconciliation_reason",
+   "fieldtype": "Small Text",
+   "label": "Reconciliation Reason",
+   "read_only": 1
+  },
+  {
+   "fieldname": "bank_match_reference",
+   "fieldtype": "Data",
+   "in_standard_filter": 1,
+   "label": "Exact Bank Match Reference",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "default": "0",
+   "description": "True only for authenticated payout evidence in Payrexx status sent. No accounting entry is created by this app.",
+   "fieldname": "settlement_ready",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Settlement Ready",
+   "read_only": 1
+  },
+  {
+   "fieldname": "status_updated_on",
+   "fieldtype": "Datetime",
+   "label": "Status Updated On",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "amount_section",
+   "fieldtype": "Section Break",
+   "label": "Payout"
+  },
+  {
+   "fieldname": "amount",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Amount (Provider Minor Units)",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "gross_amount",
+   "fieldtype": "Int",
+   "label": "Gross Amount (Provider Minor Units)",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "total_fees",
+   "fieldtype": "Int",
+   "label": "Total Fees (Provider Minor Units)",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "currency",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Currency",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_amount",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "payout_date",
+   "fieldtype": "Date",
+   "in_standard_filter": 1,
+   "label": "Payout Date",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "statement",
+   "fieldtype": "Small Text",
+   "label": "Statement",
+   "read_only": 1
+  },
+  {
+   "fieldname": "payer",
+   "fieldtype": "Select",
+   "label": "Payer",
+   "options": "stripe\npayrexx\nunknown",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "is_manual_payout",
+   "fieldtype": "Check",
+   "label": "Manual Payout",
+   "read_only": 1
+  },
+  {
+   "fieldname": "destination_section",
+   "fieldtype": "Section Break",
+   "label": "Privacy-Minimized Destination"
+  },
+  {
+   "fieldname": "destination_type",
+   "fieldtype": "Data",
+   "label": "Destination Type",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "destination_iban_last_four",
+   "fieldtype": "Data",
+   "label": "IBAN Last Four",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "destination_iban_hash",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "IBAN Hash",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "composition_section",
+   "fieldtype": "Section Break",
+   "label": "Composition"
+  },
+  {
+   "fieldname": "transfers",
+   "fieldtype": "Table",
+   "label": "Transfers",
+   "options": "Payrexx Payout Transfer",
+   "read_only": 1
+  },
+  {
+   "fieldname": "items",
+   "fieldtype": "Table",
+   "label": "Transfer Items",
+   "options": "Payrexx Payout Item",
+   "read_only": 1
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "audit_section",
+   "fieldtype": "Section Break",
+   "label": "Capture Audit"
+  },
+  {
+   "fieldname": "composition_hash",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Composition Hash",
+   "read_only": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "received_on",
+   "fieldtype": "Datetime",
+   "label": "Received On",
+   "read_only": 1,
+   "reqd": 1
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-08-11 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Payrexx Integration",
+ "name": "Payrexx Payout Evidence",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "export": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager"
+  },
+  {
+   "export": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Accounts Manager"
+  }
+ ],
+ "row_format": "Dynamic",
+ "search_fields": "payout_uuid,currency,provider_status,destination_iban_last_four",
+ "sort_field": "payout_date",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "payout_uuid",
+ "track_changes": 0
+}

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 TRANSACTION_KEY = "transaction"
 SUBSCRIPTION_KEY = "subscription"
+PAYOUT_OBJECT = "payout"
 
 # Subscription lifecycle states. Payrexx's event list implies four; the object
 # tables carry five. `overdue` and `in_notice` are the two that get misread:
@@ -63,6 +64,18 @@ def _text(value) -> str:
 def transaction_of(body) -> dict:
 	"""The transaction a delivery carries, or an empty dict."""
 	return _as_dict(_as_dict(body).get(TRANSACTION_KEY))
+
+
+def payout_of(body) -> dict:
+	"""The documented bare payout object a delivery carries, or an empty dict."""
+	body = _as_dict(body)
+	if body.get("object") != PAYOUT_OBJECT:
+		return {}
+	return body
+
+
+def is_payout_event(body) -> bool:
+	return bool(payout_of(body))
 
 
 def subscription_of(body) -> dict:

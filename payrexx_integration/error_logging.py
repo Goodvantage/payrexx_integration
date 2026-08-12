@@ -77,8 +77,10 @@ def error_fingerprint(operation: str, exception_class: str) -> str:
 def _error_title(operation: str) -> str:
 	titles = {
 		"payrexx_pay_url": "Payrexx pay URL unavailable",
+		"payout_webhook": "Payrexx payout webhook failed",
 		"payrexx_request": "Payrexx request failed",
 		"payrexx_response": "Payrexx response failed",
+		"webhook": "Payrexx webhook failed",
 	}
 	return titles.get(operation, f"Payrexx {operation} failed")[:140]
 

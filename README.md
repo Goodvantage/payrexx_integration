@@ -2,8 +2,9 @@
 
 Payrexx payment gateway integration for the Frappe payments app
 
-Current release: `16.5.2` (the package version is sourced dynamically from
-`payrexx_integration/__init__.py`).
+Current release: `16.8.0` (the package version is sourced dynamically from
+`payrexx_integration/__init__.py`). This release declares the directly imported
+Requests runtime in package metadata.
 
 ### Installation
 

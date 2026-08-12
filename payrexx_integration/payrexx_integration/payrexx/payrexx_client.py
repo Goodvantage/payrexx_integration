@@ -16,6 +16,7 @@ from payrexx_integration.error_logging import TRANSACTION_ERRORS, log_sanitized_
 DEFAULT_API_BASE_DOMAIN = "payrexx.com"
 DEFAULT_API_VERSION = "v1.16"
 ALLOWED_API_HOSTS_CONFIG = "payrexx_allowed_api_hosts"
+CREDENTIAL_PROBE_SENTINEL = {"status": "error", "message": "No Gateway found with id 0"}
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -83,8 +84,11 @@ class PayrexxClient:
 		return _unwrap(self._get(f"Gateway/{gateway_id}/"))
 
 	def ping_gateway(self) -> dict:
-		"""GET /Gateway/0/ for a cheap credential check without creating checkout data."""
-		return self._get("Gateway/0/", retry_not_found=True)
+		"""Accept only Payrexx's exact HTTP-200 Gateway-zero credential sentinel."""
+		body = self._get("Gateway/0/")
+		if body != CREDENTIAL_PROBE_SENTINEL:
+			raise _logged_response_error("Unexpected credential probe response")
+		return body
 
 	# ----------------------------------------------------------------- static QR codes
 

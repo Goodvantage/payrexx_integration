@@ -56,8 +56,8 @@ allowlist contains the final host the client contacts
 
 If that custom API domain rejects an otherwise valid instance key with 401/403,
 the client repeats the request once on `api.payrexx.com`. A 404 repeats only for
-the credential probe or Gateway creation, where the custom API host may not be
-provisioned. Therefore Gateway creation on a custom host can send the same POST
+Gateway creation, where the custom API host may not be provisioned. The
+credential probe rejects every 404. Therefore Gateway creation on a custom host can send the same POST
 twice, once per host, after 401/403/404. A 404 for a specific existing-checkout
 Gateway lookup does not fall back; verify the configured API domain and Gateway
 in Payrexx instead. This host fallback is separate from rate-limit and database
@@ -127,14 +127,23 @@ payment_url = safe_pay_url(sales_invoice.name, gateway_name="Live")
 failure and writes exactly one fixed, sanitized, empty-metadata Error Log entry.
 Consumer apps must not wrap it with another error log. It deliberately re-raises
 `QueryDeadlockError` and `QueryTimeoutError` without logging so the caller can
-retry its complete transaction. Consumer apps keep their own rules for whether
-a document is eligible for online payment.
+retry its complete transaction. It also returns an empty string before gateway
+resolution when the Sales Invoice is not submitted, is a return, is already
+paid, or its positive outstanding amount no longer equals the original rounded
+payable total. Consumer apps keep additional product opt-ins, but must not
+weaken this canonical invoice-state gate.
 
 The helper returns a signed GET URL:
 
 ```text
 GET /api/method/payrexx_integration.api.pay_invoice?si=<Sales Invoice>&gateway_name=<Payrexx Settings name>&token=<hmac>
 ```
+
+New tokens use an app-purpose key derived as
+`SHA256(encryption_key || ":payrexx_integration:pay-link")`. Verification also
+accepts pre-derivation signatures made with the raw site key so already-sent
+links keep working; gateway-unbound legacy links additionally retain their
+invoice-only payload while gateway resolution remains unambiguous.
 
 When clicked, the endpoint verifies the token, lazy-creates and submits a Payment
 Request through ERPNext, and redirects to the checkout URL created during that
@@ -265,13 +274,16 @@ If saving Payrexx Settings fails:
 
 1. Confirm the instance name matches the first subdomain of the checkout/login domain.
 2. Confirm the API base domain is correct (`payrexx.com` for normal accounts, e.g. `pay.goodvantage.ch` for GoodVantage partner accounts).
-3. For a custom domain, confirm its exact final host is present in the `payrexx_allowed_api_hosts` JSON list, e.g. `api.pay.goodvantage.ch`. A 401/403 repeats the request once on `api.payrexx.com`; a 404 repeats only credential probing and Gateway creation, not a concrete Gateway retrieval. For Gateway creation this is a second POST, not a rate-limit retry.
+3. For a custom domain, confirm its exact final host is present in the `payrexx_allowed_api_hosts` JSON list, e.g. `api.pay.goodvantage.ch`. A 401/403 repeats the request once on `api.payrexx.com`; a 404 repeats only Gateway creation, not credential probing or concrete retrieval. For Gateway creation this is a second POST, not a rate-limit retry.
 4. Confirm the Automation User is present, enabled, and a System User.
 5. Confirm the API secret is current.
 6. Confirm outbound network access from the bench.
 7. Try saving in Sandbox first.
 
-The app pings `GET /Gateway/0/`; a Payrexx JSON response with `status: error` can still mean credentials are accepted if the error is "gateway not found".
+The app pings `GET /Gateway/0/`; only HTTP 200 with the exact Payrexx JSON object
+`{"status":"error","message":"No Gateway found with id 0"}` means credentials
+are accepted. Partner-host 404 responses, prefixed/substring messages, extra
+keys, and every other successful envelope are rejected.
 
 Every final unexpected provider call writes exactly one direct Error Log entry.
 `Payrexx request failed` identifies transport failures and `Payrexx response
@@ -335,10 +347,13 @@ failed transaction and replays the complete callback, reconciliation,
 chargeback, or settlement unit from fresh state. Retry webhook delivery manually
 only if all bounded attempts fail and Payrexx receives an error response; never
 retry the payment itself.
-Other downstream payment-hook failures are logged and returned as webhook
-errors so Payrexx can retry; the app no longer marks the Integration Request
-complete in a separate manual commit before the referenced document accepts the
-payment.
+Other downstream payment-hook failures return HTTP 503 so Payrexx can retry and
+write one context-free `Payrexx webhook failed` Error Log entry. The entry has
+empty metadata and omits the exception, transaction/subscription body, request,
+and traceback. Compact ignored/unclaimed observations are written only to
+`sites/<site>/logs/payrexx_integration.log`. The app no longer marks the
+Integration Request complete in a separate manual commit before the referenced
+document accepts the payment.
 
 If checkout creation fails around a provider timeout, local rollback, or SQL
 commit, inspect `sites/<site>/logs/payrexx_integration.log` for
@@ -760,7 +775,76 @@ User**, so that field must name an enabled System User (§2) or QR creation and
 deletion fail with "Payrexx Settings … requires an Automation User." before
 Payrexx is contacted.
 
-## 14. Run Tests
+## 14. Review Captured Payout Evidence
+
+Payout evidence arrives passively through the same signed JSON webhook URL in
+Section 3. Do not trigger a payout merely to populate local records.
+
+1. Open **Payrexx Payout Evidence** and filter by the exact Payrexx Settings row,
+   mode, payout UUID, currency, or status.
+2. Compare the exact provider-minor-unit payout amount with the transfer rows.
+   Every transfer also has item rows linked by **Transfer Index**.
+3. Signed evidence remains review-only. Do not treat transaction UUID/reference
+   or a `sent` status as authority to post accounting.
+4. Treat **Settlement Ready** as provider evidence only. It is true solely for
+   Payrexx status `sent`; it is not proof that ERPNext bank accounting was
+   posted.
+5. Investigate a rejected replay in Payrexx rather than editing the evidence.
+   Only `processing` may advance, and only to `sent` or `failed`; composition is
+   immutable.
+6. If Payrexx records HTTP 503, wait for/retry the delivery and inspect **Error
+   Log** for `Payrexx payout webhook failed` or, when processing failed before
+   body classification, `Payrexx webhook failed`. That row intentionally
+   contains only operation/class/status and empty metadata. It never contains
+   the payout body. Deadlock/timeout retries may have no Error Log row.
+
+The full IBAN, account holder, merchant, owner, and raw webhook are intentionally
+unavailable. Operators see only destination type and IBAN last four; the hidden
+site-keyed hash supports exact destination matching without retaining the IBAN.
+Authenticated `initiated`, `pending`, and `under-review` evidence remains
+non-settlement-ready even though Payrexx says it normally sends no webhook for
+those states.
+
+### Create synthetic acceptance evidence
+
+This is a developer/test acceptance workflow, not a production payout workflow.
+There is intentionally no LIVE enable setting.
+
+1. On **Payrexx Settings**, enable **Allow TEST Transactions** and **Enable
+   Synthetic Payout Acceptance** only on a developer/test site.
+2. Configure the payout clearing Account, destination Bank Account, fee expense
+   Account, and fee Cost Center. All accounts must use the company's
+   two-decimal default currency; the Bank Account must carry its real IBAN and
+   ledger account. Foreign-currency accounting is intentionally unsupported.
+3. Confirm each source is a Completed TEST Integration Request for a submitted,
+   fully paid Sales Invoice Payment Request under this exact gateway. The
+   Payment Request payment account must be the configured clearing account, and
+   its recorded submitted receipt Payment Entry must allocate only to that exact
+   Payment Request/Sales Invoice. Do not edit or replay signed provider data.
+4. From a controlled bench console, call the non-whitelisted function with
+   Integration Request names and the exact confirmation text:
+
+```python
+from payrexx_integration.payout_reconciliation import create_synthetic_acceptance_evidence
+
+create_synthetic_acceptance_evidence(
+	"Sandbox",
+	["<integration-request-1>", "<integration-request-2>"],
+	"CREATE SYNTHETIC PAYREXX TEST PAYOUT",
+)
+```
+
+5. Put the returned exact `SYNTHETIC-PAYOUT-*` reference in the synthetic EBICS
+   `TxDtls.Refs.AcctSvcrRef`. The booked credit must also match net amount,
+   currency, payout date, and configured destination Bank Account.
+6. Verify the resulting Internal Transfer debits the bank by net, debits the fee
+   expense by total fees, and credits clearing by gross. Disable the synthetic
+   gate after acceptance.
+
+Any signed/LIVE evidence, amount-only credit, blank/different reference,
+ambiguous candidate, or failed secondary check stays Review.
+
+## 15. Run Tests
 
 ```bash
 cd frappe-bench
@@ -790,6 +874,12 @@ bench --site development16.localhost run-tests \
 
 bench --site development16.localhost run-tests \
   --module payrexx_integration.tests.test_subscriptions
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_payout_webhooks
+
+bench --site development16.localhost run-tests \
+  --module payrexx_integration.tests.test_payout_reconciliation
 ```
 
 `test_rate_limit` directly covers GET backoff and a canonical-host POST 405 that

@@ -55,10 +55,12 @@ all five in sync with every change.
 | `gateway_selection.py` | Canonical strict resolver shared by native flows and downstream apps. Supports explicit selection, a caller-owned site-config key, and unambiguous single-row fallback. |
 | `payrexx_integration/payrexx_integration/doctype/payrexx_settings/` | The settings DocType. One row per environment (`Sandbox` / `Live`), each with its own required automation user. `on_update` auto-creates the matching `Payment Gateway` row (`Payrexx-<gateway_name>`). |
 | `payrexx_integration/payrexx_integration/doctype/payrexx_subscription_event/` | Durable, non-PII recurring-transaction state for installments and later-installment reversals. Its deterministic gateway/event key advances monotonically; claimed same-status replays stop, while Unclaimed states remain retryable from a sanitized financial payload. A raised provider rolls back fully before that Unclaimed row is retained, and the daily worker redrives it before transaction/status reconciliation. |
+| `payrexx_integration/payrexx_integration/doctype/payrexx_payout_evidence/` | Durable, read-only provider payout evidence with normalized transfer and item child rows. Its settings + mode + UUID key is deterministic; exact replay is inert, only `processing` may advance to `sent` or `failed`, and raw/merchant/account-holder data is never retained. |
+| `payout_reconciliation.py` | Optional synthetic TEST acceptance provider. It never imports Good Connector, never accepts payout JSON, validates exact receipt chains, returns the unsaved gross/net Internal Transfer, and owns evidence lifecycle callbacks only. |
 | `payrexx_integration/payrexx_integration/payrexx/payrexx_client.py` | Thin REST client for Gateway, Subscription, and static-QR operations. **Auth: `x-api-key: <api_secret>` header** — current Payrexx scheme (per the official PHP SDK). The API version is code-pinned at `v1.16`; it is not a settings field. The legacy `ApiSignature` body field is no longer used. Canonical `*.payrexx.com` API hosts are trusted by default; custom Platform hosts require exact `payrexx_allowed_api_hosts` site-config entries and are validated before secret access. Canonical POSTs have no rate-limit retry, but custom-host Gateway creation can repeat once on `api.payrexx.com` after 401/403/404. Intermediate retry statuses are unlogged; one final failure crosses `error_logging.py`. The secret lives only in the closure of the `requests` auth callable. |
 | `error_logging.py` | Context-free provider/pay-URL failure boundary. Inserts one bounded `Error Log` with empty metadata directly (deferred for safe HTTP methods), never calls core `frappe.log_error`/`frappe.get_traceback`, and never invokes Sentry. |
 | `payrexx_integration/payrexx_integration/payrexx/webhook_validator.py` | HMAC-SHA256 verification of `X-Webhook-Signature`. Verifies Payrexx's documented hex encoding first and retains base64 as an observed compatibility form. The signing key is **separate** from the API secret (configured per webhook in the Payrexx dashboard). |
-| `api.py::payrexx_pay_url(sales_invoice, gateway_name=None)` | Jinja helper (registered via `hooks.py.jinja`). Resolves the gateway and returns an HMAC-signed redirect URL keyed off the site's `encryption_key`. |
+| `api.py::is_invoice_checkout_eligible/payrexx_pay_url` | Canonical cross-app current-state gate plus Jinja helper. Links require a submitted non-return invoice whose outstanding amount still equals the original payable total, then resolve the gateway and return an HMAC-signed redirect URL using the app-purpose key derived from the site's `encryption_key`; verification also accepts pre-derivation raw-key signatures for in-flight links. |
 | `api.py::pay_invoice(si=None, token=None, gateway_name=None)` | Whitelisted GET redirect endpoint. Verifies the invoice-and-gateway-bound HMAC token, locks/revalidates the wholly unpaid invoice and exact submitted/Requested Payment Request plus Integration Request checkout metadata, lazy-creates through ERPNext only when safe, and 302s to Payrexx. Because Frappe otherwise rolls back GET transactions, it sets `frappe.local.flags.commit` only after atomic local setup and checkout URL resolution. **All args remain optional kwargs** so missing-param requests return clean 403, not 500. |
 | `hosted_qa.py` | Explicitly gated, System-Manager-and-Accounts-Manager-only, read-only hosted sandbox preflight and settlement evidence. Exact invoice/gateway targets come from site config; never add checkout creation, callback replay, or reconciliation here. |
 | `tests/hosted_settlement_qa.py` | Protected hosted CLI. Credentials and target allowlists are environment-only; persisted state contains no signed/provider URLs or transaction identifiers. |
@@ -74,13 +76,15 @@ all five in sync with every change.
 {{ host_name }}/api/method/payrexx_integration.api.pay_invoice
   ?si=<Sales Invoice name>
   &gateway_name=<Payrexx Settings name>
-  &token=<32 hex chars — first half of HMAC-SHA256(encryption_key, si_name|gateway_name)>
+  &token=<32 hex chars — first half of HMAC-SHA256(derived pay-link key, si_name|gateway_name)>
 ```
 
+The pay-link key is `SHA256(encryption_key || ":payrexx_integration:pay-link")`.
 The token is deterministic per SI and gateway, so resends with the same gateway
-produce the same URL. Legacy links omit `gateway_name` and sign only `si_name`;
-they remain valid only while gateway resolution is unambiguous. To invalidate
-all links, rotate the site's `encryption_key` (rare).
+produce the same URL. Verification also accepts signatures made with the raw
+site key before purpose derivation. Separately, legacy links omit `gateway_name`
+and sign only `si_name`; they remain valid only while gateway resolution is
+unambiguous. To invalidate all forms, rotate the site's `encryption_key` (rare).
 
 ### Webhook URL (configured in Payrexx dashboard)
 
@@ -99,6 +103,19 @@ deliveries accept both Payrexx's documented bare object and the older observed /
 SDK-derived `subscription` envelope. This compatibility is not proof of the
 owned account's delivery shape; signed sandbox captures remain mandatory before
 production subscription processing.
+Payout deliveries use Payrexx's documented bare `object: payout` shape. They are
+validated and captured as signed provider evidence only; signed TEST/LIVE rows
+remain Review. The separate non-whitelisted synthetic TEST acceptance path may
+build an unsaved accounting entry for Good Connector, but this app never imports
+Good Connector and never inserts/links the payout Payment Entry itself.
+Every webhook body is sensitive. Transaction, subscription, payout, and
+pre-classification failures must never re-raise their original exception into
+Frappe's HTTP handler: Error Log metadata and Sentry capture the complete JSON
+body from `form_dict`. Use `_handle_sensitive_webhook_failure` so validation
+uses the snapshot-excluded exception, unexpected writes roll back before one
+context-free diagnostic and fixed HTTP 503, and transaction errors retry without
+database logging. Ignored/unclaimed observations use only the allowlisted file
+logger, never core `frappe.log_error`.
 After signature verification, settlement and accounting-review side effects run
 as the owning Payrexx Settings row's configured enabled System User. Missing,
 disabled, or Website users fail closed; there is no Administrator or cross-app
@@ -164,7 +181,10 @@ closed.
 | Create idempotency | No idempotency-key field; `referenceId` is documented as an internal merchant reference, not as unique or de-duplicating |
 
 A "no gateway found" GET against `/Gateway/0/` is the cheap auth-check used
-by `_ping()` — HTTP 200 with `status: error` means creds are valid.
+by `_ping()`. Only HTTP 200 with the exact JSON object
+`{"status":"error","message":"No Gateway found with id 0"}` proves the
+credentials. A 404, a substring match, additional envelope keys, or any other
+HTTP-200 body is rejected.
 
 For Payrexx Platform / partner accounts, split the checkout/login domain:
 `customer.pay.goodvantage.ch` means `instance_name = "customer"` and
@@ -174,8 +194,8 @@ site-config JSON list `payrexx_allowed_api_hosts` before saving. URL-like values
 IP literals, malformed hosts, wildcards, and non-HTTPS ports are rejected before
 the Password field is read. A custom API domain's 401/403 response repeats the
 same request once against `api.payrexx.com` for every supported operation. A 404
-repeats only the credential probe and Gateway creation, where it can indicate an
-unprovisioned custom API host; every other retrieval or POST 404 is authoritative.
+repeats only Gateway creation, where it can indicate an unprovisioned custom API
+host; the credential probe and every other retrieval or POST treat 404 as authoritative.
 Thus custom-host Gateway creation can issue two POSTs for one app call. This is a
 host fallback, not a rate-limit or checkout-deadlock retry.
 
@@ -291,6 +311,9 @@ bench --site <site> run-tests \
 
 bench --site <site> run-tests \
   --module payrexx_integration.tests.test_error_logging
+
+bench --site <site> run-tests \
+  --module payrexx_integration.tests.test_payout_reconciliation
 
 # Playwright e2e (core specs plus an optional existing-booking email check)
 cd playwright
@@ -409,11 +432,19 @@ Follow `HOW_TO.md` §12 and never test it on a shared or production host.
 
 ## Cross-app integration
 
-- Good Event's default invoice renderer imports the canonical
-  `payrexx_integration.api.safe_pay_url` boundary. Missing, ambiguous, or
-  ordinarily failing Payrexx configuration degrades to no online-pay button
-  with one Payrexx-owned sanitized Error Log; retryable database errors
-  propagate unchanged and Good Event must not re-log them.
+- Good Event and MiKi import the canonical `safe_pay_url` boundary. Good NPO
+  additionally calls `is_invoice_checkout_eligible` before an optional custom
+  membership provider. Paid, partially paid, returned, or amount-inconsistent
+  invoices produce no link before gateway/provider resolution. Missing,
+  ambiguous, or ordinarily failing Payrexx configuration degrades to no
+  online-pay button with one Payrexx-owned sanitized Error Log; retryable
+  database errors propagate unchanged and consumers must not re-log them.
+- Payrexx registers the optional exact-reference EBICS provider by hook only.
+  LIVE and signed payout evidence can never be eligible. Preserve the reserved
+  synthetic namespace, explicit gate/confirmation, exact Sales Invoice Payment
+  Request receipt chain, company-default two-decimal currency restriction,
+  indexed current-lock ownership check, one deduction row, and order-independent
+  cancellation/unlink behavior.
 
 ---
 

@@ -11,6 +11,24 @@ app_license = "unlicense"
 
 required_apps = ["payments"]
 
+after_install = "payrexx_integration.setup.ensure_payout_reconciliation_fields"
+after_migrate = ["payrexx_integration.setup.ensure_payout_reconciliation_fields"]
+
+# Optional Good Connector hook. Frappe reads registrations without importing
+# the hook owner, so Payrexx keeps its payments-only installation topology.
+good_connector_ebics_reference_reconciliation_providers = [
+	"payrexx_integration.payout_reconciliation.get_reconciliation_candidates",
+]
+
+doc_events = {
+	"Bank Transaction": {
+		"on_update_after_submit": "payrexx_integration.payout_reconciliation.on_bank_transaction_update_after_submit",
+	},
+	"Payment Entry": {
+		"before_cancel": "payrexx_integration.payout_reconciliation.on_payment_entry_before_cancel",
+	},
+}
+
 # Extension point for apps that own a non-Sales-Invoice settlement source.
 # With no provider registered, only Sales Invoice-backed Payment Requests are supported.
 payrexx_settlement_source_providers = []

@@ -158,7 +158,7 @@ here.
 |---|---|---|
 | `POST` | `/Gateway/` | Create a hosted checkout. Returns `{id, link, hash, status}`. |
 | `GET` | `/Gateway/{id}/` | Look up a gateway and its `invoices[].transactions[]`. |
-| `GET` | `/Gateway/0/` | Credential ping — HTTP 200 with `status: error` means the credentials are valid. |
+| `GET` | `/Gateway/0/` | Credential ping — only HTTP 200 with the exact `{"status":"error","message":"No Gateway found with id 0"}` envelope proves valid credentials. |
 | `DELETE` | `/Gateway/{id}/` | Provider-supported Gateway deletion. This app exposes no wrapper; manual cleanup requires exact transaction-free evidence and provider permission. |
 | `POST` | `/Subscription/` | Create a subscription for an already-known Payrexx contact. Normal signup uses Gateway subscription parameters instead. |
 | `GET` | `/Subscription/` or `/Subscription/{id}/` | List or retrieve subscriptions; list pagination uses query parameters. |

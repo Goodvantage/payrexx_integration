@@ -20,7 +20,10 @@ from payments.utils import create_payment_gateway
 from payrexx_integration.error_logging import TRANSACTION_ERRORS, log_sanitized_error
 from payrexx_integration.gateway_selection import resolve_payrexx_settings
 from payrexx_integration.payrexx_integration.payrexx import webhook_payload
+from payrexx_integration.payrexx_integration.payrexx.payout_evidence import capture_payout_evidence
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import (
+	CREDENTIAL_PROBE_SENTINEL,
+	PayrexxAPIError,
 	PayrexxClient,
 	_normalize_api_base_domain,
 	get_http_status,
@@ -103,21 +106,39 @@ class SubscriptionEventDispatchError(RuntimeError):
 	"""An installment provider failed after the webhook was authenticated."""
 
 
+class SensitiveWebhookValidationError(frappe.SecurityException, frappe.ValidationError):
+	"""A sensitive webhook failed validation without entering framework error capture."""
+
+
+class SensitiveWebhookBoundaryError(frappe.SecurityException):
+	"""The privacy-preserving webhook failure boundary could not return normally."""
+
+	http_status_code = 503
+
+
 def _get_current_locked_doc(doctype: str, name: str) -> Document:
 	"""Hydrate and lock a document in one current read, outside any stale transaction snapshot."""
 	return frappe.get_doc(doctype, name, for_update=True)
 
 
 def _run_with_deadlock_retry(operation):
-	"""Rollback a failed transaction before replaying its complete atomic operation."""
-	for attempt in range(1, DEADLOCK_MAX_ATTEMPTS + 1):
+	"""Rollback a failed transaction before replaying its complete atomic operation.
+
+	D45 twin of ``good_connector.database.retry_transaction`` defaults
+	(payrexx_integration is deliberately connector-free); also retries
+	lock-wait timeouts, linear 0.2s backoff. Pinned by good_connector's
+	``test_retry_parity`` and registered in ``tools/sanctioned_twins.json``.
+	"""
+	last_error = None
+	for attempt in range(DEADLOCK_MAX_ATTEMPTS):
 		try:
 			return operation()
-		except frappe.QueryDeadlockError:
+		except (frappe.QueryDeadlockError, frappe.QueryTimeoutError) as error:
+			last_error = error
 			frappe.db.rollback()
-			if attempt == DEADLOCK_MAX_ATTEMPTS:
-				raise
-			time.sleep(0.25 * attempt)
+			if attempt < DEADLOCK_MAX_ATTEMPTS - 1:
+				time.sleep(0.2 * (attempt + 1))
+	raise last_error
 
 
 class PayrexxSettings(Document):
@@ -299,6 +320,13 @@ class PayrexxSettings(Document):
 			body = client.ping_gateway()
 		except TRANSACTION_ERRORS:
 			raise
+		except PayrexxAPIError:
+			frappe.throw(
+				_(
+					"Unexpected response from Payrexx. Check that 'Instance Name' ({0}) and "
+					"'API Base Domain' ({1}) are correct."
+				).format(client.instance, client.api_base_domain)
+			)
 		except Exception as exc:
 			status_code = get_http_status(exc)
 			if status_code in (401, 403):
@@ -307,7 +335,7 @@ class PayrexxSettings(Document):
 				frappe.throw(_("Payrexx returned HTTP {0}").format(status_code))
 			frappe.throw(_("Cannot reach Payrexx — check network connectivity."))
 
-		if not isinstance(body, dict) or "status" not in body:
+		if body != CREDENTIAL_PROBE_SENTINEL:
 			frappe.throw(
 				_(
 					"Unexpected response from Payrexx. Check that 'Instance Name' ({0}) and "
@@ -661,6 +689,7 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 	txn = {}
 	ref_id = ""
 	status = ""
+	payout_delivery = False
 	try:
 		raw_body = frappe.request.get_data() or b""
 		signature = frappe.get_request_header("X-Webhook-Signature", "")
@@ -675,6 +704,11 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 
 		body = frappe.parse_json(raw_body.decode("utf-8") if raw_body else "{}") or {}
 
+		payout_delivery = webhook_payload.is_payout_event(body)
+		if payout_delivery:
+			with as_automation_user(settings):
+				return capture_payout_evidence(settings.name, webhook_payload.payout_of(body))
+
 		# A subscription lifecycle delivery carries no transaction and settles no
 		# money; it reports what happened to the instruction.
 		if webhook_payload.is_subscription_event(body):
@@ -685,7 +719,7 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 			frappe.throw(
 				_(
 					"Payrexx delivered an unsupported JSON webhook shape. Expected a transaction "
-					"envelope or a subscription lifecycle object."
+					"envelope, a subscription lifecycle object, or a bare payout object."
 				),
 				frappe.ValidationError,
 			)
@@ -700,36 +734,62 @@ doctype.payrexx_settings.payrexx_settings.callback?gateway_name=Live
 				return _run_with_deadlock_retry(
 					lambda: _process_callback_transaction(settings.name, txn, "", status)
 				)
-			frappe.log_error(
-				title="Payrexx webhook missing referenceId",
-				message=frappe.as_json(_webhook_log_summary(txn, ref_id, status)),
+			_log_webhook_observation(
+				"Payrexx webhook missing referenceId",
+				_webhook_log_summary(txn, ref_id, status),
 			)
 			return {"ok": True}
 
 		return _run_with_deadlock_retry(
 			lambda: _process_callback_transaction(settings.name, txn, ref_id, status)
 		)
-	except SubscriptionEventDispatchError:
+	except SubscriptionEventDispatchError as error:
 		# The provider may have written documents or registered callbacks before it
 		# failed. Roll back the complete webhook transaction first, then retain only
 		# a sanitized, locally replayable Unclaimed event in the fresh transaction.
-		frappe.db.rollback()
-		with as_automation_user(settings):
-			_persist_unclaimed_subscription_event(settings.name, txn, ref_id, status)
+		frappe.local.flags.disable_traceback = True
+		try:
+			frappe.db.rollback()
+			with as_automation_user(settings):
+				_persist_unclaimed_subscription_event(settings.name, txn, ref_id, status)
+		except Exception as recovery_error:
+			return _handle_sensitive_webhook_failure(recovery_error, payout_delivery=False)
 		frappe.local.response["http_status_code"] = 503
-		frappe.log_error(
-			title="Payrexx subscription charge provider failed",
-			message=frappe.as_json(
-				_subscription_log_summary(webhook_payload.embedded_subscription(txn))
-				| {"reference": ref_id or None}
-			),
+		_log_webhook_observation(
+			"Payrexx subscription charge provider failed",
+			_subscription_log_summary(webhook_payload.embedded_subscription(txn))
+			| {"reference": ref_id or None, "error": type(error).__name__},
 		)
 		return {"ok": False, "error": "subscription_event_unclaimed"}
 	except frappe.AuthenticationError:
 		raise
+	except Exception as error:
+		return _handle_sensitive_webhook_failure(error, payout_delivery=payout_delivery)
+
+
+def _handle_sensitive_webhook_failure(
+	error: Exception,
+	*,
+	payout_delivery: bool,
+) -> dict[str, bool | str]:
+	"""Rollback a webhook without exposing its authenticated body or request context."""
+	frappe.local.flags.disable_traceback = True
+	if isinstance(error, frappe.ValidationError):
+		raise SensitiveWebhookValidationError(cstr(error)) from None
+
+	try:
+		frappe.db.rollback()
 	except Exception:
-		frappe.log_error(title="Payrexx callback error", message=frappe.get_traceback())
-		raise
+		raise SensitiveWebhookBoundaryError("Payrexx webhook processing failed") from None
+
+	if not isinstance(error, TRANSACTION_ERRORS):
+		try:
+			log_sanitized_error("payout_webhook" if payout_delivery else "webhook", error, http_status=503)
+		except TRANSACTION_ERRORS:
+			raise SensitiveWebhookBoundaryError("Payrexx webhook processing failed") from None
+
+	frappe.local.response["http_status_code"] = 503
+	return {"ok": False, "error": "payout_capture_failed" if payout_delivery else "webhook_processing_failed"}
 
 
 def _reject_non_json_webhook_body() -> None:
@@ -770,9 +830,9 @@ def _process_callback_subscription(settings_name: str, subscription: dict) -> di
 		)
 	with as_automation_user(settings_name):
 		if not _dispatch_subscription_event("status", subscription=subscription, settings_name=settings_name):
-			frappe.log_error(
-				title="Payrexx subscription event unclaimed",
-				message=frappe.as_json(_subscription_log_summary(subscription)),
+			_log_webhook_observation(
+				"Payrexx subscription event unclaimed",
+				_subscription_log_summary(subscription),
 			)
 	_enqueue_subscription_transaction_reconciliation(settings_name, subscription)
 	return {"ok": True}
@@ -815,16 +875,16 @@ def _process_callback_transaction(
 				status,
 				integration_request=None,
 			)
-		frappe.log_error(
-			title="Payrexx webhook unknown reference",
-			message=frappe.as_json(_webhook_log_summary(transaction, reference_id, status)),
+		_log_webhook_observation(
+			"Payrexx webhook unknown reference",
+			_webhook_log_summary(transaction, reference_id, status),
 		)
 		return {"ok": True}
 
 	if ir.integration_request_service != "Payrexx":
-		frappe.log_error(
-			title="Payrexx webhook wrong Integration Request service",
-			message=frappe.as_json(_webhook_log_summary(transaction, reference_id, status)),
+		_log_webhook_observation(
+			"Payrexx webhook wrong Integration Request service",
+			_webhook_log_summary(transaction, reference_id, status),
 		)
 		return {"ok": True}
 
@@ -835,12 +895,10 @@ def _process_callback_transaction(
 	# request created by another row (e.g. Live).
 	expected_settings = ir_data.get("payrexx_settings") or _settings_name_from_request_data(ir_data)
 	if expected_settings and expected_settings != settings_name:
-		frappe.log_error(
-			title="Payrexx webhook gateway mismatch",
-			message=frappe.as_json(
-				_webhook_log_summary(transaction, reference_id, status)
-				| {"verified_with": settings_name, "expected": expected_settings}
-			),
+		_log_webhook_observation(
+			"Payrexx webhook gateway mismatch",
+			_webhook_log_summary(transaction, reference_id, status)
+			| {"verified_with": settings_name, "expected": expected_settings},
 		)
 		return {"ok": True}
 	if (
@@ -892,11 +950,9 @@ def _process_callback_transaction(
 		return {"ok": True}
 
 	if status == "confirmed" and not expected_settings and _multiple_gateways_configured():
-		frappe.log_error(
-			title="Payrexx webhook unbound legacy request",
-			message=frappe.as_json(
-				_webhook_log_summary(transaction, reference_id, status) | {"verified_with": settings_name}
-			),
+		_log_webhook_observation(
+			"Payrexx webhook unbound legacy request",
+			_webhook_log_summary(transaction, reference_id, status) | {"verified_with": settings_name},
 		)
 		return {"ok": True}
 
@@ -962,6 +1018,18 @@ def _webhook_log_summary(txn: dict, ref_id: str | None, status: str | None) -> d
 		"instance_name": instance.get("name"),
 		"payment_request_id": invoice.get("paymentRequestId"),
 	}
+
+
+def _log_webhook_observation(title: str, summary: dict) -> None:
+	"""Write an allowlisted summary without request metadata, traceback, or Sentry."""
+	try:
+		frappe.logger("payrexx_integration", allow_site=True).warning(
+			"%s | %s",
+			title,
+			frappe.as_json(summary),
+		)
+	except Exception:
+		pass
 
 
 def reconcile_integration_request(
@@ -1134,20 +1202,14 @@ def _on_payment_authorized(
 ) -> str | None:
 	if not (integration_request.reference_doctype and integration_request.reference_docname):
 		return None
-	try:
-		with _payment_authorization_user(integration_request, settings_name):
-			if integration_request.reference_doctype == "Payment Request":
-				return _set_payment_request_as_paid(integration_request.reference_docname)
-			else:
-				frappe.get_doc(
-					integration_request.reference_doctype,
-					integration_request.reference_docname,
-				).run_method("on_payment_authorized", status)
-	except frappe.QueryDeadlockError:
-		raise
-	except Exception:
-		frappe.log_error(title="Payrexx on_payment_authorized", message=frappe.get_traceback())
-		raise
+	with _payment_authorization_user(integration_request, settings_name):
+		if integration_request.reference_doctype == "Payment Request":
+			return _set_payment_request_as_paid(integration_request.reference_docname)
+		else:
+			frappe.get_doc(
+				integration_request.reference_doctype,
+				integration_request.reference_docname,
+			).run_method("on_payment_authorized", status)
 	return None
 
 
@@ -1639,9 +1701,9 @@ def _process_subscription_reversal(
 		if not webhook_payload.is_live(transaction) and not _gateway_allows_test_transactions(
 			{"payrexx_settings": settings_name}
 		):
-			frappe.log_error(
-				title="Payrexx subscription reversal ignored (TEST mode)",
-				message=frappe.as_json(_subscription_log_summary(subscription) | {"reference": reference_id}),
+			_log_webhook_observation(
+				"Payrexx subscription reversal ignored (TEST mode)",
+				_subscription_log_summary(subscription) | {"reference": reference_id},
 			)
 			return {"ok": True}
 
@@ -1662,7 +1724,6 @@ def _process_subscription_reversal(
 		except frappe.QueryDeadlockError:
 			raise
 		except Exception:
-			frappe.logger("payrexx_integration").exception("Payrexx subscription reversal provider failed")
 			raise SubscriptionEventDispatchError from None
 		event.db_set(
 			{
@@ -1671,9 +1732,9 @@ def _process_subscription_reversal(
 			}
 		)
 		if not claimed:
-			frappe.log_error(
-				title="Payrexx subscription reversal unclaimed",
-				message=frappe.as_json(_subscription_log_summary(subscription) | {"reference": reference_id}),
+			_log_webhook_observation(
+				"Payrexx subscription reversal unclaimed",
+				_subscription_log_summary(subscription) | {"reference": reference_id},
 			)
 			if getattr(frappe.local, "request", None):
 				frappe.local.response["http_status_code"] = 503
@@ -1728,9 +1789,9 @@ def _process_subscription_charge(
 		if not webhook_payload.is_live(transaction) and not _gateway_allows_test_transactions(
 			{"payrexx_settings": settings_name}
 		):
-			frappe.log_error(
-				title="Payrexx subscription charge ignored (TEST mode)",
-				message=frappe.as_json(_subscription_log_summary(subscription) | {"reference": reference_id}),
+			_log_webhook_observation(
+				"Payrexx subscription charge ignored (TEST mode)",
+				_subscription_log_summary(subscription) | {"reference": reference_id},
 			)
 			return {"ok": True}
 
@@ -1752,7 +1813,6 @@ def _process_subscription_charge(
 		except frappe.QueryDeadlockError:
 			raise
 		except Exception:
-			frappe.logger("payrexx_integration").exception("Payrexx subscription charge provider failed")
 			raise SubscriptionEventDispatchError from None
 		event.db_set(
 			{
@@ -1761,9 +1821,9 @@ def _process_subscription_charge(
 			}
 		)
 		if not claimed:
-			frappe.log_error(
-				title="Payrexx subscription charge unclaimed",
-				message=frappe.as_json(_subscription_log_summary(subscription) | {"reference": reference_id}),
+			_log_webhook_observation(
+				"Payrexx subscription charge unclaimed",
+				_subscription_log_summary(subscription) | {"reference": reference_id},
 			)
 			# Persist the Unclaimed state but return a retryable HTTP response. Raising
 			# here would roll the durable row back with the request and remove the
@@ -2511,12 +2571,11 @@ def _evidence_recording_user(integration_request, settings_name: str | None = No
 	try:
 		return _payment_authorization_user(integration_request, settings_name)
 	except frappe.ValidationError:
-		frappe.log_error(
-			title="Payrexx evidence recorded without gateway automation user",
-			message=(
-				f"Integration Request {integration_request.name}: no Payrexx Settings row "
-				"could be resolved (unbound request on a zero- or multi-gateway site). "
-				f"Terminal evidence was recorded as {frappe.session.user}.\n\n" + frappe.get_traceback()
-			),
+		_log_webhook_observation(
+			"Payrexx evidence recorded without gateway automation user",
+			{
+				"integration_request": integration_request.name,
+				"recorded_as": frappe.session.user,
+			},
 		)
 		return nullcontext()

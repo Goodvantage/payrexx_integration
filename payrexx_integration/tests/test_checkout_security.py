@@ -1,4 +1,6 @@
+import tomllib
 from contextlib import nullcontext
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import frappe
@@ -13,11 +15,19 @@ from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
 	payrexx_settings as settings_module,
 )
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import (
+	PayrexxAPIError,
 	PayrexxClient,
 	_normalize_api_base_domain,
 )
 
 CLIENT_MODULE = "payrexx_integration.payrexx_integration.payrexx.payrexx_client"
+APP_ROOT = Path(__file__).resolve().parents[2]
+
+
+class TestDependencyManifest(UnitTestCase):
+	def test_python_manifest_declares_direct_http_runtime_import(self):
+		project = tomllib.loads((APP_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+		self.assertIn("requests~=2.33.0", project["dependencies"])
 
 
 def _sales_invoice(*, outstanding_amount=100, currency="CHF"):
@@ -207,6 +217,47 @@ class TestPayrexxApiHostTrust(UnitTestCase):
 		request.assert_called_once()
 		self.assertIn("api.pay.example", request.call_args.args[1])
 
+	def test_partner_ping_rejects_gateway_zero_404_without_fallback(self):
+		response = Response()
+		response.status_code = 404
+		response.url = "https://api.pay.goodvantage.ch/v1.16/Gateway/0/?instance=goodvantage"
+		response.headers["Content-Type"] = "application/json"
+		response._content = b'{"status":"error","message":"An error occurred: No Gateway found with id 0"}'
+
+		with (
+			patch(
+				f"{CLIENT_MODULE}.frappe.conf",
+				{"payrexx_allowed_api_hosts": ["api.pay.goodvantage.ch"]},
+			),
+			patch(f"{CLIENT_MODULE}._execute_request", side_effect=HTTPError(response=response)) as request,
+		):
+			with self.assertRaises(HTTPError):
+				PayrexxClient(
+					instance="goodvantage",
+					api_secret="sk_test_dummy",
+					api_base_domain="pay.goodvantage.ch",
+				).ping_gateway()
+
+		request.assert_called_once()
+		self.assertEqual(request.call_args.args[1], response.url)
+
+	def test_ping_rejects_every_http_200_near_match_envelope(self):
+		client = PayrexxClient(instance="demo", api_secret="sk_test_dummy")
+		near_matches = (
+			{"status": "success", "data": []},
+			{"status": "error", "message": "An error occurred: No Gateway found with id 0"},
+			{"status": "error", "message": "No Gateway found with id 0", "data": []},
+			{"status": "error", "message": "No Gateway found with id 00"},
+		)
+		for body in near_matches:
+			with (
+				self.subTest(body=body),
+				patch(f"{CLIENT_MODULE}._execute_request", return_value=body),
+				patch(f"{CLIENT_MODULE}.log_sanitized_error"),
+				self.assertRaises(PayrexxAPIError),
+			):
+				client.ping_gateway()
+
 	def test_gateway_retrieval_auth_rejection_still_falls_back(self):
 		for status_code in (401, 403):
 			with self.subTest(status_code=status_code):
@@ -338,7 +389,7 @@ class TestSafePayUrlBoundary(UnitTestCase):
 	def test_gateway_resolution_failure_uses_the_same_sanitized_contract(self):
 		with (
 			patch.object(api.frappe.db, "exists", return_value=True),
-			patch.object(api.frappe.db, "get_value", return_value=1),
+			patch.object(api.frappe, "get_doc", return_value=_sales_invoice()),
 			patch.object(api, "resolve_payrexx_settings", side_effect=RuntimeError(self.EXCEPTION_TEXT)),
 			patch.object(api, "log_sanitized_error") as log_error,
 		):
@@ -346,13 +397,29 @@ class TestSafePayUrlBoundary(UnitTestCase):
 
 		self._assert_sanitized_error_log(log_error)
 
+	def test_partially_paid_invoice_returns_no_link_without_gateway_resolution(self):
+		for outstanding_amount in (0, 60):
+			with (
+				self.subTest(outstanding_amount=outstanding_amount),
+				patch.object(api.frappe.db, "exists", return_value=True),
+				patch.object(
+					api.frappe,
+					"get_doc",
+					return_value=_sales_invoice(outstanding_amount=outstanding_amount),
+				),
+				patch.object(api, "resolve_payrexx_settings") as resolve_settings,
+			):
+				self.assertEqual(api.safe_pay_url("SINV-SECURITY-TEST"), "")
+
+			resolve_settings.assert_not_called()
+
 	def test_retryable_database_errors_propagate_without_logging(self):
 		for error_type in (frappe.QueryDeadlockError, frappe.QueryTimeoutError):
 			error = error_type(f"retryable failure containing {self.PAYER_EMAIL}")
 			with (
 				self.subTest(error_type=error_type.__name__),
 				patch.object(api.frappe.db, "exists", return_value=True),
-				patch.object(api.frappe.db, "get_value", return_value=1),
+				patch.object(api.frappe, "get_doc", return_value=_sales_invoice()),
 				patch.object(api, "resolve_payrexx_settings", side_effect=error),
 				patch.object(api, "log_sanitized_error") as log_error,
 				self.assertRaises(error_type) as raised,
@@ -463,12 +530,15 @@ class TestApiSecretNeverReachesLoggedTracebacks(UnitTestCase):
 		response = Response()
 		response.status_code = 200
 		response.headers["content-type"] = "application/json"
-		response._content = b'{"status":"success","data":[]}'
+		response._content = b'{"status":"error","message":"No Gateway found with id 0"}'
 		session = _StubProviderSession(response)
 		client = PayrexxClient(instance="demo", api_secret=self.API_SECRET)
 
 		with patch(f"{CLIENT_MODULE}.get_request_session", return_value=session):
-			self.assertEqual(client.ping_gateway(), {"status": "success", "data": []})
+			self.assertEqual(
+				client.ping_gateway(),
+				{"status": "error", "message": "No Gateway found with id 0"},
+			)
 
 		self.assertEqual(session.send_kwargs["timeout"], (5, 30))
 
@@ -1158,3 +1228,21 @@ class TestBrowserReturnTransactionBinding(UnitTestCase):
 		self.assertEqual(transaction["id"], 2)
 		self.assertEqual(transaction["referenceId"], "IR-EXPECTED")
 		self.assertEqual(transaction["currency"], "CHF")
+
+
+class TestPayLinkKeyCompatibility(UnitTestCase):
+	def test_legacy_raw_key_token_still_verifies(self) -> None:
+		# Links issued before the purpose-scoped signing key (D53) were
+		# signed with the raw site key; the documented contract says they
+		# keep verifying.
+		import hashlib
+		import hmac as hmac_module
+
+		from payrexx_integration.api import _raw_site_key, sign_reference, verify_reference
+
+		payload = "ACC-SINV-2026-00001|gateway-1"
+		legacy = hmac_module.new(_raw_site_key(), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+		self.assertTrue(verify_reference(payload, legacy))
+		self.assertTrue(verify_reference(payload, sign_reference(payload)))
+		self.assertNotEqual(legacy, sign_reference(payload))
+		self.assertFalse(verify_reference(payload, legacy[:-1] + ("0" if legacy[-1] != "0" else "1")))

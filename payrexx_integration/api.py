@@ -45,10 +45,17 @@ from payrexx_integration.url_utils import safe_return_url as _safe_return_url
 def _signing_key() -> bytes:
 	"""Per-site secret used to sign pay-by-email links.
 
-	Reuses the site's ``encryption_key`` so we don't introduce yet another
-	secret to manage. The key is in ``site_config.json`` and is required for
-	a Frappe site to boot, so it's always present.
+	Derived from the site's ``encryption_key`` (always present) but scoped to
+	this app's pay-link purpose (D53): a payrexx link token can no longer be
+	replayed against any other surface that signs with the raw site key, and
+	vice versa. For NEW link kinds elsewhere in the stack use
+	``good_connector.link_tokens`` (purpose + expiry); this compact scheme
+	stays payrexx policy so payment links keep their short form.
 	"""
+	return hashlib.sha256(_raw_site_key() + b":payrexx_integration:pay-link").digest()
+
+
+def _raw_site_key() -> bytes:
 	key = frappe.local.conf.get("encryption_key")
 	if not key:
 		frappe.throw(_("Site encryption_key is not configured"))
@@ -58,9 +65,11 @@ def _signing_key() -> bytes:
 def sign_reference(payload: str) -> str:
 	"""HMAC-sign an arbitrary reference string with the site key.
 
-	Shared signer for compact email-link tokens (pay-by-email here, the dummy
-	checkout in good_demo). Callers compose the payload string; keep existing
-	compositions stable so in-flight links keep verifying.
+	Signer for THIS app's compact email-link tokens (pay-by-email here, the
+	dummy checkout in good_demo rides the same payment surface). Callers
+	compose the payload string; keep existing compositions stable so
+	in-flight links keep verifying. Other link kinds must NOT reuse this —
+	use ``good_connector.link_tokens`` (purpose-scoped, expiring) instead.
 	"""
 	digest = hmac.new(_signing_key(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
 	# 32 hex chars = 128 bits of HMAC output, enough to make guessing infeasible
@@ -71,7 +80,14 @@ def sign_reference(payload: str) -> str:
 def verify_reference(payload: str, token: str | None) -> bool:
 	if not (payload and token):
 		return False
-	return hmac.compare_digest(sign_reference(payload), str(token))
+	if hmac.compare_digest(sign_reference(payload), str(token)):
+		return True
+	# Compatibility (documented contract: in-flight links keep verifying):
+	# links issued before the purpose-scoped key derivation were signed with
+	# the raw site key. Accept those signatures too; new links always carry
+	# the scoped signature, so this path ages out with the old emails.
+	legacy = hmac.new(_raw_site_key(), payload.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+	return hmac.compare_digest(legacy, str(token))
 
 
 def _sign(invoice_name: str, gateway_name: str | None = None) -> str:
@@ -109,20 +125,27 @@ def _log_pay_url_unavailable(exception: BaseException) -> None:
 # ---------------------------------------------------------------- jinja helper
 
 
+def is_invoice_checkout_eligible(sales_invoice: str | None) -> bool:
+	"""Return whether an invoice can enter the Payrexx checkout now."""
+	if not sales_invoice or not frappe.db.exists("Sales Invoice", sales_invoice):
+		return False
+	try:
+		_validate_sales_invoice_checkout_state(frappe.get_doc("Sales Invoice", sales_invoice))
+	except frappe.ValidationError:
+		return False
+	return True
+
+
 def payrexx_pay_url(sales_invoice: str | None, gateway_name: str | None = None) -> str:
 	"""Return the public pay-by-email URL for a Sales Invoice.
 
 	Registered as a jinja method via ``hooks.py`` — call from any email
 	template as ``{{ payrexx_pay_url(doc.name) }}``.
 
-	Returns an empty string when called with no invoice so jinja templates
-	can guard with ``{% if payrexx_pay_url(...) %}`` cleanly.
+	Returns an empty string unless the invoice is submitted, non-return, and
+	wholly outstanding, so rendered links pass the checkout's current-state gate.
 	"""
-	if not sales_invoice:
-		return ""
-	if not frappe.db.exists("Sales Invoice", sales_invoice):
-		return ""
-	if frappe.db.get_value("Sales Invoice", sales_invoice, "docstatus") != 1:
+	if not is_invoice_checkout_eligible(sales_invoice):
 		return ""
 	try:
 		settings_name = resolve_payrexx_settings(gateway_name).name
