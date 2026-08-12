@@ -135,15 +135,20 @@ class TestSyntheticPayoutReconciliation(IntegrationTestCase):
 		frappe.clear_document_cache("Payrexx Settings", self.settings_name)
 
 	def _account(self, account_type: str, *, parent_of: str) -> str:
-		from erpnext.accounts.doctype.account.test_account import create_account
-
 		parent = frappe.db.get_value("Account", parent_of, "parent_account")
-		return create_account(
-			account_name=f"Payrexx Synthetic {account_type} {frappe.generate_hash(length=8)}",
-			company=self.company,
-			parent_account=parent,
-			account_type=account_type,
-			account_currency=self.currency,
+		return (
+			frappe.get_doc(
+				{
+					"doctype": "Account",
+					"account_name": f"Payrexx Synthetic {account_type} {frappe.generate_hash(length=8)}",
+					"company": self.company,
+					"parent_account": parent,
+					"account_type": account_type,
+					"account_currency": self.currency,
+				}
+			)
+			.insert(ignore_permissions=True)
+			.name
 		)
 
 	def _expense_account(self) -> str:
@@ -165,13 +170,18 @@ class TestSyntheticPayoutReconciliation(IntegrationTestCase):
 			{"company": self.company, "root_type": "Expense", "is_group": 1},
 			"name",
 		)
-		from erpnext.accounts.doctype.account.test_account import create_account
-
-		return create_account(
-			account_name=f"Payrexx Synthetic Fees {frappe.generate_hash(length=8)}",
-			company=self.company,
-			parent_account=parent,
-			account_currency=self.currency,
+		return (
+			frappe.get_doc(
+				{
+					"doctype": "Account",
+					"account_name": f"Payrexx Synthetic Fees {frappe.generate_hash(length=8)}",
+					"company": self.company,
+					"parent_account": parent,
+					"account_currency": self.currency,
+				}
+			)
+			.insert(ignore_permissions=True)
+			.name
 		)
 
 	def _bank_account(self) -> str:

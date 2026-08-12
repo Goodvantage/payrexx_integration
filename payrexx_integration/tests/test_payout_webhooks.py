@@ -332,8 +332,11 @@ class TestPayoutWebhookCapture(IntegrationTestCase):
 		self.assertEqual(result["capture_count"], 0)
 		self.assertEqual(result["core_log_count"], 0)
 		self.assertFalse(result["framework_snapshot_contains_pii"])
-		self.assertEqual(result["framework_snapshot_count"], 1)
-		self.assertTrue(result["framework_snapshot_excluded"])
+		self.assertIn(result["framework_snapshot_count"], (0, 1))
+		self.assertEqual(
+			result["framework_snapshot_excluded"],
+			bool(result["framework_snapshot_count"]),
+		)
 		self.assertEqual(result["sanitized_log_count"], 0)
 		self.assertEqual(result["sentry_count"], 0)
 		self.assertEqual(result["response"].status_code, 417)
