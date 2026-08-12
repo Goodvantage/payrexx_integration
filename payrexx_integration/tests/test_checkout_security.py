@@ -1231,6 +1231,10 @@ class TestBrowserReturnTransactionBinding(UnitTestCase):
 
 
 class TestPayLinkKeyCompatibility(UnitTestCase):
+	def setUp(self):
+		super().setUp()
+		self.enterContext(patch.dict(api.frappe.local.conf, {"encryption_key": "payrexx-test-signing-key"}))
+
 	def test_legacy_raw_key_token_still_verifies(self) -> None:
 		# Links issued before the purpose-scoped signing key (D53) were
 		# signed with the raw site key; the documented contract says they
