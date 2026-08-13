@@ -273,6 +273,39 @@ class TestPayrexxApiHostTrust(UnitTestCase):
 
 		request.assert_called_once()
 
+	def test_probe_404_logs_only_when_the_body_is_not_the_sentinel(self):
+		client = PayrexxClient(instance="demo", api_secret="sk_test_dummy")
+		for body, expected_log_count in (
+			(b'{"status":"error","message":"No Gateway found with id 0"}', 0),
+			(b'{"status":"error","message":"Instance not found"}', 1),
+			(b"not-json", 1),
+		):
+			response = Response()
+			response.status_code = 404
+			response.reason = "Not Found"
+			response.url = "https://api.payrexx.com/v1.16/Gateway/0/?instance=demo"
+			response.headers["Content-Type"] = "application/json"
+			response._content = body
+
+			with (
+				self.subTest(body=body),
+				patch(
+					f"{CLIENT_MODULE}.get_request_session",
+					return_value=_StubProviderSession(response),
+				),
+				patch(f"{CLIENT_MODULE}.log_sanitized_error") as log_error,
+			):
+				if expected_log_count:
+					with self.assertRaises(HTTPError):
+						client.ping_gateway()
+				else:
+					self.assertEqual(client.ping_gateway()["status"], "error")
+
+			self.assertEqual(log_error.call_count, expected_log_count)
+			if expected_log_count:
+				self.assertEqual(log_error.call_args.args[0], "payrexx_request")
+				self.assertEqual(log_error.call_args.kwargs, {"http_status": 404})
+
 	def test_ping_rejects_every_http_200_near_match_envelope(self):
 		client = PayrexxClient(instance="demo", api_secret="sk_test_dummy")
 		# "An error occurred: No Gateway found with id 0" is deliberately absent:

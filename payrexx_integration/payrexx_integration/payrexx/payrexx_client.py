@@ -125,6 +125,11 @@ class PayrexxClient:
 		except HTTPError as exc:
 			body = _credential_probe_body(exc)
 			if body is None:
+				# This probe declares 404 expected so the genuine sentinel remains
+				# unlogged. Restore the final-failure boundary when the body proves
+				# that the response was not the handled sentinel after all.
+				if get_http_status(exc) == CREDENTIAL_PROBE_STATUS:
+					log_sanitized_error("payrexx_request", exc, http_status=CREDENTIAL_PROBE_STATUS)
 				raise
 		if not is_credential_probe_sentinel(body):
 			raise _logged_response_error("Unexpected credential probe response")

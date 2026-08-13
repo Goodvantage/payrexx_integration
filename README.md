@@ -2,9 +2,10 @@
 
 Payrexx payment gateway integration for the Frappe payments app
 
-Current release: `16.8.0` (the package version is sourced dynamically from
+Current release: `16.8.1` (the package version is sourced dynamically from
 `payrexx_integration/__init__.py`). This release declares the directly imported
-Requests runtime in package metadata.
+Requests runtime in package metadata and accepts Payrexx's Gateway-zero
+credential sentinel under HTTP 200 or HTTP 404.
 
 ### Installation
 
