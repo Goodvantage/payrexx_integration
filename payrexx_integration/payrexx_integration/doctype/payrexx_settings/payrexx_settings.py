@@ -22,11 +22,11 @@ from payrexx_integration.gateway_selection import resolve_payrexx_settings
 from payrexx_integration.payrexx_integration.payrexx import webhook_payload
 from payrexx_integration.payrexx_integration.payrexx.payout_evidence import capture_payout_evidence
 from payrexx_integration.payrexx_integration.payrexx.payrexx_client import (
-	CREDENTIAL_PROBE_SENTINEL,
 	PayrexxAPIError,
 	PayrexxClient,
 	_normalize_api_base_domain,
 	get_http_status,
+	is_credential_probe_sentinel,
 	validate_subscription_interval,
 )
 from payrexx_integration.payrexx_integration.payrexx.webhook_validator import (
@@ -335,12 +335,12 @@ class PayrexxSettings(Document):
 				frappe.throw(_("Payrexx returned HTTP {0}").format(status_code))
 			frappe.throw(_("Cannot reach Payrexx — check network connectivity."))
 
-		if body != CREDENTIAL_PROBE_SENTINEL:
+		if not is_credential_probe_sentinel(body):
 			frappe.throw(
 				_(
 					"Unexpected response from Payrexx. Check that 'Instance Name' ({0}) and "
-					"'API Base Domain' ({1}) are correct."
-				).format(client.instance, client.api_base_domain)
+					"'API Base Domain' ({1}) are correct. Payrexx answered: {2}"
+				).format(client.instance, client.api_base_domain, cstr(body)[:200])
 			)
 
 	def _supported_currencies(self) -> set[str]:

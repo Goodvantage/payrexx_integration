@@ -217,12 +217,45 @@ class TestPayrexxApiHostTrust(UnitTestCase):
 		request.assert_called_once()
 		self.assertIn("api.pay.example", request.call_args.args[1])
 
-	def test_partner_ping_rejects_gateway_zero_404_without_fallback(self):
+	def test_partner_ping_accepts_gateway_zero_404_sentinel_without_fallback(self):
+		"""Payrexx carries the credential sentinel on HTTP 404 since 2026-08.
+
+		The envelope asserts the same fact it asserted under HTTP 200 — the API
+		key and instance are good — so the probe must accept it. It must still
+		make exactly one call: the partner instance does not exist on
+		``api.payrexx.com``, so falling back there would fail a good credential.
+		"""
 		response = Response()
 		response.status_code = 404
 		response.url = "https://api.pay.goodvantage.ch/v1.16/Gateway/0/?instance=goodvantage"
 		response.headers["Content-Type"] = "application/json"
 		response._content = b'{"status":"error","message":"An error occurred: No Gateway found with id 0"}'
+
+		with (
+			patch(
+				f"{CLIENT_MODULE}.frappe.conf",
+				{"payrexx_allowed_api_hosts": ["api.pay.goodvantage.ch"]},
+			),
+			patch(f"{CLIENT_MODULE}._execute_request", side_effect=HTTPError(response=response)) as request,
+		):
+			body = PayrexxClient(
+				instance="goodvantage",
+				api_secret="sk_test_dummy",
+				api_base_domain="pay.goodvantage.ch",
+			).ping_gateway()
+
+		self.assertEqual(body.get("status"), "error")
+		self.assertIn("No Gateway found with id 0", body.get("message"))
+		request.assert_called_once()
+		self.assertEqual(request.call_args.args[1], response.url)
+
+	def test_partner_ping_still_raises_on_a_404_that_is_not_the_sentinel(self):
+		"""Only the exact sentinel envelope may be recovered from a 404."""
+		response = Response()
+		response.status_code = 404
+		response.url = "https://api.pay.goodvantage.ch/v1.16/Gateway/0/?instance=goodvantage"
+		response.headers["Content-Type"] = "application/json"
+		response._content = b'{"status":"error","message":"Instance not found"}'
 
 		with (
 			patch(
@@ -239,15 +272,18 @@ class TestPayrexxApiHostTrust(UnitTestCase):
 				).ping_gateway()
 
 		request.assert_called_once()
-		self.assertEqual(request.call_args.args[1], response.url)
 
 	def test_ping_rejects_every_http_200_near_match_envelope(self):
 		client = PayrexxClient(instance="demo", api_secret="sk_test_dummy")
+		# "An error occurred: No Gateway found with id 0" is deliberately absent:
+		# that is Payrexx's current prose for the genuine sentinel, covered by
+		# test_ping_accepts_the_prefixed_sentinel_envelope below. "id 00" stays —
+		# it names a different gateway and must never satisfy the id-0 probe.
 		near_matches = (
 			{"status": "success", "data": []},
-			{"status": "error", "message": "An error occurred: No Gateway found with id 0"},
-			{"status": "error", "message": "No Gateway found with id 0", "data": []},
 			{"status": "error", "message": "No Gateway found with id 00"},
+			{"status": "error", "message": "No Gateway found with id 01"},
+			{"status": "error", "message": ""},
 		)
 		for body in near_matches:
 			with (
@@ -257,6 +293,21 @@ class TestPayrexxApiHostTrust(UnitTestCase):
 				self.assertRaises(PayrexxAPIError),
 			):
 				client.ping_gateway()
+
+	def test_ping_accepts_the_prefixed_sentinel_envelope(self):
+		"""Prose drift across API versions must not fail a valid credential."""
+		client = PayrexxClient(instance="demo", api_secret="sk_test_dummy")
+		accepted = (
+			{"status": "error", "message": "No Gateway found with id 0"},
+			{"status": "error", "message": "An error occurred: No Gateway found with id 0"},
+			{"status": "error", "message": "No Gateway found with id 0", "data": []},
+		)
+		for body in accepted:
+			with (
+				self.subTest(body=body),
+				patch(f"{CLIENT_MODULE}._execute_request", return_value=body),
+			):
+				self.assertEqual(client.ping_gateway(), body)
 
 	def test_gateway_retrieval_auth_rejection_still_falls_back(self):
 		for status_code in (401, 403):

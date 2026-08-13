@@ -55,7 +55,10 @@ again before constructing request headers. If an allowed custom API domain
 rejects a supported operation with 401/403, the client retries the same request
 once against trusted `api.payrexx.com`. A 404 retries only for the Gateway
 collection/create operation, where it can mean the custom API host is not
-provisioned; the credential probe rejects every 404. This means custom-host Gateway creation currently can
+provisioned; the credential probe never falls back on 404, because it now
+*expects* one — Payrexx carries the Gateway-zero sentinel on HTTP 404, and the
+probe reads the body rather than the status (ADR-0004). A 404 whose body is not
+that sentinel is still raised. This means custom-host Gateway creation currently can
 send the identical POST twice, first to the configured host and then to
 `api.payrexx.com`, after 401/403/404. A 404 retrieving a concrete Gateway is
 authoritative and never falls back, preventing a missing custom-domain resource

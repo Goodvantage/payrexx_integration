@@ -17,6 +17,28 @@ DEFAULT_API_BASE_DOMAIN = "payrexx.com"
 DEFAULT_API_VERSION = "v1.16"
 ALLOWED_API_HOSTS_CONFIG = "payrexx_allowed_api_hosts"
 CREDENTIAL_PROBE_SENTINEL = {"status": "error", "message": "No Gateway found with id 0"}
+# Payrexx wraps the same fact in varying prose *and* status depending on API
+# version: API 2026-04-21 answers "An error occurred: No Gateway found with id 0"
+# where older versions answered the bare sentence, and since 2026-08 it carries
+# HTTP 404 where it used to carry HTTP 200. Match the stable clause, and let
+# ``ping_gateway`` accept it under either status, so a valid credential probe is
+# not read as a wrong instance/domain.
+#
+# The trailing guard keeps this strict where it matters: "No Gateway found with
+# id 00" is a different gateway and must never satisfy the id-0 probe.
+_CREDENTIAL_PROBE_MESSAGE_PATTERN = re.compile(r"No Gateway found with id 0(?!\d)")
+# The status Payrexx now carries the sentinel envelope on.
+CREDENTIAL_PROBE_STATUS = 404
+
+
+def is_credential_probe_sentinel(body: object) -> bool:
+	return (
+		isinstance(body, dict)
+		and body.get("status") == "error"
+		and _CREDENTIAL_PROBE_MESSAGE_PATTERN.search(str(body.get("message") or "")) is not None
+	)
+
+
 _HOST_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
 
@@ -84,9 +106,27 @@ class PayrexxClient:
 		return _unwrap(self._get(f"Gateway/{gateway_id}/"))
 
 	def ping_gateway(self) -> dict:
-		"""Accept only Payrexx's exact HTTP-200 Gateway-zero credential sentinel."""
-		body = self._get("Gateway/0/")
-		if body != CREDENTIAL_PROBE_SENTINEL:
+		"""Accept Payrexx's Gateway-zero credential sentinel under HTTP 200 or 404.
+
+		A valid API key + instance is answered with the sentinel envelope. That
+		envelope carried HTTP 200 historically and carries HTTP 404 since 2026-08;
+		the asserted fact is identical either way, so the status alone must not
+		decide the outcome. Matched on the stable clause rather than the exact
+		string; see ``is_credential_probe_sentinel``.
+
+		404 is declared expected so a *healthy* probe leaves no Error Log row. It
+		still never triggers the custom-domain fallback — ``retry_not_found``
+		stays False here because a partner instance does not exist on
+		``api.payrexx.com``, so retrying there would only turn a good credential
+		into a confusing second failure.
+		"""
+		try:
+			body = self._get("Gateway/0/", expected_statuses=(CREDENTIAL_PROBE_STATUS,))
+		except HTTPError as exc:
+			body = _credential_probe_body(exc)
+			if body is None:
+				raise
+		if not is_credential_probe_sentinel(body):
 			raise _logged_response_error("Unexpected credential probe response")
 		return body
 
@@ -200,14 +240,18 @@ class PayrexxClient:
 		retry_not_found: bool = False,
 		query: dict | None = None,
 		json_data: dict | None = None,
+		expected_statuses: Collection[int] = (),
 	) -> dict:
 		return self._send_idempotent(
+			# The caller's expected statuses hold for every attempt; the rate-limit
+			# statuses the retry loop tolerates are added on top of them, never in
+			# place of them.
 			lambda tolerated: self._get_once(
 				path,
 				retry_not_found=retry_not_found,
 				query=query,
 				json_data=json_data,
-				expected_statuses=tolerated,
+				expected_statuses=tuple(dict.fromkeys((*expected_statuses, *tolerated))),
 			)
 		)
 
@@ -438,6 +482,25 @@ def _execute_request(
 		if get_http_status(exc) not in expected_statuses:
 			log_sanitized_error("payrexx_request", exc, http_status=get_http_status(exc))
 		raise
+
+
+def _credential_probe_body(exc: HTTPError) -> dict | None:
+	"""Return the sentinel envelope carried by a Gateway-zero 404, else ``None``.
+
+	Only the exact credential-probe envelope is recovered from a failure status.
+	Any other 404 body — and any unparseable one — returns ``None`` so the caller
+	re-raises it as the provider failure it is.
+	"""
+	if get_http_status(exc) != CREDENTIAL_PROBE_STATUS:
+		return None
+	response = getattr(exc, "response", None)
+	if response is None:
+		return None
+	try:
+		body = response.json()
+	except ValueError:
+		return None
+	return body if is_credential_probe_sentinel(body) else None
 
 
 def _parse_response(response: requests.Response) -> dict | list | str | None:

@@ -57,7 +57,8 @@ allowlist contains the final host the client contacts
 If that custom API domain rejects an otherwise valid instance key with 401/403,
 the client repeats the request once on `api.payrexx.com`. A 404 repeats only for
 Gateway creation, where the custom API host may not be provisioned. The
-credential probe rejects every 404. Therefore Gateway creation on a custom host can send the same POST
+credential probe never falls back on 404 — it expects the Gateway-zero sentinel
+to arrive with that status and judges the body instead. Therefore Gateway creation on a custom host can send the same POST
 twice, once per host, after 401/403/404. A 404 for a specific existing-checkout
 Gateway lookup does not fall back; verify the configured API domain and Gateway
 in Payrexx instead. This host fallback is separate from rate-limit and database
@@ -280,10 +281,19 @@ If saving Payrexx Settings fails:
 6. Confirm outbound network access from the bench.
 7. Try saving in Sandbox first.
 
-The app pings `GET /Gateway/0/`; only HTTP 200 with the exact Payrexx JSON object
-`{"status":"error","message":"No Gateway found with id 0"}` means credentials
-are accepted. Partner-host 404 responses, prefixed/substring messages, extra
-keys, and every other successful envelope are rejected.
+The app pings `GET /Gateway/0/`. Credentials are accepted when Payrexx answers
+an envelope whose `status` is `error` and whose `message` contains
+`No Gateway found with id 0` — **under either HTTP 200 or HTTP 404**. Payrexx has
+carried this same sentinel on both statuses and with an `"An error occurred: "`
+prefix; the probe judges the asserted fact, not the status line (ADR-0004).
+Surrounding prose and extra envelope keys are fine. A message naming a different
+gateway (`id 00`, `id 01`), a 404 with any other body, and every other
+successful envelope are rejected.
+
+If saving started failing with `Payrexx returned HTTP 404` on an unchanged
+instance and API secret, this is the case to suspect first: check whether
+Payrexx has restated the sentinel again rather than assuming the credentials
+went bad.
 
 Every final unexpected provider call writes exactly one direct Error Log entry.
 `Payrexx request failed` identifies transport failures and `Payrexx response

@@ -162,6 +162,53 @@ or eligible code path.
 - Cross-app releases coordinate through hook contracts rather than dependency
   edges; focused cross-app real-document tests remain necessary.
 
+## ADR-0004: Identify The Credential Probe By Its Asserted Fact, Not Its HTTP Status
+
+- Status: Accepted
+- Date: 2026-08-13
+- Scope: `payrexx_integration` credential validation (`ping_gateway`, `_ping`)
+- Supersedes: The exact-envelope/HTTP-200-only rule in REQ-PRX-SET-02
+
+### Context
+
+The credential probe was specified as "HTTP 200 with the exact JSON object
+`{"status":"error","message":"No Gateway found with id 0"}`", and every 404 was
+rejected outright. Payrexx has since restated the same response twice without
+changing its meaning: the message gained an `"An error occurred: "` prefix, and
+the envelope now arrives with **HTTP 404** where it previously arrived with HTTP
+200. Because `raise_for_status()` runs before the body is parsed, a valid API key
+could no longer be saved on any environment — the failure reached dev and
+production simultaneously despite different deployed code, which is the
+signature of a provider-side change rather than a regression.
+
+Pinning an older API version was rejected: it freezes the integration against
+one observed provider state and defers the same break.
+
+### Decision
+
+Treat the Gateway-zero envelope as the credential signal in its own right and
+accept it under either HTTP 200 or HTTP 404, matching on the stable clause
+`No Gateway found with id 0` rather than the whole string. The clause is
+anchored with a non-digit guard so `id 00`/`id 01` — different gateways — can
+never satisfy the id-0 probe. Only that exact envelope may be recovered from a
+failure status; any other 404 body, and any unparseable one, is re-raised as the
+provider failure it is.
+
+404 is declared an *expected* status for this one call, so a healthy probe
+leaves no Error Log row. It deliberately does **not** enable the custom-domain
+fallback: a partner instance does not exist on `api.payrexx.com`, so retrying
+there would turn a good credential into a second, more confusing failure.
+
+### Consequences
+
+- Credential validation survives provider prose and status drift; only a change
+  to the asserted fact itself breaks it again.
+- The probe no longer proves anything about the provider's HTTP status choice.
+  Status-based assertions for this call belong in tests, not in operator docs.
+- Envelope strictness moved from "exact object" to "exact clause": extra
+  envelope keys are tolerated, gateway-identity precision is not.
+- 401/403 keep their existing meanings, including the custom-host fallback.
+
 ## References
 
 - [Technical documentation](DOCUMENTATION.md)

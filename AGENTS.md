@@ -181,10 +181,14 @@ closed.
 | Create idempotency | No idempotency-key field; `referenceId` is documented as an internal merchant reference, not as unique or de-duplicating |
 
 A "no gateway found" GET against `/Gateway/0/` is the cheap auth-check used
-by `_ping()`. Only HTTP 200 with the exact JSON object
-`{"status":"error","message":"No Gateway found with id 0"}` proves the
-credentials. A 404, a substring match, additional envelope keys, or any other
-HTTP-200 body is rejected.
+by `_ping()`. Credentials are proven by an envelope whose `status` is `error`
+and whose `message` contains the clause `No Gateway found with id 0` — under
+**either HTTP 200 or HTTP 404**. Payrexx has carried this same sentinel on both
+statuses, and with or without an `"An error occurred: "` prefix, so the probe
+judges the asserted fact rather than the status line (ADR-0004). Surrounding
+prose and extra envelope keys are tolerated; the clause is anchored so a message
+naming a different gateway (`id 00`, `id 01`) never satisfies it. A 404 whose
+body is not that envelope, and any other HTTP-200 body, is rejected.
 
 For Payrexx Platform / partner accounts, split the checkout/login domain:
 `customer.pay.goodvantage.ch` means `instance_name = "customer"` and
@@ -195,7 +199,9 @@ IP literals, malformed hosts, wildcards, and non-HTTPS ports are rejected before
 the Password field is read. A custom API domain's 401/403 response repeats the
 same request once against `api.payrexx.com` for every supported operation. A 404
 repeats only Gateway creation, where it can indicate an unprovisioned custom API
-host; the credential probe and every other retrieval or POST treat 404 as authoritative.
+host; every other retrieval or POST treats 404 as authoritative. The credential
+probe also never falls back on 404 — but because it *expects* that status for a
+healthy sentinel, not because it treats it as failure.
 Thus custom-host Gateway creation can issue two POSTs for one app call. This is a
 host fallback, not a rate-limit or checkout-deadlock retry.
 

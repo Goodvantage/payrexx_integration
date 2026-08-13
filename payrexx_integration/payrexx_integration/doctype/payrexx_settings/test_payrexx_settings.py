@@ -453,17 +453,51 @@ class TestPayrexxSettings(IntegrationTestCase):
 			payrexx_settings as ps_module,
 		)
 
+		# Envelopes carrying the genuine id-0 clause are accepted regardless of
+		# surrounding prose or extra keys — see
+		# test_settings_ping_accepts_sentinel_prose_variants. What must still be
+		# rejected is a body naming a *different* gateway, or none at all.
 		near_matches = (
 			{"status": "success", "data": []},
-			{"status": "error", "message": "An error occurred: No Gateway found with id 0"},
-			{"status": "error", "message": "No Gateway found with id 0", "data": []},
 			{"status": "error", "message": "No Gateway found with id 00"},
+			{"status": "error", "message": "No Gateway found with id 01"},
+			{"status": "error", "message": ""},
 		)
 		for body in near_matches:
 			with (
 				self.subTest(body=body),
 				patch.object(ps_module.PayrexxSettings, "_client", return_value=_FakeClient(body)),
 				self.assertRaisesRegex(frappe.ValidationError, "Unexpected response from Payrexx"),
+			):
+				doc._ping()
+
+	def test_settings_ping_accepts_sentinel_prose_variants(self):
+		"""Payrexx's id-0 clause is the credential signal, whatever wraps it."""
+		doc = frappe.get_doc("Payrexx Settings", self.settings_name)
+
+		class _FakeClient:
+			instance = "test-instance"
+			api_base_domain = "payrexx.com"
+
+			def __init__(self, body):
+				self.body = body
+
+			def ping_gateway(self) -> dict:
+				return self.body
+
+		from payrexx_integration.payrexx_integration.doctype.payrexx_settings import (
+			payrexx_settings as ps_module,
+		)
+
+		accepted = (
+			{"status": "error", "message": "No Gateway found with id 0"},
+			{"status": "error", "message": "An error occurred: No Gateway found with id 0"},
+			{"status": "error", "message": "No Gateway found with id 0", "data": []},
+		)
+		for body in accepted:
+			with (
+				self.subTest(body=body),
+				patch.object(ps_module.PayrexxSettings, "_client", return_value=_FakeClient(body)),
 			):
 				doc._ping()
 
