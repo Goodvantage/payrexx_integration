@@ -61,8 +61,10 @@ class TestRateLimitBackoff(UnitTestCase):
 			client.retrieve_gateway(7)
 
 		tolerated = [call.kwargs.get("expected_statuses") for call in execute.call_args_list]
-		self.assertEqual(tolerated[0], RATE_LIMIT_STATUSES)
-		self.assertEqual(tolerated[-1], RATE_LIMIT_STATUSES)
+		# _get merges caller-expected statuses with the tolerated rate-limit ones
+		# into a tuple; the contract is the set of statuses, not the container.
+		self.assertEqual(frozenset(tolerated[0]), RATE_LIMIT_STATUSES)
+		self.assertEqual(frozenset(tolerated[-1]), RATE_LIMIT_STATUSES)
 
 	def test_persistent_rate_limit_surfaces_on_the_final_attempt(self):
 		client = self._client()
