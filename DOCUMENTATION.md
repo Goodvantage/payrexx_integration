@@ -20,7 +20,7 @@ The Python package also declares `requests~=2.33.0` directly because the
 provider REST client and hosted settlement QA import Requests at runtime; the
 app does not rely on Frappe to provide it transitively.
 
-The app metadata exposes `/assets/payrexx_integration/images/payrexx-integration-app-logo.svg`, following the shared Goodvantage navy tile pattern with a centered white credit-card line symbol and small bottom-right white Goodvantage `g` mark. Payrexx Integration does not add a Desk app tile by default; the logo is available for metadata or future app-surface use.
+The app metadata exposes `/assets/payrexx_integration/images/payrexx-integration-app-logo.svg`, following the shared Goodvantage navy tile pattern with a centered white credit-card line symbol with an orange detail line. Payrexx Integration does not add a Desk app tile by default; the logo is available for metadata or future app-surface use.
 
 ## Core DocTypes
 
