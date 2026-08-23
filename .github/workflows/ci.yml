@@ -117,15 +117,6 @@ jobs:
         env:
           TYPE: server
 
-      - name: Upload Coverage
-        if: always()
-        uses: codecov/codecov-action@v5
-        with:
-          files: /home/runner/frappe-bench/sites/coverage.xml
-          flags: server
-          fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
-
       - name: Seed Sandbox browser fixture
         working-directory: /home/runner/frappe-bench
         run: |
