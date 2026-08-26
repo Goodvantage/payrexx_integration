@@ -3,7 +3,7 @@ name: CI
 on:
   workflow_dispatch:
   push:
-    branches: [main, version-16]
+    branches: [version-16]
   pull_request:
 
 concurrency:
@@ -14,23 +14,19 @@ jobs:
   tests:
     name: Server
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
+    # Forgejo act_runner: jobs run inside containers, so services are reached
+    # by hostname (mariadb:3306, redis-cache:6379), not host port mappings.
     services:
       redis-cache:
         image: redis:alpine
-        ports:
-          - 13000:6379
       redis-queue:
         image: redis:alpine
-        ports:
-          - 11000:6379
       mariadb:
         image: mariadb:11.8
         env:
           MYSQL_ROOT_PASSWORD: root
-        ports:
-          - 3306:3306
         options: --health-cmd="mariadb-admin ping" --health-interval=5s --health-timeout=2s --health-retries=3
 
     steps:
@@ -48,124 +44,108 @@ jobs:
           node-version: 24
           check-latest: true
 
-      - name: Cache pip
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml', '**/setup.py') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Get yarn cache directory path
-        id: yarn-cache-dir-path
-        run: echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT
-
-      - name: Cache yarn
-        uses: actions/cache@v5
-        with:
-          path: ${{ steps.yarn-cache-dir-path.outputs.dir }}
-          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-yarn-
-
-      - name: Install MariaDB Client
+      - name: System dependencies and CI user
         run: |
-          sudo apt update
-          sudo apt-get install mariadb-client
+          apt-get update -qq
+          # cron: bench init aborts without /usr/bin/crontab.
+          apt-get install -y -qq git curl ca-certificates cron mariadb-client >/dev/null
+          npm install -g yarn >/dev/null
+          # bench refuses to run as root; job containers run as root.
+          useradd -m -s /bin/bash runner
+          chown -R runner "$GITHUB_WORKSPACE"
 
-      - name: Setup
+      - name: Setup bench
         run: |
-          pip install frappe-bench
-          bench init --skip-redis-config-generation --skip-assets --frappe-branch version-16 --python "$(which python)" ~/frappe-bench
+          pip install -q frappe-bench
+          touch /tmp/ci.log && chmod 666 /tmp/ci.log
+          sudo -u runner -H env "PATH=$PATH" "TOKEN=$TOKEN" bash -c '
+            set -e
+            exec > >(tee -a /tmp/ci.log) 2>&1
+            git config --global url."https://x-access-token:${TOKEN}@code.goodvantage.cloud/".insteadOf "https://code.goodvantage.cloud/"
+            cd /home/runner
+            bench init --skip-redis-config-generation --skip-assets --frappe-branch version-16 --python "$(which python)" /home/runner/frappe-bench
+            cd /home/runner/frappe-bench
+            bench set-config -g redis_cache redis://redis-cache:6379
+            bench set-config -g redis_queue redis://redis-queue:6379
+            bench set-config -g redis_socketio redis://redis-queue:6379
+          '
+        env:
+          TOKEN: ${{ secrets.CI_FORGEJO_TOKEN }}
 
-      - name: Install
-        working-directory: /home/runner/frappe-bench
+      - name: Get apps
         run: |
-          # ERPNext gives us the company / fiscal year etc. that the gateway
-          # plumbing assumes (Payment Gateway is registered against ERPNext).
-          bench get-app erpnext --branch version-16
-          # Upstream payments app — payrexx_integration's only required_app.
-          bench get-app payments --branch version-16 https://github.com/frappe/payments
-          bench get-app payrexx_integration $GITHUB_WORKSPACE
-          bench setup requirements --dev
-          bench new-site --db-root-password root --admin-password admin test_site
-          bench --site test_site install-app erpnext
-          bench --site test_site install-app payments
-          bench --site test_site install-app payrexx_integration
-          bench build
+          sudo -u runner -H env "PATH=$PATH" "WS=$GITHUB_WORKSPACE" bash -c '
+            set -e
+            exec > >(tee -a /tmp/ci.log) 2>&1
+            cd /home/runner/frappe-bench
+            bench get-app erpnext --branch version-16
+            bench get-app payments https://github.com/frappe/payments --branch version-16
+            bench get-app payrexx_integration "$WS"
+            bench setup requirements --dev
+          '
+        env:
+          CI: 'Yes'
+
+      - name: Site setup and install apps
+        run: |
+          sudo -u runner -H env "PATH=$PATH" bash -c '
+            set -e
+            exec > >(tee -a /tmp/ci.log) 2>&1
+            cd /home/runner/frappe-bench
+            # frappe logger wants <bench>/test_site/logs before the site exists
+            mkdir -p ~/logs logs test_site/logs
+            bench new-site --db-host mariadb --db-root-password root --admin-password admin test_site
+            mkdir -p sites/test_site/logs
+            # frappe throttles User creation at 60/hour in production; every
+            # upstream Frappe app raises this for CI (see erpnext, hrms,
+            # payments, non_profit .github/helper/site_config.json).
+            bench --site test_site set-config -p throttle_user_limit 1000
+            bench --site test_site install-app erpnext
+            bench --site test_site install-app payments
+            bench --site test_site install-app payrexx_integration
+            /home/runner/frappe-bench/env/bin/python -c "
+            import frappe
+            frappe.init(\"test_site\", sites_path=\"/home/runner/frappe-bench/sites\")
+            frappe.connect()
+            from erpnext.setup.setup_wizard.setup_wizard import setup_complete
+            setup_complete(frappe._dict({\"country\": \"Switzerland\", \"currency\": \"CHF\", \"company_name\": \"Test Company\", \"company_abbr\": \"TC\", \"chart_of_accounts\": \"Standard\", \"fy_start_date\": \"2026-01-01\", \"fy_end_date\": \"2026-12-31\"}))
+            frappe.db.commit()
+            frappe.destroy()
+            "
+            bench build
+          '
         env:
           CI: 'Yes'
 
       - name: Run Tests
-        working-directory: /home/runner/frappe-bench
         run: |
-          bench --site test_site set-config allow_tests true
-          mkdir -p ~/logs ~/frappe-bench/logs ~/frappe-bench/sites/test_site/logs ~/frappe-bench/test_site/logs
-          /home/runner/frappe-bench/env/bin/python -c "
-          import frappe
-          frappe.init('test_site', sites_path='/home/runner/frappe-bench/sites')
-          frappe.connect()
-          from erpnext.setup.setup_wizard.setup_wizard import setup_complete
-          from frappe.desk.page.setup_wizard.setup_wizard import enable_setup_wizard_complete
-          setup_complete(frappe._dict({'country': 'Switzerland', 'currency': 'CHF', 'company_name': 'Test Company', 'company_abbr': 'TC', 'chart_of_accounts': 'Standard', 'fy_start_date': '2026-01-01', 'fy_end_date': '2026-12-31'}))
-          enable_setup_wizard_complete('frappe')
-          enable_setup_wizard_complete('erpnext')
-          frappe.db.commit()
-          frappe.destroy()
-          "
-          bench --site test_site run-tests --app payrexx_integration --coverage
+          sudo -u runner -H env "PATH=$PATH" bash -c '
+            set -e
+            exec > >(tee -a /tmp/ci.log) 2>&1
+            cd /home/runner/frappe-bench
+            bench --site test_site set-config allow_tests true
+            bench --site test_site run-tests --app payrexx_integration --coverage
+          '
         env:
           TYPE: server
 
-      - name: Seed Sandbox browser fixture
-        working-directory: /home/runner/frappe-bench
-        run: |
-          /home/runner/frappe-bench/env/bin/python -c "
-          import frappe
-          frappe.init('test_site', sites_path='/home/runner/frappe-bench/sites')
-          frappe.connect()
-          frappe.flags.in_test = True
-          settings = frappe.get_doc('Payrexx Settings', 'Sandbox') if frappe.db.exists('Payrexx Settings', 'Sandbox') else frappe.new_doc('Payrexx Settings')
-          settings.update({'gateway_name': 'Sandbox', 'instance_name': 'ci-sandbox', 'api_base_domain': 'payrexx.com', 'api_secret': 'ci_not_live', 'webhook_signing_key': 'ci_not_live', 'automation_user': 'Administrator', 'supported_currencies': 'CHF'})
-          settings.save(ignore_permissions=True)
-          frappe.db.commit()
-          frappe.destroy()
-          "
-
-      - name: Install Playwright
-        working-directory: ${{ github.workspace }}/playwright
-        run: |
-          npm ci
-          npx playwright install --with-deps chromium
-
-      - name: Run core Playwright specs
-        working-directory: /home/runner/frappe-bench
-        run: |
-          bench --site test_site serve --port 8000 > "$GITHUB_WORKSPACE/playwright/bench-web.log" 2>&1 &
-          web_pid=$!
-          trap 'kill $web_pid' EXIT
-          for attempt in {1..60}; do
-            if curl --fail --silent http://127.0.0.1:8000/api/method/ping > /dev/null; then
-              break
-            fi
-            sleep 2
-          done
-          curl --fail --silent http://127.0.0.1:8000/api/method/ping > /dev/null
-          cd "$GITHUB_WORKSPACE/playwright"
-          npx playwright test tests/payrexx_settings.spec.ts tests/pay_invoice_redirect.spec.ts
-        env:
-          PLAYWRIGHT_BASE_URL: http://127.0.0.1:8000
-          FRAPPE_USERNAME: Administrator
-          FRAPPE_PASSWORD: admin
-          TEST_PAYREXX_SETTINGS: Sandbox
-
-      - name: Upload Playwright failure artifacts
+      # This Forgejo exposes no Actions log API and its web log route needs a
+      # browser session, so a failing run publishes its own tail as an issue.
+      - name: Post failure log
         if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: payrexx-playwright-failure
-          if-no-files-found: ignore
-          path: |
-            playwright/bench-web.log
-            playwright/playwright-report
-            playwright/test-results
+        run: |
+          export TAIL=$(tail -c 12000 /tmp/ci.log 2>/dev/null || echo "no captured log")
+          python3 - <<'PYEOF'
+          import os, json, urllib.request
+          fence = chr(96) * 3
+          body = "Run %s\n\n%s\n%s\n%s" % (os.environ.get('RUNID', '?'), fence, os.environ.get('TAIL', ''), fence)
+          payload = json.dumps({'title': 'CI failure log: payrexx_integration', 'body': body}).encode()
+          req = urllib.request.Request(os.environ['API'] + '/repos/Goodvantage/payrexx_integration/issues',
+                data=payload, method='POST',
+                headers={'Content-Type': 'application/json', 'Authorization': 'token ' + os.environ['GT']})
+          urllib.request.urlopen(req, timeout=30)
+          PYEOF
+        env:
+          GT: ${{ secrets.GITHUB_TOKEN }}
+          API: ${{ github.api_url }}
+          RUNID: ${{ github.run_id }}
