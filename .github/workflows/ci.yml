@@ -129,6 +129,59 @@ jobs:
         env:
           TYPE: server
 
+      - name: Seed Sandbox browser fixture
+        run: |
+          sudo -u runner -H env "PATH=$PATH" bash -c '
+            set -e
+            cd /home/runner/frappe-bench
+            /home/runner/frappe-bench/env/bin/python -c "
+            import frappe
+            frappe.init(\"test_site\", sites_path=\"/home/runner/frappe-bench/sites\")
+            frappe.connect()
+            frappe.flags.in_test = True
+            settings = frappe.get_doc(\"Payrexx Settings\", \"Sandbox\") if frappe.db.exists(\"Payrexx Settings\", \"Sandbox\") else frappe.new_doc(\"Payrexx Settings\")
+            settings.update({\"gateway_name\": \"Sandbox\", \"instance_name\": \"ci-sandbox\", \"api_base_domain\": \"payrexx.com\", \"api_secret\": \"ci_not_live\", \"webhook_signing_key\": \"ci_not_live\", \"automation_user\": \"Administrator\", \"supported_currencies\": \"CHF\"})
+            settings.save(ignore_permissions=True)
+            frappe.db.commit()
+            frappe.destroy()
+            "
+          '
+
+      - name: Install Playwright
+        working-directory: ${{ github.workspace }}/playwright
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run core Playwright specs
+        run: |
+          # bench serve runs as the CI user; nohup keeps it alive past the sudo shell.
+          sudo -u runner -H env "PATH=$PATH" bash -c '
+            cd /home/runner/frappe-bench
+            nohup bench --site test_site serve --port 8000 > /tmp/bench-web.log 2>&1 &
+            sleep 3
+          '
+          timeout 120 bash -c 'until curl --fail --silent http://127.0.0.1:8000/api/method/ping > /dev/null; do sleep 2; done'
+          cp /tmp/bench-web.log "$GITHUB_WORKSPACE/playwright/bench-web.log" || true
+          cd "$GITHUB_WORKSPACE/playwright"
+          npx playwright test tests/payrexx_settings.spec.ts tests/pay_invoice_redirect.spec.ts 2>&1 | tee "$GITHUB_WORKSPACE/playwright/pw.log"
+        env:
+          PLAYWRIGHT_BASE_URL: http://127.0.0.1:8000
+          FRAPPE_USERNAME: Administrator
+          FRAPPE_PASSWORD: admin
+          TEST_PAYREXX_SETTINGS: Sandbox
+
+      - name: Upload Playwright failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: payrexx-playwright-failure
+          if-no-files-found: ignore
+          path: |
+            playwright/bench-web.log
+            playwright/playwright-report
+            playwright/test-results
+
       # This Forgejo exposes no Actions log API and its web log route needs a
       # browser session, so a failing run publishes its own tail as an issue.
       - name: Post failure log
