@@ -56,6 +56,7 @@ jobs:
 
       - name: Setup bench
         run: |
+          set -o pipefail
           pip install -q frappe-bench
           touch /tmp/ci.log && chmod 666 /tmp/ci.log
           sudo -u runner -H env "PATH=$PATH" "TOKEN=$TOKEN" bash -c '
@@ -130,6 +131,7 @@ jobs:
 
       - name: Seed Sandbox browser fixture
         run: |
+          set -o pipefail
           cat > /tmp/seed_sandbox.py <<'SEEDEOF'
           import frappe
           frappe.init("test_site", sites_path="/home/runner/frappe-bench/sites")
@@ -168,6 +170,7 @@ jobs:
 
       - name: Run core Playwright specs
         run: |
+          set -o pipefail
           # bench serve runs as the CI user; nohup keeps it alive past the sudo shell.
           sudo -u runner -H env "PATH=$PATH" bash -c '
             cd /home/runner/frappe-bench
@@ -206,11 +209,21 @@ jobs:
       - name: Post failure log
         if: failure()
         run: |
+          # Full artifacts to the package registry - the only complete-log
+          # channel this Forgejo has (no Actions log/artifact API).
+          U="https://code.goodvantage.cloud/api/packages/Goodvantage/generic/ci-logs/run-${RUNID}"
+          curl -s -o /dev/null -u "Goodfred:${AT}" --upload-file /tmp/ci.log "$U/ci.log" || true
+          for f in "$GITHUB_WORKSPACE"/playwright/test-results/*/error-context.md; do
+            [ -f "$f" ] && { echo "=== $f ==="; cat "$f"; } >> /tmp/ci.log
+          done
+          tar czf /tmp/test-results.tgz -C "$GITHUB_WORKSPACE/playwright" test-results 2>/dev/null \
+            && curl -s -o /dev/null -u "Goodfred:${AT}" --upload-file /tmp/test-results.tgz \
+                 "https://code.goodvantage.cloud/api/packages/Goodvantage/generic/ci-logs/run-${RUNID}/test-results.tgz" || true
           export TAIL=$(tail -c 12000 /tmp/ci.log 2>/dev/null || echo "no captured log")
           python3 - <<'PYEOF'
           import os, json, urllib.request
           fence = chr(96) * 3
-          body = "Run %s\n\n%s\n%s\n%s" % (os.environ.get('RUNID', '?'), fence, os.environ.get('TAIL', ''), fence)
+          body = "Run %s - full log: curl -u <user>:<token> https://code.goodvantage.cloud/api/packages/Goodvantage/generic/ci-logs/run-%s/ci.log\n\n%s\n%s\n%s" % (os.environ.get('RUNID','?'), os.environ.get('RUNID','?'), fence, os.environ.get('TAIL',''), fence)
           payload = json.dumps({'title': 'CI failure log: payrexx_integration', 'body': body}).encode()
           req = urllib.request.Request(os.environ['API'] + '/repos/Goodvantage/payrexx_integration/issues',
                 data=payload, method='POST',
@@ -219,5 +232,6 @@ jobs:
           PYEOF
         env:
           GT: ${{ secrets.GITHUB_TOKEN }}
+          AT: ${{ secrets.CI_ARTIFACT_TOKEN }}
           API: ${{ github.api_url }}
           RUNID: ${{ github.run_id }}
