@@ -181,6 +181,10 @@ jobs:
           timeout 120 bash -c 'until curl --fail --silent http://127.0.0.1:8000/api/method/ping > /dev/null; do sleep 2; done'
           cp /tmp/bench-web.log "$GITHUB_WORKSPACE/playwright/bench-web.log" || true
           cat /tmp/bench-web.log || true
+          # Warm the desk bundle before the specs: the first /app request compiles
+          # and serves a large bundle, and on this container runner that can
+          # exceed the spec's own 30s locator timeout.
+          curl --silent --max-time 120 -o /dev/null "http://127.0.0.1:8000/app/payrexx-settings" || true
           cd "$GITHUB_WORKSPACE/playwright"
           npx playwright test tests/payrexx_settings.spec.ts tests/pay_invoice_redirect.spec.ts
         env:
