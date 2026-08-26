@@ -131,30 +131,47 @@ jobs:
 
       - name: Seed Sandbox browser fixture
         run: |
+          exec > >(tee -a /tmp/ci.log) 2>&1
+          cat > /tmp/seed_sandbox.py <<'SEEDEOF'
+          import frappe
+          frappe.init("test_site", sites_path="/home/runner/frappe-bench/sites")
+          frappe.connect()
+          frappe.flags.in_test = True
+          name = "Sandbox"
+          settings = (
+              frappe.get_doc("Payrexx Settings", name)
+              if frappe.db.exists("Payrexx Settings", name)
+              else frappe.new_doc("Payrexx Settings")
+          )
+          settings.update({
+              "gateway_name": "Sandbox",
+              "instance_name": "ci-sandbox",
+              "api_base_domain": "payrexx.com",
+              "api_secret": "ci_not_live",
+              "webhook_signing_key": "ci_not_live",
+              "automation_user": "Administrator",
+              "supported_currencies": "CHF",
+          })
+          settings.save(ignore_permissions=True)
+          frappe.db.commit()
+          frappe.destroy()
+          SEEDEOF
+          chown runner /tmp/seed_sandbox.py
           sudo -u runner -H env "PATH=$PATH" bash -c '
-            set -e
             cd /home/runner/frappe-bench
-            /home/runner/frappe-bench/env/bin/python -c "
-            import frappe
-            frappe.init(\"test_site\", sites_path=\"/home/runner/frappe-bench/sites\")
-            frappe.connect()
-            frappe.flags.in_test = True
-            settings = frappe.get_doc(\"Payrexx Settings\", \"Sandbox\") if frappe.db.exists(\"Payrexx Settings\", \"Sandbox\") else frappe.new_doc(\"Payrexx Settings\")
-            settings.update({\"gateway_name\": \"Sandbox\", \"instance_name\": \"ci-sandbox\", \"api_base_domain\": \"payrexx.com\", \"api_secret\": \"ci_not_live\", \"webhook_signing_key\": \"ci_not_live\", \"automation_user\": \"Administrator\", \"supported_currencies\": \"CHF\"})
-            settings.save(ignore_permissions=True)
-            frappe.db.commit()
-            frappe.destroy()
-            "
+            env/bin/python /tmp/seed_sandbox.py
           '
 
       - name: Install Playwright
         working-directory: ${{ github.workspace }}/playwright
         run: |
+          exec > >(tee -a /tmp/ci.log) 2>&1
           npm ci
           npx playwright install --with-deps chromium
 
       - name: Run core Playwright specs
         run: |
+          exec > >(tee -a /tmp/ci.log) 2>&1
           # bench serve runs as the CI user; nohup keeps it alive past the sudo shell.
           sudo -u runner -H env "PATH=$PATH" bash -c '
             cd /home/runner/frappe-bench
@@ -163,10 +180,12 @@ jobs:
           '
           timeout 120 bash -c 'until curl --fail --silent http://127.0.0.1:8000/api/method/ping > /dev/null; do sleep 2; done'
           cp /tmp/bench-web.log "$GITHUB_WORKSPACE/playwright/bench-web.log" || true
+          cat /tmp/bench-web.log || true
           cd "$GITHUB_WORKSPACE/playwright"
-          npx playwright test tests/payrexx_settings.spec.ts tests/pay_invoice_redirect.spec.ts 2>&1 | tee "$GITHUB_WORKSPACE/playwright/pw.log"
+          npx playwright test tests/payrexx_settings.spec.ts tests/pay_invoice_redirect.spec.ts
         env:
           PLAYWRIGHT_BASE_URL: http://127.0.0.1:8000
+          FRAPPE_SITE: test_site
           FRAPPE_USERNAME: Administrator
           FRAPPE_PASSWORD: admin
           TEST_PAYREXX_SETTINGS: Sandbox
