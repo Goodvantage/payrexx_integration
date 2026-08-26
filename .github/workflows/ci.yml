@@ -60,7 +60,6 @@ jobs:
           touch /tmp/ci.log && chmod 666 /tmp/ci.log
           sudo -u runner -H env "PATH=$PATH" "TOKEN=$TOKEN" bash -c '
             set -e
-            exec > >(tee -a /tmp/ci.log) 2>&1
             git config --global url."https://x-access-token:${TOKEN}@code.goodvantage.cloud/".insteadOf "https://code.goodvantage.cloud/"
             cd /home/runner
             bench init --skip-redis-config-generation --skip-assets --frappe-branch version-16 --python "$(which python)" /home/runner/frappe-bench
@@ -68,29 +67,29 @@ jobs:
             bench set-config -g redis_cache redis://redis-cache:6379
             bench set-config -g redis_queue redis://redis-queue:6379
             bench set-config -g redis_socketio redis://redis-queue:6379
-          '
+          ' 2>&1 | tee -a /tmp/ci.log
         env:
           TOKEN: ${{ secrets.CI_FORGEJO_TOKEN }}
 
       - name: Get apps
         run: |
+          set -o pipefail
           sudo -u runner -H env "PATH=$PATH" "WS=$GITHUB_WORKSPACE" bash -c '
             set -e
-            exec > >(tee -a /tmp/ci.log) 2>&1
             cd /home/runner/frappe-bench
             bench get-app erpnext --branch version-16
             bench get-app payments https://github.com/frappe/payments --branch version-16
             bench get-app payrexx_integration "$WS"
             bench setup requirements --dev
-          '
+          ' 2>&1 | tee -a /tmp/ci.log
         env:
           CI: 'Yes'
 
       - name: Site setup and install apps
         run: |
+          set -o pipefail
           sudo -u runner -H env "PATH=$PATH" bash -c '
             set -e
-            exec > >(tee -a /tmp/ci.log) 2>&1
             cd /home/runner/frappe-bench
             # frappe logger wants <bench>/test_site/logs before the site exists
             mkdir -p ~/logs logs test_site/logs
@@ -113,25 +112,24 @@ jobs:
             frappe.destroy()
             "
             bench build
-          '
+          ' 2>&1 | tee -a /tmp/ci.log
         env:
           CI: 'Yes'
 
       - name: Run Tests
         run: |
+          set -o pipefail
           sudo -u runner -H env "PATH=$PATH" bash -c '
             set -e
-            exec > >(tee -a /tmp/ci.log) 2>&1
             cd /home/runner/frappe-bench
             bench --site test_site set-config allow_tests true
             bench --site test_site run-tests --app payrexx_integration --coverage
-          '
+          ' 2>&1 | tee -a /tmp/ci.log
         env:
           TYPE: server
 
       - name: Seed Sandbox browser fixture
         run: |
-          exec > >(tee -a /tmp/ci.log) 2>&1
           cat > /tmp/seed_sandbox.py <<'SEEDEOF'
           import frappe
           frappe.init("test_site", sites_path="/home/runner/frappe-bench/sites")
@@ -160,24 +158,22 @@ jobs:
           sudo -u runner -H env "PATH=$PATH" bash -c '
             cd /home/runner/frappe-bench
             env/bin/python /tmp/seed_sandbox.py
-          '
+          ' 2>&1 | tee -a /tmp/ci.log
 
       - name: Install Playwright
         working-directory: ${{ github.workspace }}/playwright
         run: |
-          exec > >(tee -a /tmp/ci.log) 2>&1
           npm ci
           npx playwright install --with-deps chromium
 
       - name: Run core Playwright specs
         run: |
-          exec > >(tee -a /tmp/ci.log) 2>&1
           # bench serve runs as the CI user; nohup keeps it alive past the sudo shell.
           sudo -u runner -H env "PATH=$PATH" bash -c '
             cd /home/runner/frappe-bench
             nohup bench --site test_site serve --port 8000 > /tmp/bench-web.log 2>&1 &
             sleep 3
-          '
+          ' 2>&1 | tee -a /tmp/ci.log
           timeout 120 bash -c 'until curl --fail --silent http://127.0.0.1:8000/api/method/ping > /dev/null; do sleep 2; done'
           cp /tmp/bench-web.log "$GITHUB_WORKSPACE/playwright/bench-web.log" || true
           cat /tmp/bench-web.log || true
