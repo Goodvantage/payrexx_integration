@@ -30,8 +30,23 @@ jobs:
 
       - name: Run Semgrep rules
         run: |
+          set -o pipefail
           pip install semgrep
-          semgrep ci --config ./frappe-semgrep-rules/rules --config r/python.lang.correctness
+          semgrep ci --config ./frappe-semgrep-rules/rules --config r/python.lang.correctness 2>&1 | tee -a /tmp/lint.log
+
+      # This Forgejo has no Actions log API and the web log route needs a
+      # browser session a token cannot produce, so a failing lint publishes its
+      # own log. Without this the only way to see why the base branch went red
+      # is to guess and reproduce locally.
+      - name: Post failure log
+        if: failure()
+        run: |
+          U="https://code.goodvantage.cloud/api/packages/Goodvantage/generic/ci-logs/run-${RUNID}"
+          curl -s -o /dev/null -u "Goodfred:${AT}" --upload-file /tmp/lint.log "$U/lint-${JOBNAME}.log" || true
+        env:
+          AT: ${{ secrets.CI_ARTIFACT_TOKEN }}
+          RUNID: ${{ github.run_id }}
+          JOBNAME: semgrep
 
   deps-vulnerable-check:
     name: 'Vulnerable Dependency Check'
@@ -54,6 +69,17 @@ jobs:
 
       - name: Install and run pip-audit
         run: |
+          set -o pipefail
           pip install pip-audit
           cd ${GITHUB_WORKSPACE}
-          pip-audit --desc on .
+          pip-audit --desc on . 2>&1 | tee -a /tmp/audit.log
+
+      - name: Post failure log
+        if: failure()
+        run: |
+          U="https://code.goodvantage.cloud/api/packages/Goodvantage/generic/ci-logs/run-${RUNID}"
+          curl -s -o /dev/null -u "Goodfred:${AT}" --upload-file /tmp/audit.log "$U/lint-${JOBNAME}.log" || true
+        env:
+          AT: ${{ secrets.CI_ARTIFACT_TOKEN }}
+          RUNID: ${{ github.run_id }}
+          JOBNAME: pip-audit
