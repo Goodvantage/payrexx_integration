@@ -112,6 +112,11 @@ jobs:
             frappe.db.commit()
             frappe.destroy()
             "
+            # erpnext setup_complete builds the company but does not set the
+            # frappe-level setup_complete flag, so the desk still redirects to
+            # the Welcome wizard and every browser spec times out. The same
+            # call workflow_visualizer uses, proven green:
+            bench --site test_site execute frappe.utils.install.complete_setup_wizard
             bench build
           ' 2>&1 | tee -a /tmp/ci.log
         env:
@@ -212,13 +217,13 @@ jobs:
           # Full artifacts to the package registry - the only complete-log
           # channel this Forgejo has (no Actions log/artifact API).
           U="https://code.goodvantage.cloud/api/packages/Goodvantage/generic/ci-logs/run-${RUNID}"
-          curl -s -o /dev/null -u "Goodfred:${AT}" --upload-file /tmp/ci.log "$U/ci.log" || true
           for f in "$GITHUB_WORKSPACE"/playwright/test-results/*/error-context.md; do
             [ -f "$f" ] && { echo "=== $f ==="; cat "$f"; } >> /tmp/ci.log
           done
           tar czf /tmp/test-results.tgz -C "$GITHUB_WORKSPACE/playwright" test-results 2>/dev/null \
             && curl -s -o /dev/null -u "Goodfred:${AT}" --upload-file /tmp/test-results.tgz \
                  "https://code.goodvantage.cloud/api/packages/Goodvantage/generic/ci-logs/run-${RUNID}/test-results.tgz" || true
+          curl -s -o /dev/null -u "Goodfred:${AT}" --upload-file /tmp/ci.log "$U/ci.log" || true
           export TAIL=$(tail -c 12000 /tmp/ci.log 2>/dev/null || echo "no captured log")
           python3 - <<'PYEOF'
           import os, json, urllib.request
