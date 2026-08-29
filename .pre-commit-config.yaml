@@ -63,6 +63,40 @@ repos:
                 payrexx_integration/public/js/lib/.*
             )$
 
+  # linter.yml blocks a push on frappe's semgrep rules, but nothing ran them
+  # locally: `pre-commit run --all-files` could be clean and the base branch
+  # still go red on push, which is what happened to ilanga_app on 2026-08-29.
+  #
+  # The rules are cloned from the same repository CI uses and cached under
+  # ~/.cache, so only the first run needs network. semgrep itself is installed
+  # into pre-commit's own venv -- nobody needs it on PATH.
+  #
+  # If the rules cannot be fetched the hook passes with a notice rather than
+  # blocking every commit on an offline machine. That makes this an early
+  # warning, not a gate: linter.yml remains the gate, and it also runs
+  # `r/python.lang.correctness`, a registry lookup deliberately left out here.
+  - repo: local
+    hooks:
+      - id: semgrep-frappe
+        name: "Run frappe semgrep rules"
+        language: python
+        additional_dependencies: ["semgrep==1.174.0"]
+        pass_filenames: false
+        # Scans the app rather than the staged files (the rules need whole-file
+        # context), but types_or keeps a docs-only or JSON-only commit from
+        # paying for it.
+        types_or: [python, javascript]
+        entry: bash
+        args:
+          - -c
+          - |
+            CACHE="${HOME}/.cache/frappe-semgrep-rules"
+            if [ ! -d "${CACHE}/rules" ]; then
+              git clone --depth 1 -q https://github.com/frappe/semgrep-rules "${CACHE}" 2>/dev/null \
+                || { echo "frappe semgrep rules unavailable (offline?) - skipped; linter.yml still enforces them"; exit 0; }
+            fi
+            exec semgrep --config "${CACHE}/rules" --error --quiet .
+
 ci:
     autoupdate_schedule: weekly
     skip: []
