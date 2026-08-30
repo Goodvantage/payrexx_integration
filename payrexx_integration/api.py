@@ -21,8 +21,18 @@ from urllib.parse import urlencode
 
 import frappe
 from frappe import _
+from frappe.rate_limiter import rate_limit
 
 from payrexx_integration.error_logging import log_sanitized_error
+
+# Browser-facing pay links are token-gated, but each hit is unthrottled DB work
+# (a settings resolve plus, for pay_invoice, locked reads). Bound a flood per
+# IP, generous enough for a shared office NAT where several people legitimately
+# pay invoices from the same address. The provider webhook (callback) is
+# deliberately NOT rate-limited: all of a gateway's deliveries share one source
+# IP, so a limiter there would drop real settlement notifications, and its work
+# is already bounded by fail-closed signature verification before any parsing.
+PAY_LINK_RATE_LIMIT_PER_HOUR = 300
 from payrexx_integration.gateway_selection import resolve_payrexx_settings
 from payrexx_integration.payrexx_integration.doctype.payrexx_settings.payrexx_settings import (
 	CHECKOUT_PROVIDER_CONTACT_FLAG,
@@ -183,6 +193,7 @@ def safe_pay_url(sales_invoice: str | None, gateway_name: str | None = None) -> 
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])  # nosemgrep: guest-whitelisted-method
+@rate_limit(limit=PAY_LINK_RATE_LIMIT_PER_HOUR, seconds=60 * 60, methods=["GET"])
 def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: str | None = None) -> None:
 	"""Lazy-create a Payrexx Gateway for a Sales Invoice and redirect to it.
 
@@ -230,6 +241,7 @@ def pay_invoice(si: str | None = None, token: str | None = None, gateway_name: s
 
 
 @frappe.whitelist(allow_guest=True, methods=["GET"])  # nosemgrep: guest-whitelisted-method
+@rate_limit(limit=PAY_LINK_RATE_LIMIT_PER_HOUR, seconds=60 * 60, methods=["GET"])
 def payment_success(
 	ir: str | None = None,
 	gateway_name: str | None = None,
